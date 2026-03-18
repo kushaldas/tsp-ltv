@@ -50,6 +50,7 @@ tsp-ltv (this crate)
 Used by:
    ├── underskrift  (PAdES/CAdES — adds DSS dictionary embedding)
    ├── bergshamra   (XAdES — adds qualifying property embedding)
+   └── jades        (JAdES — adds etsiU header construction)
 ```
 
 ## Quick start

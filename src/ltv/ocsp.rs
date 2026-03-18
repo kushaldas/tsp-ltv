@@ -1513,7 +1513,7 @@ mod tests {
     ) -> Vec<u8> {
         use rsa::pkcs1v15::SigningKey;
         use rsa::signature::{Signer, SignatureEncoding};
-        use pkcs8::DecodePrivateKey;
+        use rsa::pkcs8::DecodePrivateKey;
         use sha2::Sha256;
 
         // Build tbsResponseData body

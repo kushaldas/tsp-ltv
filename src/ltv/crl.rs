@@ -730,7 +730,7 @@ mod tests {
         use rsa::pkcs1v15::SigningKey;
         use rsa::signature::Signer;
         use rsa::signature::SignatureEncoding;
-        use pkcs8::DecodePrivateKey;
+        use rsa::pkcs8::DecodePrivateKey;
         use sha2::Sha256;
 
         // Build TBSCertList body

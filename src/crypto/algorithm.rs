@@ -309,7 +309,7 @@ impl std::fmt::Display for SignatureAlgorithm {
 /// # Example
 ///
 /// ```
-/// use underskrift::crypto::algorithm::{AlgorithmRegistry, DigestAlgorithm, SignatureAlgorithm};
+/// use tsp_ltv::crypto::algorithm::{AlgorithmRegistry, DigestAlgorithm, SignatureAlgorithm};
 ///
 /// // Allow only SHA-256/384/512 with RSA and ECDSA (no SHA-3, no Ed25519)
 /// let registry = AlgorithmRegistry::new()

@@ -13,8 +13,8 @@
 //! # Usage
 //!
 //! ```rust,no_run
-//! use underskrift::ltv::revocation::{RevocationConfig, check_certificate_revocation};
-//! use underskrift::ltv::{OcspClient, CrlClient};
+//! use tsp_ltv::ltv::revocation::{RevocationConfig, check_certificate_revocation};
+//! use tsp_ltv::ltv::{OcspClient, CrlClient};
 //! # async fn example() {
 //! let config = RevocationConfig::default();
 //! let ocsp = OcspClient::new();

@@ -25,10 +25,10 @@ const TSP_RESPONSE_CONTENT_TYPE: &str = "application/timestamp-reply";
 /// # Example
 ///
 /// ```no_run
-/// use underskrift::tsp::TsaClient;
-/// use underskrift::crypto::algorithm::DigestAlgorithm;
+/// use tsp_ltv::tsp::TsaClient;
+/// use tsp_ltv::crypto::algorithm::DigestAlgorithm;
 ///
-/// # async fn example() -> Result<(), underskrift::error::TspError> {
+/// # async fn example() -> Result<(), tsp_ltv::error::TspError> {
 /// let client = TsaClient::new("http://timestamp.digicert.com")
 ///     .digest_algorithm(DigestAlgorithm::Sha256)
 ///     .timeout(std::time::Duration::from_secs(10));
@@ -215,7 +215,7 @@ impl TsaClient {
 /// # Example
 ///
 /// ```no_run
-/// use underskrift::tsp::{TsaClient, TsaClientPool};
+/// use tsp_ltv::tsp::{TsaClient, TsaClientPool};
 ///
 /// let pool = TsaClientPool::new(vec![
 ///     TsaClient::new("http://timestamp.digicert.com"),
