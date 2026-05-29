@@ -482,6 +482,18 @@ fn verify_token_cms(
         }
     }
 
+    // No certificates to verify against at all: the token omitted the (optional)
+    // CMS `certificates` field and the caller supplied no `extra_certs`. This is
+    // not a cryptographic failure — we simply lack the signer's public key — so
+    // report it distinctly and point the caller at the two ways to provide it.
+    if embedded.is_empty() {
+        return Err(TspError::InvalidResponse(
+            "timestamp token contains no certificates and no extra_certs were supplied; \
+             request the token with certReq=true, or pass the TSA certificate via extra_certs"
+                .into(),
+        ));
+    }
+
     // Locate the signing certificate identified by SignerInfo.sid.
     let signer = find_signer_cert(&signer_info.sid, &embedded).ok_or_else(|| {
         TspError::VerificationFailed(
@@ -1273,7 +1285,7 @@ mod tests {
                 enable_key_encipherment: false,
             };
             let serial = SerialNumber::new(&[0x2A]).unwrap();
-            // Valid 2026..2036-ish; genTime fixtures (2030) fall inside this.
+            // Valid from "now" for ~10 years; clock-derived genTimes fall inside.
             let validity =
                 Validity::from_now(std::time::Duration::from_secs(3650 * 24 * 3600)).unwrap();
             let subject: Name = "CN=Runtime Test TSA,O=tsp-ltv tests".parse().unwrap();
@@ -1338,7 +1350,7 @@ mod tests {
     }
 
     /// Build a DER-encoded TSTInfo with the given message imprint hash, nonce,
-    /// and genTime (GeneralizedTime contents, e.g. b"20300101000000Z").
+    /// and genTime (GeneralizedTime contents, i.e. b"YYYYMMDDHHMMSSZ").
     fn build_tst_info(hash: &[u8], nonce: u64, gen_time_bytes: &[u8]) -> Vec<u8> {
         let version = der_utils::encode_integer_u64(1);
         // policy OID (arbitrary but well-formed)
@@ -1714,12 +1726,13 @@ mod tests {
             false,
         );
 
-        // Without the cert, verification fails (no key to check the signature).
+        // Without the cert there is no key to check the signature; this is
+        // reported as InvalidResponse (missing material), not a crypto failure.
         let err = verify_timestamp_token(&token, &hash, DigestAlgorithm::Sha256, None, None, None, &[])
             .unwrap_err();
         assert!(
-            matches!(err, TspError::VerificationFailed(_)),
-            "token without certs and no extra_certs must fail, got {err:?}"
+            matches!(err, TspError::InvalidResponse(_)),
+            "token without certs and no extra_certs must fail as InvalidResponse, got {err:?}"
         );
 
         // Supplying the signer cert out-of-band lets it verify.
