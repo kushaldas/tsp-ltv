@@ -10,10 +10,12 @@ use const_oid::ObjectIdentifier;
 use der::asn1::OctetString;
 use der::{Decode, Encode};
 use spki::AlgorithmIdentifierOwned;
+use x509_cert::Certificate;
 
 use crate::crypto::algorithm::DigestAlgorithm;
 use crate::der_utils;
 use crate::error::TspError;
+use crate::trust::TrustStore;
 
 // ---------------------------------------------------------------------------
 // OIDs
@@ -25,6 +27,29 @@ pub const ID_CT_TST_INFO: ObjectIdentifier =
 
 /// id-signedData (1.2.840.113549.1.7.2)
 pub const ID_SIGNED_DATA: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.840.113549.1.7.2");
+
+/// id-contentType signed attribute (1.2.840.113549.1.9.3)
+const ID_CONTENT_TYPE_ATTR: ObjectIdentifier =
+    ObjectIdentifier::new_unwrap("1.2.840.113549.1.9.3");
+
+/// id-messageDigest signed attribute (1.2.840.113549.1.9.4)
+const ID_MESSAGE_DIGEST_ATTR: ObjectIdentifier =
+    ObjectIdentifier::new_unwrap("1.2.840.113549.1.9.4");
+
+/// Extended Key Usage extension (2.5.29.37)
+const ID_CE_EXT_KEY_USAGE: ObjectIdentifier = ObjectIdentifier::new_unwrap("2.5.29.37");
+
+/// id-kp-timeStamping extended key usage (1.3.6.1.5.5.7.3.8).
+///
+/// RFC 3161 §2.3 requires the TSA signing certificate to carry this EKU,
+/// and that the extension be marked **critical**.
+const ID_KP_TIME_STAMPING: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.3.6.1.5.5.7.3.8");
+
+/// rsaEncryption (1.2.840.113549.1.1.1) — bare RSA key algorithm.
+const OID_RSA_ENCRYPTION: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.840.113549.1.1.1");
+
+/// id-ecPublicKey (1.2.840.10045.2.1) — bare EC key algorithm.
+const OID_EC_PUBLIC_KEY: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.840.10045.2.1");
 
 // ---------------------------------------------------------------------------
 // PKI status codes per RFC 3161 §2.4.2
@@ -259,7 +284,20 @@ pub fn parse_timestamp_response(der_bytes: &[u8]) -> Result<TimeStampResp, TspEr
     })
 }
 
-/// Validate a TimeStampResp: check status, extract token.
+/// Validate a TimeStampResp: check status, **cryptographically verify the
+/// token signature**, and confirm the message imprint / nonce match the request.
+///
+/// This performs the full RFC 3161 / RFC 5652 verification of the embedded
+/// `TimeStampToken`:
+/// - the CMS `SignerInfo` signature is verified over the signed attributes;
+/// - the `content-type` and `message-digest` signed attributes are checked to
+///   bind the signature to the `TSTInfo` content;
+/// - the signing certificate is required to carry a critical
+///   `id-kp-timeStamping` extended key usage.
+///
+/// It does **not** chain the TSA certificate to a trust anchor — at request
+/// time the caller has no trust store. Use [`verify_timestamp_token`] with a
+/// [`TrustStore`] to perform full path validation at verification time.
 ///
 /// Returns the raw DER-encoded TimeStampToken (CMS ContentInfo containing SignedData).
 pub fn validate_timestamp_response(
@@ -281,17 +319,221 @@ pub fn validate_timestamp_response(
         TspError::InvalidResponse("no token in response despite success status".into())
     })?;
 
-    // Parse TSTInfo from the token to validate hash and nonce
-    let tst_info = extract_tst_info(token_der)?;
+    // Cryptographically verify the CMS signature and bind it to the TSTInfo.
+    let (_verified, tst_info) = verify_token_cms(token_der)?;
 
-    // Validate message imprint hash
+    // Validate message imprint hash / algorithm / nonce against the request.
+    check_tst_info_matches(&tst_info, expected_hash, expected_nonce, digest_algorithm)?;
+
+    Ok(token_der.clone())
+}
+
+/// Fully verify an RFC 3161 timestamp token, including chaining the TSA
+/// signing certificate to a configured trust anchor.
+///
+/// This is the entry point a *verifier* (as opposed to the requester) should
+/// use — e.g. when validating an AdES B-T signature's embedded timestamp.
+///
+/// Verification steps:
+/// 1. Parse the CMS `ContentInfo`/`SignedData` and locate the signing certificate.
+/// 2. Verify the `SignerInfo` signature over the DER-encoded signed attributes.
+/// 3. Check the `content-type` and `message-digest` signed attributes bind the
+///    signature to the encapsulated `TSTInfo`.
+/// 4. Require a critical `id-kp-timeStamping` EKU on the signing certificate.
+/// 5. Confirm the message imprint hash/algorithm (and nonce, if supplied) match.
+/// 6. If `trust_store` is provided: build the certificate chain from the
+///    embedded certificates and verify it terminates at a trust anchor, and
+///    confirm `genTime` falls within the TSA certificate's validity period.
+///
+/// `validation_time` is the time at which certificate validity is assessed
+/// (typically the timestamp's `genTime` for archival validation, or "now").
+///
+/// Returns the verified [`TstInfo`] on success.
+pub fn verify_timestamp_token(
+    token_der: &[u8],
+    expected_hash: &[u8],
+    digest_algorithm: DigestAlgorithm,
+    expected_nonce: Option<u64>,
+    trust_store: Option<&TrustStore>,
+    validation_time: Option<der::DateTime>,
+) -> Result<TstInfo, TspError> {
+    let (verified, tst_info) = verify_token_cms(token_der)?;
+
+    check_tst_info_matches(&tst_info, expected_hash, expected_nonce, digest_algorithm)?;
+
+    if let Some(store) = trust_store {
+        // Build the chain [signer, intermediate, ...] from embedded certs and
+        // verify it reaches a trust anchor. verify_chain performs the actual
+        // signature checks on every link, so name-based ordering is safe.
+        let chain = order_chain(&verified.signer, &verified.embedded);
+        store.verify_chain(&chain, validation_time).map_err(|e| {
+            TspError::VerificationFailed(format!(
+                "TSA certificate does not chain to a trust anchor: {e}"
+            ))
+        })?;
+
+        // RFC 3161: genTime must fall within the TSA certificate validity.
+        check_gen_time_within_validity(&verified.signer, &tst_info)?;
+    }
+
+    Ok(tst_info)
+}
+
+/// A timestamp token whose CMS signature has been cryptographically verified.
+struct VerifiedToken {
+    /// The certificate whose key signed the token.
+    signer: Certificate,
+    /// All certificates embedded in the SignedData (signer + any intermediates).
+    embedded: Vec<Certificate>,
+}
+
+/// Parse and cryptographically verify the CMS SignedData of a timestamp token.
+///
+/// Returns the verified signer/embedded certificates together with the parsed
+/// `TSTInfo` taken from the (now-authenticated) encapsulated content.
+fn verify_token_cms(token_der: &[u8]) -> Result<(VerifiedToken, TstInfo), TspError> {
+    use cms::cert::CertificateChoices;
+    use cms::content_info::ContentInfo;
+    use cms::signed_data::SignedData;
+
+    // ContentInfo { contentType, content [0] EXPLICIT }
+    let ci = ContentInfo::from_der(token_der)
+        .map_err(|e| TspError::InvalidResponse(format!("failed to parse ContentInfo: {e}")))?;
+    if ci.content_type != ID_SIGNED_DATA {
+        return Err(TspError::InvalidResponse(format!(
+            "ContentInfo contentType is not id-signedData (got {})",
+            ci.content_type
+        )));
+    }
+
+    let signed_data: SignedData = ci
+        .content
+        .decode_as()
+        .map_err(|e| TspError::InvalidResponse(format!("failed to parse SignedData: {e}")))?;
+
+    // encapContentInfo must wrap a TSTInfo.
+    let eci = &signed_data.encap_content_info;
+    if eci.econtent_type != ID_CT_TST_INFO {
+        return Err(TspError::InvalidResponse(format!(
+            "encapContentInfo eContentType is not id-ct-TSTInfo (got {})",
+            eci.econtent_type
+        )));
+    }
+    let econtent = eci.econtent.as_ref().ok_or_else(|| {
+        TspError::InvalidResponse("SignedData has no encapsulated content".into())
+    })?;
+    // The eContent is an OCTET STRING; its value is the DER of TSTInfo.
+    let tst_info_der = econtent.value().to_vec();
+
+    // Exactly one SignerInfo is expected for an RFC 3161 token.
+    let signer_info = signed_data
+        .signer_infos
+        .0
+        .iter()
+        .next()
+        .ok_or_else(|| TspError::InvalidResponse("SignedData contains no SignerInfo".into()))?;
+
+    // Signed attributes are mandatory: the signature is computed over them, and
+    // they carry the message-digest binding to the eContent.
+    let signed_attrs = signer_info.signed_attrs.as_ref().ok_or_else(|| {
+        TspError::VerificationFailed("SignerInfo has no signedAttrs".into())
+    })?;
+
+    // Collect embedded certificates.
+    let mut embedded: Vec<Certificate> = Vec::new();
+    if let Some(cert_set) = &signed_data.certificates {
+        for choice in cert_set.0.iter() {
+            if let CertificateChoices::Certificate(cert) = choice {
+                embedded.push(cert.clone());
+            }
+        }
+    }
+
+    // Locate the signing certificate identified by SignerInfo.sid.
+    let signer = find_signer_cert(&signer_info.sid, &embedded).ok_or_else(|| {
+        TspError::VerificationFailed(
+            "signing certificate identified by SignerInfo not found in token".into(),
+        )
+    })?;
+
+    // The digest algorithm used for the message-digest attribute and signature.
+    let digest_alg = DigestAlgorithm::from_oid(&signer_info.digest_alg.oid).ok_or_else(|| {
+        TspError::VerificationFailed(format!(
+            "unsupported SignerInfo digestAlgorithm OID: {}",
+            signer_info.digest_alg.oid
+        ))
+    })?;
+
+    // --- content-type signed attribute must equal id-ct-TSTInfo ---
+    let content_type_attr = find_attribute(signed_attrs, &ID_CONTENT_TYPE_ATTR).ok_or_else(|| {
+        TspError::VerificationFailed("signedAttrs missing content-type attribute".into())
+    })?;
+    let signed_content_type: ObjectIdentifier = content_type_attr
+        .decode_as()
+        .map_err(|e| TspError::VerificationFailed(format!("invalid content-type attribute: {e}")))?;
+    if signed_content_type != ID_CT_TST_INFO {
+        return Err(TspError::VerificationFailed(format!(
+            "signed content-type is not id-ct-TSTInfo (got {signed_content_type})"
+        )));
+    }
+
+    // --- message-digest signed attribute must equal digest(eContent) ---
+    let message_digest_attr =
+        find_attribute(signed_attrs, &ID_MESSAGE_DIGEST_ATTR).ok_or_else(|| {
+            TspError::VerificationFailed("signedAttrs missing message-digest attribute".into())
+        })?;
+    let signed_digest = message_digest_attr.value();
+    let computed_digest = digest_alg.digest(&tst_info_der);
+    if signed_digest != computed_digest.as_slice() {
+        return Err(TspError::VerificationFailed(
+            "message-digest signed attribute does not match the TSTInfo content".into(),
+        ));
+    }
+
+    // --- verify the SignerInfo signature over the DER-encoded signedAttrs ---
+    // CMS signs the SET OF SignedAttributes (tag 0x31), not the [0] IMPLICIT form.
+    let signed_attrs_der = signed_attrs
+        .to_der()
+        .map_err(|e| TspError::VerificationFailed(format!("failed to re-encode signedAttrs: {e}")))?;
+    let spki_der = signer
+        .tbs_certificate
+        .subject_public_key_info
+        .to_der()
+        .map_err(|e| TspError::VerificationFailed(format!("failed to encode signer SPKI: {e}")))?;
+    let sig_oid = resolve_cms_signature_oid(&signer_info.signature_algorithm.oid, digest_alg);
+    crate::crypto::verify::verify_signature_by_oid(
+        &signed_attrs_der,
+        signer_info.signature.as_bytes(),
+        &spki_der,
+        &sig_oid,
+    )
+    .map_err(|e| {
+        TspError::VerificationFailed(format!("TSA signature verification failed: {e}"))
+    })?;
+
+    // --- require a critical id-kp-timeStamping EKU on the signer ---
+    require_timestamping_eku(&signer)?;
+
+    // The TSTInfo is now authenticated; parse its fields.
+    let tst_info = parse_tst_info_body(&tst_info_der)?;
+
+    Ok((VerifiedToken { signer, embedded }, tst_info))
+}
+
+/// Validate that a parsed [`TstInfo`] matches the request's expected hash,
+/// algorithm, and (optionally) nonce.
+fn check_tst_info_matches(
+    tst_info: &TstInfo,
+    expected_hash: &[u8],
+    expected_nonce: Option<u64>,
+    digest_algorithm: DigestAlgorithm,
+) -> Result<(), TspError> {
     if tst_info.message_hash != expected_hash {
         return Err(TspError::InvalidResponse(
             "TSTInfo messageImprint hash does not match request".into(),
         ));
     }
 
-    // Validate message imprint algorithm
     if tst_info.hash_algorithm != digest_algorithm {
         return Err(TspError::InvalidResponse(format!(
             "TSTInfo hash algorithm mismatch: expected {:?}, got {:?}",
@@ -299,7 +541,6 @@ pub fn validate_timestamp_response(
         )));
     }
 
-    // Validate nonce if provided
     if let Some(expected) = expected_nonce {
         match tst_info.nonce {
             Some(actual) if actual == expected => {}
@@ -316,7 +557,190 @@ pub fn validate_timestamp_response(
         }
     }
 
-    Ok(token_der.clone())
+    Ok(())
+}
+
+/// Find the certificate identified by a CMS `SignerIdentifier` among `certs`.
+fn find_signer_cert(
+    sid: &cms::signed_data::SignerIdentifier,
+    certs: &[Certificate],
+) -> Option<Certificate> {
+    use cms::signed_data::SignerIdentifier;
+    match sid {
+        SignerIdentifier::IssuerAndSerialNumber(iasn) => certs
+            .iter()
+            .find(|c| {
+                c.tbs_certificate.issuer == iasn.issuer
+                    && c.tbs_certificate.serial_number == iasn.serial_number
+            })
+            .cloned(),
+        SignerIdentifier::SubjectKeyIdentifier(skid) => {
+            let want = skid.0.as_bytes();
+            certs
+                .iter()
+                .find(|c| cert_ski(c).as_deref() == Some(want))
+                .cloned()
+        }
+    }
+}
+
+/// Extract the SubjectKeyIdentifier (2.5.29.14) octet contents from a cert.
+fn cert_ski(cert: &Certificate) -> Option<Vec<u8>> {
+    let ski_oid = ObjectIdentifier::new_unwrap("2.5.29.14");
+    let exts = cert.tbs_certificate.extensions.as_ref()?;
+    let ext = exts.iter().find(|e| e.extn_id == ski_oid)?;
+    // extnValue is an OCTET STRING wrapping the SKI OCTET STRING.
+    let (tag, body) = der_utils::parse_tlv(ext.extn_value.as_bytes()).ok()?;
+    if tag != 0x04 {
+        return None;
+    }
+    Some(body)
+}
+
+/// Find a signed attribute by OID and return its single value.
+fn find_attribute<'a>(
+    attrs: &'a x509_cert::attr::Attributes,
+    oid: &ObjectIdentifier,
+) -> Option<&'a der::Any> {
+    attrs
+        .iter()
+        .find(|attr| attr.oid == *oid)
+        .and_then(|attr| attr.values.iter().next())
+}
+
+/// Map a CMS `SignerInfo.signatureAlgorithm` OID (which may be a bare key
+/// algorithm such as `rsaEncryption`) plus the digest algorithm onto the
+/// combined signature-algorithm OID understood by
+/// [`crate::crypto::verify::verify_signature_by_oid`].
+fn resolve_cms_signature_oid(
+    sig_alg_oid: &ObjectIdentifier,
+    digest_alg: DigestAlgorithm,
+) -> ObjectIdentifier {
+    use const_oid::db;
+
+    if *sig_alg_oid == OID_RSA_ENCRYPTION {
+        // Bare RSA key alg → combine with the digest algorithm.
+        match digest_alg {
+            DigestAlgorithm::Sha256 => db::rfc5912::SHA_256_WITH_RSA_ENCRYPTION,
+            DigestAlgorithm::Sha384 => db::rfc5912::SHA_384_WITH_RSA_ENCRYPTION,
+            DigestAlgorithm::Sha512 => db::rfc5912::SHA_512_WITH_RSA_ENCRYPTION,
+            // For any other digest, fall through to the bare OID and let the
+            // verifier reject it as unsupported rather than guessing.
+            _ => *sig_alg_oid,
+        }
+    } else if *sig_alg_oid == OID_EC_PUBLIC_KEY {
+        match digest_alg {
+            DigestAlgorithm::Sha256 => db::rfc5912::ECDSA_WITH_SHA_256,
+            DigestAlgorithm::Sha384 => db::rfc5912::ECDSA_WITH_SHA_384,
+            DigestAlgorithm::Sha512 => db::rfc5912::ECDSA_WITH_SHA_512,
+            _ => *sig_alg_oid,
+        }
+    } else {
+        // Already a combined OID (e.g. sha256WithRSAEncryption, ecdsa-with-SHA256,
+        // RSASSA-PSS, Ed25519) — pass through unchanged.
+        *sig_alg_oid
+    }
+}
+
+/// Require that `cert` carries the `id-kp-timeStamping` EKU, marked critical,
+/// per RFC 3161 §2.3.
+fn require_timestamping_eku(cert: &Certificate) -> Result<(), TspError> {
+    let exts = cert.tbs_certificate.extensions.as_ref().ok_or_else(|| {
+        TspError::VerificationFailed("TSA certificate has no extensions (no EKU)".into())
+    })?;
+    let eku_ext = exts
+        .iter()
+        .find(|e| e.extn_id == ID_CE_EXT_KEY_USAGE)
+        .ok_or_else(|| {
+            TspError::VerificationFailed("TSA certificate lacks an extendedKeyUsage extension".into())
+        })?;
+
+    if !eku_ext.critical {
+        return Err(TspError::VerificationFailed(
+            "TSA certificate extendedKeyUsage is not marked critical (RFC 3161 §2.3)".into(),
+        ));
+    }
+
+    if !eku_contains(eku_ext.extn_value.as_bytes(), &ID_KP_TIME_STAMPING) {
+        return Err(TspError::VerificationFailed(
+            "TSA certificate extendedKeyUsage does not include id-kp-timeStamping".into(),
+        ));
+    }
+
+    Ok(())
+}
+
+/// Return true if an EKU extension value (SEQUENCE OF OID) contains `target`.
+fn eku_contains(eku_der: &[u8], target: &ObjectIdentifier) -> bool {
+    let Ok((tag, body)) = der_utils::parse_tlv(eku_der) else {
+        return false;
+    };
+    if tag != 0x30 {
+        return false;
+    }
+    let mut pos = &body[..];
+    while !pos.is_empty() {
+        let Ok((oid_tag, oid_body, rest)) = der_utils::parse_tlv_with_rest(pos) else {
+            break;
+        };
+        if oid_tag == 0x06 {
+            if let Ok(oid) = ObjectIdentifier::from_der(&der_utils::encode_tlv(0x06, oid_body)) {
+                if oid == *target {
+                    return true;
+                }
+            }
+        }
+        pos = rest;
+    }
+    false
+}
+
+/// Order embedded certificates into a chain `[signer, issuer, ...]` by name,
+/// stopping at a self-signed certificate or when no issuer is found. The actual
+/// signature checks are performed by [`TrustStore::verify_chain`].
+fn order_chain(signer: &Certificate, embedded: &[Certificate]) -> Vec<Certificate> {
+    let mut chain = vec![signer.clone()];
+    // Bounded to avoid loops on adversarial inputs.
+    for _ in 0..16 {
+        let current = chain.last().unwrap();
+        if current.tbs_certificate.issuer == current.tbs_certificate.subject {
+            break; // reached a self-signed cert
+        }
+        let next = embedded.iter().find(|c| {
+            c.tbs_certificate.subject == current.tbs_certificate.issuer
+                && !chain
+                    .iter()
+                    .any(|existing| existing.tbs_certificate == c.tbs_certificate)
+        });
+        match next {
+            Some(c) => chain.push(c.clone()),
+            None => break,
+        }
+    }
+    chain
+}
+
+/// Confirm the timestamp's `genTime` falls within the signer certificate's
+/// validity window (RFC 3161).
+fn check_gen_time_within_validity(signer: &Certificate, tst_info: &TstInfo) -> Result<(), TspError> {
+    // gen_time_der holds the GeneralizedTime *contents*; re-wrap to decode.
+    let gt_tlv = der_utils::encode_tlv(0x18, &tst_info.gen_time_der);
+    let gen_time = der::asn1::GeneralizedTime::from_der(&gt_tlv)
+        .map_err(|e| TspError::VerificationFailed(format!("invalid genTime: {e}")))?
+        .to_date_time();
+
+    let validity = &signer.tbs_certificate.validity;
+    let not_before = validity.not_before.to_date_time();
+    let not_after = validity.not_after.to_date_time();
+
+    if gen_time < not_before || gen_time > not_after {
+        return Err(TspError::VerificationFailed(format!(
+            "timestamp genTime {gen_time} is outside the TSA certificate validity \
+             ({not_before} .. {not_after})"
+        )));
+    }
+
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -676,5 +1100,315 @@ mod tests {
         let n2 = generate_nonce();
         // They should differ (with extremely high probability)
         assert_ne!(n1, n2, "nonces should be unique");
+    }
+
+    // ── RFC 3161 token signature verification (C-1 fix) ──────────────────
+
+    use cms::cert::CertificateChoices;
+    use cms::content_info::{CmsVersion, ContentInfo};
+    use cms::signed_data::{
+        CertificateSet, EncapsulatedContentInfo, SignerIdentifier, SignerInfo, SignerInfos,
+    };
+    use der::asn1::{Any, SetOfVec};
+    use der::{Decode, Tag};
+    use spki::AlgorithmIdentifierOwned;
+    use x509_cert::attr::Attribute;
+    use x509_cert::Certificate;
+
+    const TSA_CERT_PEM: &str =
+        include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/tsa_cert.pem"));
+    const TSA_KEY_PEM: &str =
+        include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/tsa_key.pem"));
+    const INTERMEDIATE_CERT_PEM: &str = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/intermediate_ca_cert.pem"
+    ));
+    const INTERMEDIATE_KEY_PEM: &str = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/intermediate_ca_key.pem"
+    ));
+    const ROOT_CERT_PEM: &str =
+        include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/ca_cert.pem"));
+
+    fn load_cert(pem: &str) -> Certificate {
+        let (_, der) = pem_rfc7468::decode_vec(pem.as_bytes()).unwrap();
+        Certificate::from_der(&der).unwrap()
+    }
+
+    const SHA256_OID_DER: &[u8] = &[
+        0x06, 0x09, 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x01,
+    ];
+
+    /// Build a DER-encoded TSTInfo with the given message imprint hash and nonce.
+    fn build_tst_info(hash: &[u8], nonce: u64) -> Vec<u8> {
+        let version = der_utils::encode_integer_u64(1);
+        // policy OID (arbitrary but well-formed)
+        let policy = der_utils::encode_tlv(0x06, &[0x2B, 0x06, 0x01, 0x04, 0x01]);
+        // messageImprint { AlgorithmIdentifier{ sha256, NULL }, OCTET STRING hash }
+        let alg = der_utils::encode_sequence_from_parts(&[SHA256_OID_DER, &[0x05, 0x00]]);
+        let hashed = der_utils::encode_tlv(0x04, hash);
+        let message_imprint = der_utils::encode_sequence_from_parts(&[&alg, &hashed]);
+        let serial = der_utils::encode_integer_u64(42);
+        // genTime within the TSA cert validity (2026..2036)
+        let gen_time = der_utils::encode_tlv(0x18, b"20300101000000Z");
+        let nonce_int = der_utils::encode_integer_u64(nonce);
+        let body = [version, policy, message_imprint, serial, gen_time, nonce_int].concat();
+        der_utils::encode_sequence_raw(&body)
+    }
+
+    fn null_params() -> Option<Any> {
+        Some(Any::null())
+    }
+
+    /// Build a fully-formed CMS TimeStampToken (ContentInfo/SignedData) signed
+    /// with `signer_key_pem`, embedding `signer_cert_pem` plus `extra_certs`.
+    ///
+    /// If `corrupt_sig` is true, the signature is computed over the wrong bytes
+    /// so the token's signature will not verify.
+    fn build_signed_token(
+        signer_cert_pem: &str,
+        signer_key_pem: &str,
+        extra_certs: &[&str],
+        hash: &[u8],
+        nonce: u64,
+        corrupt_sig: bool,
+    ) -> Vec<u8> {
+        use rsa::pkcs1v15::{Signature, SigningKey};
+        use rsa::pkcs8::DecodePrivateKey;
+        use rsa::signature::{Signer, SignatureEncoding};
+        use sha2::{Digest, Sha256};
+
+        let signer_cert = load_cert(signer_cert_pem);
+        let tst_info_der = build_tst_info(hash, nonce);
+
+        // Signed attributes: content-type = id-ct-TSTInfo, message-digest = SHA256(eContent)
+        let digest = Sha256::digest(&tst_info_der).to_vec();
+        let ct_value = Any::encode_from(&ID_CT_TST_INFO).unwrap();
+        let ct_attr = Attribute {
+            oid: ID_CONTENT_TYPE_ATTR,
+            values: SetOfVec::try_from(vec![ct_value]).unwrap(),
+        };
+        let md_value = Any::new(Tag::OctetString, digest).unwrap();
+        let md_attr = Attribute {
+            oid: ID_MESSAGE_DIGEST_ATTR,
+            values: SetOfVec::try_from(vec![md_value]).unwrap(),
+        };
+        let signed_attrs: x509_cert::attr::Attributes =
+            SetOfVec::try_from(vec![ct_attr, md_attr]).unwrap();
+
+        // Sign the DER of the SET OF signed attributes (RFC 5652 §5.4).
+        let signed_attrs_der = signed_attrs.to_der().unwrap();
+        let key_der = pem_rfc7468::decode_vec(signer_key_pem.as_bytes()).unwrap().1;
+        let private_key = rsa::RsaPrivateKey::from_pkcs8_der(&key_der).unwrap();
+        let signing_key = SigningKey::<Sha256>::new(private_key);
+        let to_sign: &[u8] = if corrupt_sig { b"not the signed attributes" } else { &signed_attrs_der };
+        let signature: Signature = signing_key.sign(to_sign);
+
+        let sha256_alg = AlgorithmIdentifierOwned {
+            oid: DigestAlgorithm::Sha256.oid(),
+            parameters: null_params(),
+        };
+        let signer_info = SignerInfo {
+            version: CmsVersion::V1,
+            sid: SignerIdentifier::IssuerAndSerialNumber(cms::cert::IssuerAndSerialNumber {
+                issuer: signer_cert.tbs_certificate.issuer.clone(),
+                serial_number: signer_cert.tbs_certificate.serial_number.clone(),
+            }),
+            digest_alg: sha256_alg.clone(),
+            signed_attrs: Some(signed_attrs),
+            // bare rsaEncryption — exercises resolve_cms_signature_oid()
+            signature_algorithm: AlgorithmIdentifierOwned {
+                oid: OID_RSA_ENCRYPTION,
+                parameters: null_params(),
+            },
+            signature: OctetString::new(signature.to_vec()).unwrap(),
+            unsigned_attrs: None,
+        };
+
+        // Embedded certificates: signer first, then any extras.
+        let mut cert_choices = vec![CertificateChoices::Certificate(signer_cert)];
+        for pem in extra_certs {
+            cert_choices.push(CertificateChoices::Certificate(load_cert(pem)));
+        }
+
+        let signed_data = cms::signed_data::SignedData {
+            version: CmsVersion::V3,
+            digest_algorithms: SetOfVec::try_from(vec![sha256_alg]).unwrap(),
+            encap_content_info: EncapsulatedContentInfo {
+                econtent_type: ID_CT_TST_INFO,
+                econtent: Some(Any::new(Tag::OctetString, tst_info_der).unwrap()),
+            },
+            certificates: Some(CertificateSet::from(
+                SetOfVec::try_from(cert_choices).unwrap(),
+            )),
+            crls: None,
+            signer_infos: SignerInfos::from(SetOfVec::try_from(vec![signer_info]).unwrap()),
+        };
+
+        let content_info = ContentInfo {
+            content_type: ID_SIGNED_DATA,
+            content: Any::encode_from(&signed_data).unwrap(),
+        };
+        content_info.to_der().unwrap()
+    }
+
+    fn validation_time() -> der::DateTime {
+        der::DateTime::new(2030, 6, 1, 12, 0, 0).unwrap()
+    }
+
+    #[test]
+    fn test_verify_valid_token_no_trust_store() {
+        let hash = vec![0xABu8; 32];
+        let nonce = 0xDEAD_BEEFu64;
+        let token = build_signed_token(TSA_CERT_PEM, TSA_KEY_PEM, &[], &hash, nonce, false);
+
+        let tst = verify_timestamp_token(
+            &token,
+            &hash,
+            DigestAlgorithm::Sha256,
+            Some(nonce),
+            None,
+            None,
+        )
+        .expect("validly-signed token must verify");
+        assert_eq!(tst.message_hash, hash);
+        assert_eq!(tst.nonce, Some(nonce));
+    }
+
+    #[test]
+    fn test_verify_valid_token_with_trust_store() {
+        let hash = vec![0x11u8; 32];
+        let nonce = 7u64;
+        // Embed the intermediate so the chain reaches the root anchor.
+        let token = build_signed_token(
+            TSA_CERT_PEM,
+            TSA_KEY_PEM,
+            &[INTERMEDIATE_CERT_PEM],
+            &hash,
+            nonce,
+            false,
+        );
+
+        let mut store = TrustStore::new();
+        let (_, root_der) = pem_rfc7468::decode_vec(ROOT_CERT_PEM.as_bytes()).unwrap();
+        store.add_der_certificate(&root_der).unwrap();
+
+        let tst = verify_timestamp_token(
+            &token,
+            &hash,
+            DigestAlgorithm::Sha256,
+            Some(nonce),
+            Some(&store),
+            Some(validation_time()),
+        )
+        .expect("token chaining to a trusted root must verify");
+        assert_eq!(tst.message_hash, hash);
+    }
+
+    #[test]
+    fn test_reject_tampered_signature() {
+        let hash = vec![0x22u8; 32];
+        let token = build_signed_token(TSA_CERT_PEM, TSA_KEY_PEM, &[], &hash, 1, true);
+        let err = verify_timestamp_token(&token, &hash, DigestAlgorithm::Sha256, None, None, None)
+            .unwrap_err();
+        assert!(
+            matches!(err, TspError::VerificationFailed(_)),
+            "tampered signature must be rejected, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn test_reject_untrusted_root() {
+        // Token is validly signed but the trust store does NOT contain the root.
+        let hash = vec![0x33u8; 32];
+        let token =
+            build_signed_token(TSA_CERT_PEM, TSA_KEY_PEM, &[INTERMEDIATE_CERT_PEM], &hash, 1, false);
+        let empty_store = TrustStore::new();
+        let err = verify_timestamp_token(
+            &token,
+            &hash,
+            DigestAlgorithm::Sha256,
+            None,
+            Some(&empty_store),
+            Some(validation_time()),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, TspError::VerificationFailed(_)),
+            "token not chaining to a trust anchor must be rejected, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn test_reject_signer_without_timestamping_eku() {
+        // Sign with the intermediate CA key and present the intermediate CA cert
+        // as the signer. The signature verifies, but the cert lacks the critical
+        // id-kp-timeStamping EKU, so verification must fail.
+        let hash = vec![0x44u8; 32];
+        let token =
+            build_signed_token(INTERMEDIATE_CERT_PEM, INTERMEDIATE_KEY_PEM, &[], &hash, 1, false);
+        let err = verify_timestamp_token(&token, &hash, DigestAlgorithm::Sha256, None, None, None)
+            .unwrap_err();
+        assert!(
+            matches!(err, TspError::VerificationFailed(_)),
+            "signer without timeStamping EKU must be rejected, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn test_reject_unsigned_token_old_behavior() {
+        // A token with no SignerInfo — the kind the old (vulnerable) code would
+        // have accepted because it only parsed TSTInfo. Must now be rejected.
+        let hash = vec![0x55u8; 32];
+        let tst_info_der = build_tst_info(&hash, 1);
+        let signed_data = cms::signed_data::SignedData {
+            version: CmsVersion::V3,
+            digest_algorithms: SetOfVec::new(),
+            encap_content_info: EncapsulatedContentInfo {
+                econtent_type: ID_CT_TST_INFO,
+                econtent: Some(Any::new(Tag::OctetString, tst_info_der).unwrap()),
+            },
+            certificates: None,
+            crls: None,
+            signer_infos: SignerInfos::from(SetOfVec::<SignerInfo>::new()),
+        };
+        let content_info = ContentInfo {
+            content_type: ID_SIGNED_DATA,
+            content: Any::encode_from(&signed_data).unwrap(),
+        };
+        let token = content_info.to_der().unwrap();
+
+        let err = verify_timestamp_token(&token, &hash, DigestAlgorithm::Sha256, None, None, None)
+            .unwrap_err();
+        assert!(
+            matches!(err, TspError::InvalidResponse(_)),
+            "unsigned token must be rejected, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn test_reject_garbage_token() {
+        let err = verify_timestamp_token(
+            &[0x30, 0x03, 0x02, 0x01, 0x01],
+            &[0u8; 32],
+            DigestAlgorithm::Sha256,
+            None,
+            None,
+            None,
+        )
+        .unwrap_err();
+        assert!(matches!(err, TspError::InvalidResponse(_)));
+    }
+
+    #[test]
+    fn test_reject_wrong_message_imprint() {
+        // Validly signed, but the caller expected a different hash than the one
+        // in the (authenticated) TSTInfo.
+        let real_hash = vec![0x66u8; 32];
+        let token = build_signed_token(TSA_CERT_PEM, TSA_KEY_PEM, &[], &real_hash, 1, false);
+        let expected = vec![0x99u8; 32];
+        let err = verify_timestamp_token(&token, &expected, DigestAlgorithm::Sha256, None, None, None)
+            .unwrap_err();
+        assert!(matches!(err, TspError::InvalidResponse(_)));
     }
 }
