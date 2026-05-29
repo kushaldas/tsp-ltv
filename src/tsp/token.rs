@@ -14,7 +14,7 @@ use x509_cert::Certificate;
 
 use crate::crypto::algorithm::DigestAlgorithm;
 use crate::der_utils;
-use crate::error::TspError;
+use crate::error::{TspError, TrustError};
 use crate::trust::TrustStore;
 
 // ---------------------------------------------------------------------------
@@ -50,6 +50,9 @@ const OID_RSA_ENCRYPTION: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.8
 
 /// id-ecPublicKey (1.2.840.10045.2.1) — bare EC key algorithm.
 const OID_EC_PUBLIC_KEY: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.840.10045.2.1");
+
+/// id-RSASSA-PSS (1.2.840.113549.1.1.10).
+const OID_RSASSA_PSS: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.840.113549.1.1.10");
 
 // ---------------------------------------------------------------------------
 // PKI status codes per RFC 3161 §2.4.2
@@ -299,12 +302,18 @@ pub fn parse_timestamp_response(der_bytes: &[u8]) -> Result<TimeStampResp, TspEr
 /// time the caller has no trust store. Use [`verify_timestamp_token`] with a
 /// [`TrustStore`] to perform full path validation at verification time.
 ///
+/// `extra_certs` lets the caller supply the TSA signing certificate out-of-band
+/// for tokens that omit the (optional) CMS `certificates` field — e.g. when the
+/// request used `certReq=false`. Pass `&[]` when the request used `certReq=true`
+/// (the default), since the certificate is then embedded.
+///
 /// Returns the raw DER-encoded TimeStampToken (CMS ContentInfo containing SignedData).
 pub fn validate_timestamp_response(
     resp: &TimeStampResp,
     expected_hash: &[u8],
     expected_nonce: Option<u64>,
     digest_algorithm: DigestAlgorithm,
+    extra_certs: &[Certificate],
 ) -> Result<Vec<u8>, TspError> {
     // Check status
     if !resp.status.is_success() {
@@ -320,9 +329,7 @@ pub fn validate_timestamp_response(
     })?;
 
     // Cryptographically verify the CMS signature and bind it to the TSTInfo.
-    // The requester sets certReq=true, so the signing cert is embedded; no
-    // out-of-band certificates are needed here.
-    let (_verified, tst_info) = verify_token_cms(token_der, &[])?;
+    let (_verified, tst_info) = verify_token_cms(token_der, extra_certs)?;
 
     // Validate message imprint hash / algorithm / nonce against the request.
     check_tst_info_matches(&tst_info, expected_hash, expected_nonce, digest_algorithm)?;
@@ -554,12 +561,12 @@ fn verify_token_cms(
         .subject_public_key_info
         .to_der()
         .map_err(|e| TspError::VerificationFailed(format!("failed to encode signer SPKI: {e}")))?;
-    let sig_oid = resolve_cms_signature_oid(&signer_info.signature_algorithm.oid, digest_alg);
-    crate::crypto::verify::verify_signature_by_oid(
+    verify_cms_signature(
         &signed_attrs_der,
         signer_info.signature.as_bytes(),
         &spki_der,
-        &sig_oid,
+        &signer_info.signature_algorithm.oid,
+        digest_alg,
     )
     .map_err(|e| {
         TspError::VerificationFailed(format!("TSA signature verification failed: {e}"))
@@ -685,24 +692,51 @@ fn find_attribute<'a>(
     Ok(attr.values.iter().next())
 }
 
-/// Map a CMS `SignerInfo.signatureAlgorithm` OID (which may be a bare key
-/// algorithm such as `rsaEncryption`) plus the digest algorithm onto the
-/// combined signature-algorithm OID understood by
-/// [`crate::crypto::verify::verify_signature_by_oid`].
-fn resolve_cms_signature_oid(
+/// Verify the CMS `SignerInfo` signature over `signed_attrs_der`.
+///
+/// The CMS `SignerInfo.signatureAlgorithm` is frequently a *bare* key algorithm
+/// (`rsaEncryption`, `id-ecPublicKey`, `rsassaPss`) rather than a combined
+/// sig+hash OID. The authoritative hash is `SignerInfo.digestAlgorithm`
+/// (`digest_alg`), so we bind verification to it:
+/// - RSASSA-PSS is verified with **exactly** `digest_alg` (not a trial of
+///   several hashes), so a PSS signature whose hash disagrees with
+///   `digestAlgorithm` is rejected.
+/// - Bare `rsaEncryption` / `id-ecPublicKey` are mapped to the combined OID for
+///   `digest_alg`.
+/// - Anything else is already a combined OID and passed through.
+fn verify_cms_signature(
+    signed_attrs_der: &[u8],
+    signature: &[u8],
+    spki_der: &[u8],
     sig_alg_oid: &ObjectIdentifier,
     digest_alg: DigestAlgorithm,
-) -> ObjectIdentifier {
+) -> Result<(), TrustError> {
+    use crate::crypto::verify::{verify_rsa_pss_signature, verify_signature_by_oid};
     use const_oid::db;
 
-    if *sig_alg_oid == OID_RSA_ENCRYPTION {
-        // Bare RSA key alg → combine with the digest algorithm.
+    if *sig_alg_oid == OID_RSASSA_PSS {
+        // Bind PSS to the SignerInfo.digestAlgorithm hash.
+        return match digest_alg {
+            DigestAlgorithm::Sha256 => {
+                verify_rsa_pss_signature::<sha2::Sha256>(signed_attrs_der, signature, spki_der)
+            }
+            DigestAlgorithm::Sha384 => {
+                verify_rsa_pss_signature::<sha2::Sha384>(signed_attrs_der, signature, spki_der)
+            }
+            DigestAlgorithm::Sha512 => {
+                verify_rsa_pss_signature::<sha2::Sha512>(signed_attrs_der, signature, spki_der)
+            }
+            other => Err(TrustError::UnsupportedAlgorithm(format!(
+                "RSASSA-PSS with digest {other:?}"
+            ))),
+        };
+    }
+
+    let resolved = if *sig_alg_oid == OID_RSA_ENCRYPTION {
         match digest_alg {
             DigestAlgorithm::Sha256 => db::rfc5912::SHA_256_WITH_RSA_ENCRYPTION,
             DigestAlgorithm::Sha384 => db::rfc5912::SHA_384_WITH_RSA_ENCRYPTION,
             DigestAlgorithm::Sha512 => db::rfc5912::SHA_512_WITH_RSA_ENCRYPTION,
-            // For any other digest, fall through to the bare OID and let the
-            // verifier reject it as unsupported rather than guessing.
             _ => *sig_alg_oid,
         }
     } else if *sig_alg_oid == OID_EC_PUBLIC_KEY {
@@ -713,10 +747,12 @@ fn resolve_cms_signature_oid(
             _ => *sig_alg_oid,
         }
     } else {
-        // Already a combined OID (e.g. sha256WithRSAEncryption, ecdsa-with-SHA256,
-        // RSASSA-PSS, Ed25519) — pass through unchanged.
+        // Already a combined OID (sha256WithRSAEncryption, ecdsa-with-SHA256,
+        // Ed25519, ...) — pass through unchanged.
         *sig_alg_oid
-    }
+    };
+
+    verify_signature_by_oid(signed_attrs_der, signature, spki_der, &resolved)
 }
 
 /// Require that `cert` carries the `id-kp-timeStamping` EKU, marked critical,
@@ -1707,6 +1743,39 @@ mod tests {
         let err = verify_timestamp_token(&token, &expected, DigestAlgorithm::Sha256, None, None, None, &[])
             .unwrap_err();
         assert!(matches!(err, TspError::InvalidResponse(_)));
+    }
+
+    #[test]
+    fn test_pss_signature_bound_to_signerinfo_digest() {
+        use rsa::pkcs8::EncodePublicKey;
+        use rsa::pss::SigningKey;
+        use rsa::signature::{RandomizedSigner, SignatureEncoding};
+        use sha2::Sha256;
+
+        let key = tsa_key();
+        let spki_der = rsa::RsaPublicKey::from(&key)
+            .to_public_key_der()
+            .unwrap()
+            .as_bytes()
+            .to_vec();
+
+        // Sign with RSA-PSS / SHA-256.
+        let signing = SigningKey::<Sha256>::new(key);
+        let msg = b"the DER-encoded signed attributes";
+        let mut rng = rand::thread_rng();
+        let sig = signing.sign_with_rng(&mut rng, msg).to_vec();
+
+        // Verification bound to SHA-256 (matching SignerInfo.digestAlgorithm) succeeds.
+        verify_cms_signature(msg, &sig, &spki_der, &OID_RSASSA_PSS, DigestAlgorithm::Sha256)
+            .expect("PSS-SHA256 signature must verify when bound to SHA-256");
+
+        // Verification bound to a different digest must NOT accept the signature
+        // (previously the code tried multiple hashes and could mis-accept).
+        assert!(
+            verify_cms_signature(msg, &sig, &spki_der, &OID_RSASSA_PSS, DigestAlgorithm::Sha384)
+                .is_err(),
+            "PSS signature must be rejected when the bound digest does not match"
+        );
     }
 
     #[test]

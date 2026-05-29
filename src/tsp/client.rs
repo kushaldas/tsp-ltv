@@ -52,6 +52,11 @@ pub struct TsaClient {
     timeout: Duration,
     /// Whether to request the TSA certificate in the response.
     cert_req: bool,
+    /// TSA signing certificates supplied out-of-band, used to verify the
+    /// returned token when it omits the CMS `certificates` field (i.e. when
+    /// `cert_req` is false). Empty by default; not needed when `cert_req` is
+    /// true (the cert is then embedded in the token).
+    verification_certs: Vec<x509_cert::Certificate>,
 }
 
 impl TsaClient {
@@ -70,6 +75,7 @@ impl TsaClient {
             policy_oid: None,
             timeout: Duration::from_secs(30),
             cert_req: true,
+            verification_certs: Vec::new(),
         }
     }
 
@@ -92,8 +98,22 @@ impl TsaClient {
     }
 
     /// Set whether to request the TSA certificate in the response.
+    ///
+    /// When `false`, the returned token will not embed the TSA certificate, so
+    /// the built-in verification cannot check the signature unless the
+    /// certificate is supplied via [`verification_certs`](Self::verification_certs).
     pub fn cert_req(mut self, cert_req: bool) -> Self {
         self.cert_req = cert_req;
+        self
+    }
+
+    /// Supply TSA signing certificate(s) used to verify the returned token when
+    /// it omits the CMS `certificates` field (i.e. when `cert_req` is false).
+    ///
+    /// Not required when `cert_req` is true (the default), since the certificate
+    /// is then embedded in the token.
+    pub fn verification_certs(mut self, certs: Vec<x509_cert::Certificate>) -> Self {
+        self.verification_certs = certs;
         self
     }
 
@@ -187,6 +207,7 @@ impl TsaClient {
             data_hash,
             Some(nonce),
             self.digest_algorithm,
+            &self.verification_certs,
         )?;
 
         log::debug!(
