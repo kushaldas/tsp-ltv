@@ -371,9 +371,6 @@ pub fn verify_timestamp_token(
                 "TSA certificate does not chain to a trust anchor: {e}"
             ))
         })?;
-
-        // RFC 3161: genTime must fall within the TSA certificate validity.
-        check_gen_time_within_validity(&verified.signer, &tst_info)?;
     }
 
     Ok(tst_info)
@@ -425,13 +422,16 @@ fn verify_token_cms(token_der: &[u8]) -> Result<(VerifiedToken, TstInfo), TspErr
     // The eContent is an OCTET STRING; its value is the DER of TSTInfo.
     let tst_info_der = econtent.value().to_vec();
 
-    // Exactly one SignerInfo is expected for an RFC 3161 token.
-    let signer_info = signed_data
-        .signer_infos
-        .0
-        .iter()
-        .next()
-        .ok_or_else(|| TspError::InvalidResponse("SignedData contains no SignerInfo".into()))?;
+    // Exactly one SignerInfo is expected for an RFC 3161 token. More than one
+    // makes verification ambiguous (which signer is authoritative?), so reject.
+    let signer_infos = &signed_data.signer_infos.0;
+    if signer_infos.len() != 1 {
+        return Err(TspError::InvalidResponse(format!(
+            "expected exactly one SignerInfo, found {}",
+            signer_infos.len()
+        )));
+    }
+    let signer_info = signer_infos.iter().next().expect("checked len == 1");
 
     // Signed attributes are mandatory: the signature is computed over them, and
     // they carry the message-digest binding to the eContent.
@@ -465,7 +465,7 @@ fn verify_token_cms(token_der: &[u8]) -> Result<(VerifiedToken, TstInfo), TspErr
     })?;
 
     // --- content-type signed attribute must equal id-ct-TSTInfo ---
-    let content_type_attr = find_attribute(signed_attrs, &ID_CONTENT_TYPE_ATTR).ok_or_else(|| {
+    let content_type_attr = find_attribute(signed_attrs, &ID_CONTENT_TYPE_ATTR)?.ok_or_else(|| {
         TspError::VerificationFailed("signedAttrs missing content-type attribute".into())
     })?;
     let signed_content_type: ObjectIdentifier = content_type_attr
@@ -479,12 +479,21 @@ fn verify_token_cms(token_der: &[u8]) -> Result<(VerifiedToken, TstInfo), TspErr
 
     // --- message-digest signed attribute must equal digest(eContent) ---
     let message_digest_attr =
-        find_attribute(signed_attrs, &ID_MESSAGE_DIGEST_ATTR).ok_or_else(|| {
+        find_attribute(signed_attrs, &ID_MESSAGE_DIGEST_ATTR)?.ok_or_else(|| {
             TspError::VerificationFailed("signedAttrs missing message-digest attribute".into())
         })?;
-    let signed_digest = message_digest_attr.value();
+    // RFC 5652: the message-digest attribute value is an OCTET STRING. Decode it
+    // as such rather than reading raw Any bytes, so a different ASN.1 type whose
+    // content happens to match cannot be accepted.
+    let signed_digest = message_digest_attr
+        .decode_as::<OctetString>()
+        .map_err(|e| {
+            TspError::VerificationFailed(format!(
+                "message-digest attribute is not an OCTET STRING: {e}"
+            ))
+        })?;
     let computed_digest = digest_alg.digest(&tst_info_der);
-    if signed_digest != computed_digest.as_slice() {
+    if signed_digest.as_bytes() != computed_digest.as_slice() {
         return Err(TspError::VerificationFailed(
             "message-digest signed attribute does not match the TSTInfo content".into(),
         ));
@@ -516,6 +525,11 @@ fn verify_token_cms(token_der: &[u8]) -> Result<(VerifiedToken, TstInfo), TspErr
 
     // The TSTInfo is now authenticated; parse its fields.
     let tst_info = parse_tst_info_body(&tst_info_der)?;
+
+    // RFC 3161: genTime must fall within the signing certificate's validity.
+    // This holds independently of any trust store, so enforce it on every
+    // verification path (both the requester and the verifier entry points).
+    check_gen_time_within_validity(&signer, &tst_info)?;
 
     Ok((VerifiedToken { signer, embedded }, tst_info))
 }
@@ -597,15 +611,33 @@ fn cert_ski(cert: &Certificate) -> Option<Vec<u8>> {
     Some(body)
 }
 
-/// Find a signed attribute by OID and return its single value.
+/// Find a single-valued signed attribute by OID.
+///
+/// Returns `Ok(None)` if the attribute is absent. CMS signed attributes such as
+/// `content-type` and `message-digest` must appear exactly once and carry a
+/// single value (RFC 5652 §11); duplicate attributes or multi-valued attributes
+/// are rejected with `Err` to avoid ambiguity.
 fn find_attribute<'a>(
     attrs: &'a x509_cert::attr::Attributes,
     oid: &ObjectIdentifier,
-) -> Option<&'a der::Any> {
-    attrs
-        .iter()
-        .find(|attr| attr.oid == *oid)
-        .and_then(|attr| attr.values.iter().next())
+) -> Result<Option<&'a der::Any>, TspError> {
+    let mut matching = attrs.iter().filter(|attr| attr.oid == *oid);
+    let attr = match matching.next() {
+        Some(a) => a,
+        None => return Ok(None),
+    };
+    if matching.next().is_some() {
+        return Err(TspError::VerificationFailed(format!(
+            "duplicate signed attribute {oid}"
+        )));
+    }
+    if attr.values.len() != 1 {
+        return Err(TspError::VerificationFailed(format!(
+            "signed attribute {oid} must have exactly one value (has {})",
+            attr.values.len()
+        )));
+    }
+    Ok(attr.values.iter().next())
 }
 
 /// Map a CMS `SignerInfo.signatureAlgorithm` OID (which may be a bare key
@@ -1139,8 +1171,12 @@ mod tests {
         0x06, 0x09, 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x01,
     ];
 
-    /// Build a DER-encoded TSTInfo with the given message imprint hash and nonce.
-    fn build_tst_info(hash: &[u8], nonce: u64) -> Vec<u8> {
+    /// genTime inside the TSA cert validity (2026..2036).
+    const GEN_TIME_VALID: &[u8] = b"20300101000000Z";
+
+    /// Build a DER-encoded TSTInfo with the given message imprint hash, nonce,
+    /// and genTime (GeneralizedTime contents, e.g. b"20300101000000Z").
+    fn build_tst_info(hash: &[u8], nonce: u64, gen_time_bytes: &[u8]) -> Vec<u8> {
         let version = der_utils::encode_integer_u64(1);
         // policy OID (arbitrary but well-formed)
         let policy = der_utils::encode_tlv(0x06, &[0x2B, 0x06, 0x01, 0x04, 0x01]);
@@ -1149,8 +1185,7 @@ mod tests {
         let hashed = der_utils::encode_tlv(0x04, hash);
         let message_imprint = der_utils::encode_sequence_from_parts(&[&alg, &hashed]);
         let serial = der_utils::encode_integer_u64(42);
-        // genTime within the TSA cert validity (2026..2036)
-        let gen_time = der_utils::encode_tlv(0x18, b"20300101000000Z");
+        let gen_time = der_utils::encode_tlv(0x18, gen_time_bytes);
         let nonce_int = der_utils::encode_integer_u64(nonce);
         let body = [version, policy, message_imprint, serial, gen_time, nonce_int].concat();
         der_utils::encode_sequence_raw(&body)
@@ -1173,13 +1208,36 @@ mod tests {
         nonce: u64,
         corrupt_sig: bool,
     ) -> Vec<u8> {
+        build_signed_token_gt(
+            signer_cert_pem,
+            signer_key_pem,
+            extra_certs,
+            hash,
+            nonce,
+            GEN_TIME_VALID,
+            corrupt_sig,
+        )
+    }
+
+    /// Like [`build_signed_token`] but with an explicit genTime, for testing the
+    /// genTime-within-validity check.
+    #[allow(clippy::too_many_arguments)]
+    fn build_signed_token_gt(
+        signer_cert_pem: &str,
+        signer_key_pem: &str,
+        extra_certs: &[&str],
+        hash: &[u8],
+        nonce: u64,
+        gen_time_bytes: &[u8],
+        corrupt_sig: bool,
+    ) -> Vec<u8> {
         use rsa::pkcs1v15::{Signature, SigningKey};
         use rsa::pkcs8::DecodePrivateKey;
         use rsa::signature::{Signer, SignatureEncoding};
         use sha2::{Digest, Sha256};
 
         let signer_cert = load_cert(signer_cert_pem);
-        let tst_info_der = build_tst_info(hash, nonce);
+        let tst_info_der = build_tst_info(hash, nonce, gen_time_bytes);
 
         // Signed attributes: content-type = id-ct-TSTInfo, message-digest = SHA256(eContent)
         let digest = Sha256::digest(&tst_info_der).to_vec();
@@ -1306,6 +1364,28 @@ mod tests {
     }
 
     #[test]
+    fn test_reject_gen_time_outside_validity_without_trust_store() {
+        // genTime in 2050 is past the TSA cert's notAfter (~2036). This must be
+        // rejected even when no trust store is supplied (RFC 3161 requirement).
+        let hash = vec![0x77u8; 32];
+        let token = build_signed_token_gt(
+            TSA_CERT_PEM,
+            TSA_KEY_PEM,
+            &[],
+            &hash,
+            1,
+            b"20500101000000Z",
+            false,
+        );
+        let err = verify_timestamp_token(&token, &hash, DigestAlgorithm::Sha256, None, None, None)
+            .unwrap_err();
+        assert!(
+            matches!(err, TspError::VerificationFailed(_)),
+            "genTime outside TSA cert validity must be rejected, got {err:?}"
+        );
+    }
+
+    #[test]
     fn test_reject_tampered_signature() {
         let hash = vec![0x22u8; 32];
         let token = build_signed_token(TSA_CERT_PEM, TSA_KEY_PEM, &[], &hash, 1, true);
@@ -1360,7 +1440,7 @@ mod tests {
         // A token with no SignerInfo — the kind the old (vulnerable) code would
         // have accepted because it only parsed TSTInfo. Must now be rejected.
         let hash = vec![0x55u8; 32];
-        let tst_info_der = build_tst_info(&hash, 1);
+        let tst_info_der = build_tst_info(&hash, 1, GEN_TIME_VALID);
         let signed_data = cms::signed_data::SignedData {
             version: CmsVersion::V3,
             digest_algorithms: SetOfVec::new(),
