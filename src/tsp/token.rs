@@ -320,7 +320,9 @@ pub fn validate_timestamp_response(
     })?;
 
     // Cryptographically verify the CMS signature and bind it to the TSTInfo.
-    let (_verified, tst_info) = verify_token_cms(token_der)?;
+    // The requester sets certReq=true, so the signing cert is embedded; no
+    // out-of-band certificates are needed here.
+    let (_verified, tst_info) = verify_token_cms(token_der, &[])?;
 
     // Validate message imprint hash / algorithm / nonce against the request.
     check_tst_info_matches(&tst_info, expected_hash, expected_nonce, digest_algorithm)?;
@@ -342,11 +344,17 @@ pub fn validate_timestamp_response(
 /// 4. Require a critical `id-kp-timeStamping` EKU on the signing certificate.
 /// 5. Confirm the message imprint hash/algorithm (and nonce, if supplied) match.
 /// 6. If `trust_store` is provided: build the certificate chain from the
-///    embedded certificates and verify it terminates at a trust anchor, and
-///    confirm `genTime` falls within the TSA certificate's validity period.
+///    available certificates and verify it terminates at a trust anchor.
+///
+/// The CMS `certificates` field is optional (RFC 5652) and some TSAs omit it
+/// (e.g. when `certReq` was false). `extra_certs` lets the caller supply the
+/// TSA signing certificate (and any intermediates) out-of-band so such tokens
+/// can still be verified; pass `&[]` when the token embeds its own certificates.
 ///
 /// `validation_time` is the time at which certificate validity is assessed
 /// (typically the timestamp's `genTime` for archival validation, or "now").
+/// When `None` and a trust store is supplied, it defaults to the token's
+/// authenticated `genTime`.
 ///
 /// Returns the verified [`TstInfo`] on success.
 pub fn verify_timestamp_token(
@@ -356,8 +364,9 @@ pub fn verify_timestamp_token(
     expected_nonce: Option<u64>,
     trust_store: Option<&TrustStore>,
     validation_time: Option<der::DateTime>,
+    extra_certs: &[Certificate],
 ) -> Result<TstInfo, TspError> {
-    let (verified, tst_info) = verify_token_cms(token_der)?;
+    let (verified, tst_info) = verify_token_cms(token_der, extra_certs)?;
 
     check_tst_info_matches(&tst_info, expected_hash, expected_nonce, digest_algorithm)?;
 
@@ -399,7 +408,10 @@ struct VerifiedToken {
 ///
 /// Returns the verified signer/embedded certificates together with the parsed
 /// `TSTInfo` taken from the (now-authenticated) encapsulated content.
-fn verify_token_cms(token_der: &[u8]) -> Result<(VerifiedToken, TstInfo), TspError> {
+fn verify_token_cms(
+    token_der: &[u8],
+    extra_certs: &[Certificate],
+) -> Result<(VerifiedToken, TstInfo), TspError> {
     use cms::cert::CertificateChoices;
     use cms::content_info::ContentInfo;
     use cms::signed_data::SignedData;
@@ -450,7 +462,9 @@ fn verify_token_cms(token_der: &[u8]) -> Result<(VerifiedToken, TstInfo), TspErr
         TspError::VerificationFailed("SignerInfo has no signedAttrs".into())
     })?;
 
-    // Collect embedded certificates.
+    // Collect candidate certificates: those embedded in the token (CMS
+    // `certificates` is optional and may be absent) plus any supplied
+    // out-of-band by the caller via `extra_certs`.
     let mut embedded: Vec<Certificate> = Vec::new();
     if let Some(cert_set) = &signed_data.certificates {
         for choice in cert_set.0.iter() {
@@ -459,11 +473,19 @@ fn verify_token_cms(token_der: &[u8]) -> Result<(VerifiedToken, TstInfo), TspErr
             }
         }
     }
+    for cert in extra_certs {
+        if !embedded
+            .iter()
+            .any(|c| c.tbs_certificate == cert.tbs_certificate)
+        {
+            embedded.push(cert.clone());
+        }
+    }
 
     // Locate the signing certificate identified by SignerInfo.sid.
     let signer = find_signer_cert(&signer_info.sid, &embedded).ok_or_else(|| {
         TspError::VerificationFailed(
-            "signing certificate identified by SignerInfo not found in token".into(),
+            "signing certificate identified by SignerInfo not found in token or extra_certs".into(),
         )
     })?;
 
@@ -1283,9 +1305,37 @@ mod tests {
         0x06, 0x09, 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x01,
     ];
 
-    /// genTime inside the TSA cert validity. The runtime cert is valid from
-    /// "now" for ~10 years, so a near-future fixed instant is safely inside.
-    const GEN_TIME_VALID: &[u8] = b"20300101000000Z";
+    /// Format a chrono UTC instant as GeneralizedTime contents (YYYYMMDDHHMMSSZ).
+    fn fmt_generalized(dt: chrono::DateTime<chrono::Utc>) -> Vec<u8> {
+        dt.format("%Y%m%d%H%M%SZ").to_string().into_bytes()
+    }
+
+    /// A genTime inside the runtime TSA cert validity. The cert is valid from
+    /// "now" for ~10 years, so the current instant is always inside. Derived
+    /// from the clock (not a hard-coded calendar date) so tests don't expire.
+    fn gen_time_within() -> Vec<u8> {
+        fmt_generalized(chrono::Utc::now())
+    }
+
+    /// A genTime past the runtime TSA cert's notAfter (~now + 10y).
+    fn gen_time_after_validity() -> Vec<u8> {
+        fmt_generalized(chrono::Utc::now() + chrono::Duration::days(365 * 20))
+    }
+
+    /// A `der::DateTime` for "now", used as the chain validation time.
+    fn validation_time() -> der::DateTime {
+        use chrono::{Datelike, Timelike};
+        let n = chrono::Utc::now();
+        der::DateTime::new(
+            n.year() as u16,
+            n.month() as u8,
+            n.day() as u8,
+            n.hour() as u8,
+            n.minute() as u8,
+            n.second() as u8,
+        )
+        .unwrap()
+    }
 
     /// Build a DER-encoded TSTInfo with the given message imprint hash, nonce,
     /// and genTime (GeneralizedTime contents, e.g. b"20300101000000Z").
@@ -1327,13 +1377,15 @@ mod tests {
             extra_certs,
             hash,
             nonce,
-            GEN_TIME_VALID,
+            &gen_time_within(),
+            true,
             corrupt_sig,
         )
     }
 
-    /// Like [`build_signed_token`] but with an explicit genTime, for testing the
-    /// genTime-within-validity check.
+    /// Like [`build_signed_token`] but with an explicit genTime and control over
+    /// whether the certificates are embedded (`embed_certs`), for testing the
+    /// genTime-within-validity check and externally-supplied signer certs.
     #[allow(clippy::too_many_arguments)]
     fn build_signed_token_gt(
         signer_cert: &Certificate,
@@ -1342,6 +1394,7 @@ mod tests {
         hash: &[u8],
         nonce: u64,
         gen_time_bytes: &[u8],
+        embed_certs: bool,
         corrupt_sig: bool,
     ) -> Vec<u8> {
         use rsa::pkcs1v15::{Signature, SigningKey};
@@ -1392,11 +1445,18 @@ mod tests {
             unsigned_attrs: None,
         };
 
-        // Embedded certificates: signer first, then any extras.
-        let mut cert_choices = vec![CertificateChoices::Certificate(signer_cert.clone())];
-        for cert in extra_certs {
-            cert_choices.push(CertificateChoices::Certificate(cert.clone()));
-        }
+        // Embedded certificates (optional): signer first, then any extras.
+        let certificates = if embed_certs {
+            let mut cert_choices = vec![CertificateChoices::Certificate(signer_cert.clone())];
+            for cert in extra_certs {
+                cert_choices.push(CertificateChoices::Certificate(cert.clone()));
+            }
+            Some(CertificateSet::from(
+                SetOfVec::try_from(cert_choices).unwrap(),
+            ))
+        } else {
+            None
+        };
 
         let signed_data = cms::signed_data::SignedData {
             version: CmsVersion::V3,
@@ -1405,9 +1465,7 @@ mod tests {
                 econtent_type: ID_CT_TST_INFO,
                 econtent: Some(Any::new(Tag::OctetString, tst_info_der).unwrap()),
             },
-            certificates: Some(CertificateSet::from(
-                SetOfVec::try_from(cert_choices).unwrap(),
-            )),
+            certificates,
             crls: None,
             signer_infos: SignerInfos::from(SetOfVec::try_from(vec![signer_info]).unwrap()),
         };
@@ -1419,9 +1477,6 @@ mod tests {
         content_info.to_der().unwrap()
     }
 
-    fn validation_time() -> der::DateTime {
-        der::DateTime::new(2030, 6, 1, 12, 0, 0).unwrap()
-    }
 
     #[test]
     fn test_verify_valid_token_no_trust_store() {
@@ -1436,6 +1491,7 @@ mod tests {
             Some(nonce),
             None,
             None,
+            &[],
         )
         .expect("validly-signed token must verify");
         assert_eq!(tst.message_hash, hash);
@@ -1467,6 +1523,7 @@ mod tests {
             Some(nonce),
             Some(&store),
             Some(validation_time()),
+            &[],
         )
         .expect("token chaining to a trusted root must verify");
         assert_eq!(tst.message_hash, hash);
@@ -1475,7 +1532,7 @@ mod tests {
     #[test]
     fn test_trust_store_validation_time_defaults_to_gen_time() {
         // With a trust store but validation_time = None, the chain must still be
-        // verified using the token's genTime (not skipped). genTime is 2030,
+        // verified using the token's genTime (not skipped). genTime is "now",
         // within every cert's validity, so this must succeed.
         let hash = vec![0x88u8; 32];
         let token = build_signed_token(
@@ -1497,14 +1554,15 @@ mod tests {
             None,
             Some(&store),
             None, // -> defaults to genTime
+            &[],
         )
         .expect("chain must verify at genTime when validation_time is None");
     }
 
     #[test]
     fn test_reject_gen_time_outside_validity_without_trust_store() {
-        // genTime in 2050 is past the TSA cert's notAfter (~2036). This must be
-        // rejected even when no trust store is supplied (RFC 3161 requirement).
+        // genTime ~20 years out is past the TSA cert's notAfter (~now + 10y).
+        // This must be rejected even when no trust store is supplied (RFC 3161).
         let hash = vec![0x77u8; 32];
         let token = build_signed_token_gt(
             &tsa_cert(),
@@ -1512,10 +1570,11 @@ mod tests {
             &[],
             &hash,
             1,
-            b"20500101000000Z",
-            false,
+            &gen_time_after_validity(),
+            true,  // embed certs
+            false, // valid signature
         );
-        let err = verify_timestamp_token(&token, &hash, DigestAlgorithm::Sha256, None, None, None)
+        let err = verify_timestamp_token(&token, &hash, DigestAlgorithm::Sha256, None, None, None, &[])
             .unwrap_err();
         assert!(
             matches!(err, TspError::VerificationFailed(_)),
@@ -1527,7 +1586,7 @@ mod tests {
     fn test_reject_tampered_signature() {
         let hash = vec![0x22u8; 32];
         let token = build_signed_token(&tsa_cert(), &tsa_key(), &[], &hash, 1, true);
-        let err = verify_timestamp_token(&token, &hash, DigestAlgorithm::Sha256, None, None, None)
+        let err = verify_timestamp_token(&token, &hash, DigestAlgorithm::Sha256, None, None, None, &[])
             .unwrap_err();
         assert!(
             matches!(err, TspError::VerificationFailed(_)),
@@ -1555,6 +1614,7 @@ mod tests {
             None,
             Some(&empty_store),
             Some(validation_time()),
+            &[],
         )
         .unwrap_err();
         assert!(
@@ -1571,7 +1631,7 @@ mod tests {
         let hash = vec![0x44u8; 32];
         let token =
             build_signed_token(&intermediate_cert(), &intermediate_key(), &[], &hash, 1, false);
-        let err = verify_timestamp_token(&token, &hash, DigestAlgorithm::Sha256, None, None, None)
+        let err = verify_timestamp_token(&token, &hash, DigestAlgorithm::Sha256, None, None, None, &[])
             .unwrap_err();
         assert!(
             matches!(err, TspError::VerificationFailed(_)),
@@ -1584,7 +1644,7 @@ mod tests {
         // A token with no SignerInfo — the kind the old (vulnerable) code would
         // have accepted because it only parsed TSTInfo. Must now be rejected.
         let hash = vec![0x55u8; 32];
-        let tst_info_der = build_tst_info(&hash, 1, GEN_TIME_VALID);
+        let tst_info_der = build_tst_info(&hash, 1, &gen_time_within());
         let signed_data = cms::signed_data::SignedData {
             version: CmsVersion::V3,
             digest_algorithms: SetOfVec::new(),
@@ -1602,7 +1662,7 @@ mod tests {
         };
         let token = content_info.to_der().unwrap();
 
-        let err = verify_timestamp_token(&token, &hash, DigestAlgorithm::Sha256, None, None, None)
+        let err = verify_timestamp_token(&token, &hash, DigestAlgorithm::Sha256, None, None, None, &[])
             .unwrap_err();
         assert!(
             matches!(err, TspError::InvalidResponse(_)),
@@ -1619,6 +1679,7 @@ mod tests {
             None,
             None,
             None,
+            &[],
         )
         .unwrap_err();
         assert!(matches!(err, TspError::InvalidResponse(_)));
@@ -1631,8 +1692,47 @@ mod tests {
         let real_hash = vec![0x66u8; 32];
         let token = build_signed_token(&tsa_cert(), &tsa_key(), &[], &real_hash, 1, false);
         let expected = vec![0x99u8; 32];
-        let err = verify_timestamp_token(&token, &expected, DigestAlgorithm::Sha256, None, None, None)
+        let err = verify_timestamp_token(&token, &expected, DigestAlgorithm::Sha256, None, None, None, &[])
             .unwrap_err();
         assert!(matches!(err, TspError::InvalidResponse(_)));
+    }
+
+    #[test]
+    fn test_verify_token_without_embedded_certs_via_extra_certs() {
+        // A token that omits the CMS certificates field (e.g. certReq=false).
+        // It cannot be verified on its own, but succeeds when the signer cert is
+        // supplied out-of-band through `extra_certs`.
+        let hash = vec![0xC0u8; 32];
+        let token = build_signed_token_gt(
+            &tsa_cert(),
+            &tsa_key(),
+            &[],
+            &hash,
+            1,
+            &gen_time_within(),
+            false, // do NOT embed certificates
+            false,
+        );
+
+        // Without the cert, verification fails (no key to check the signature).
+        let err = verify_timestamp_token(&token, &hash, DigestAlgorithm::Sha256, None, None, None, &[])
+            .unwrap_err();
+        assert!(
+            matches!(err, TspError::VerificationFailed(_)),
+            "token without certs and no extra_certs must fail, got {err:?}"
+        );
+
+        // Supplying the signer cert out-of-band lets it verify.
+        let tst = verify_timestamp_token(
+            &token,
+            &hash,
+            DigestAlgorithm::Sha256,
+            None,
+            None,
+            None,
+            &[tsa_cert()],
+        )
+        .expect("token must verify with externally-supplied signer cert");
+        assert_eq!(tst.message_hash, hash);
     }
 }
