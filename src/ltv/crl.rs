@@ -285,8 +285,8 @@ pub struct RevokedEntry {
 pub struct ParsedCrl {
     /// Raw TBS bytes (for signature verification).
     pub tbs_bytes: Vec<u8>,
-    /// Signature algorithm OID.
-    pub signature_algorithm_oid: const_oid::ObjectIdentifier,
+    /// Signature algorithm (OID plus any parameters, e.g. RSASSA-PSS-params).
+    pub signature_algorithm: spki::AlgorithmIdentifierOwned,
     /// Raw signature bytes (BIT STRING contents, without the unused-bits byte).
     pub signature_bytes: Vec<u8>,
     /// CRL issuer distinguished name (raw DER of the Name SEQUENCE).
@@ -341,16 +341,21 @@ pub fn parse_crl(crl_der: &[u8]) -> Result<ParsedCrl, LtvError> {
     let tbs_end = crl_der.len() - outer_body.len() + (outer_body.len() - rest.len());
     let tbs_bytes = crl_der[tbs_start..tbs_end].to_vec();
 
-    // signatureAlgorithm SEQUENCE
-    let (sig_alg_tag, sig_alg_body, rest) =
-        parse_tlv_with_rest(rest).map_err(|e| LtvError::Crl(format!("CRL sigAlg: {e}")))?;
+    // signatureAlgorithm AlgorithmIdentifier (SEQUENCE). Keep the full
+    // structure (OID + parameters) so RSASSA-PSS-params are available when the
+    // signature is verified, rather than discarding everything but the OID.
+    use der::Decode as _;
+    let sig_alg_input = rest;
+    let (sig_alg_tag, _sig_alg_body, rest) = parse_tlv_with_rest(sig_alg_input)
+        .map_err(|e| LtvError::Crl(format!("CRL sigAlg: {e}")))?;
     if sig_alg_tag != 0x30 {
         return Err(LtvError::Crl(format!(
             "expected signatureAlgorithm SEQUENCE, got 0x{sig_alg_tag:02x}"
         )));
     }
-    // Extract OID from the AlgorithmIdentifier SEQUENCE
-    let sig_oid = parse_oid_from_algorithm_identifier(&sig_alg_body)?;
+    let sig_alg_der = &sig_alg_input[..sig_alg_input.len() - rest.len()];
+    let signature_algorithm = spki::AlgorithmIdentifierOwned::from_der(sig_alg_der)
+        .map_err(|e| LtvError::Crl(format!("CRL signatureAlgorithm decode: {e}")))?;
 
     // signatureValue BIT STRING
     let (sig_val_tag, sig_val_body, _) =
@@ -437,27 +442,13 @@ pub fn parse_crl(crl_der: &[u8]) -> Result<ParsedCrl, LtvError> {
 
     Ok(ParsedCrl {
         tbs_bytes,
-        signature_algorithm_oid: sig_oid,
+        signature_algorithm,
         signature_bytes,
         issuer_der,
         this_update,
         next_update,
         revoked_entries,
     })
-}
-
-/// Parse an OID from a DER AlgorithmIdentifier body.
-fn parse_oid_from_algorithm_identifier(body: &[u8]) -> Result<const_oid::ObjectIdentifier, LtvError>
-{
-    let (tag, oid_bytes, _) =
-        parse_tlv_with_rest(body).map_err(|e| LtvError::Crl(format!("AlgId OID: {e}")))?;
-    if tag != 0x06 {
-        return Err(LtvError::Crl(format!(
-            "expected OID (0x06) in AlgorithmIdentifier, got 0x{tag:02x}"
-        )));
-    }
-    const_oid::ObjectIdentifier::from_bytes(oid_bytes)
-        .map_err(|e| LtvError::Crl(format!("invalid OID: {e}")))
 }
 
 /// Parse the revokedCertificates SEQUENCE body.
@@ -562,7 +553,9 @@ fn parse_revocation_reason(extensions_area: &[u8]) -> RevocationReason {
 
 /// Verify a CRL's signature against the issuer's public key.
 ///
-/// Extracts the issuer's SPKI, then delegates to [`crate::crypto::verify::verify_signature_by_oid`].
+/// Extracts the issuer's SPKI, then delegates to
+/// [`crate::crypto::verify::verify_signature_by_algid`] so RSASSA-PSS
+/// parameters are honoured.
 pub fn verify_crl_signature(
     parsed_crl: &ParsedCrl,
     issuer: &Certificate,
@@ -575,11 +568,11 @@ pub fn verify_crl_signature(
         .to_der()
         .map_err(|e| LtvError::Crl(format!("issuer SPKI encode failed: {e}")))?;
 
-    crate::crypto::verify::verify_signature_by_oid(
+    crate::crypto::verify::verify_signature_by_algid(
         &parsed_crl.tbs_bytes,
         &parsed_crl.signature_bytes,
         &spki_der,
-        &parsed_crl.signature_algorithm_oid,
+        &parsed_crl.signature_algorithm,
     )
     .map_err(|e| LtvError::Crl(format!("CRL signature verification failed: {e}")))
 }

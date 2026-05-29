@@ -116,8 +116,8 @@ pub struct SingleResponse {
 pub struct ParsedBasicOcspResponse {
     /// Raw tbsResponseData bytes (for signature verification).
     pub tbs_response_data: Vec<u8>,
-    /// Signature algorithm OID.
-    pub signature_algorithm_oid: const_oid::ObjectIdentifier,
+    /// Signature algorithm (OID plus any parameters, e.g. RSASSA-PSS-params).
+    pub signature_algorithm: spki::AlgorithmIdentifierOwned,
     /// Raw signature bytes (BIT STRING contents, without unused-bits byte).
     pub signature_bytes: Vec<u8>,
     /// Responder ID — either byName (DER Name) or byKeyHash (OCTET STRING body).
@@ -719,15 +719,23 @@ fn parse_basic_ocsp_response(der: &[u8]) -> Result<ParsedBasicOcspResponse, LtvE
     let tbs_consumed = body.len() - rest.len();
     let tbs_response_data = body[..tbs_consumed].to_vec();
 
-    // signatureAlgorithm AlgorithmIdentifier SEQUENCE
-    let (sig_alg_tag, sig_alg_body, rest) = der_utils::parse_tlv_with_rest(rest)
+    // signatureAlgorithm AlgorithmIdentifier SEQUENCE. Keep the full structure
+    // (OID + parameters) so RSASSA-PSS-params are available when the signature
+    // is verified, rather than discarding everything but the OID.
+    let sig_alg_input = rest;
+    let (sig_alg_tag, _sig_alg_body, rest) = der_utils::parse_tlv_with_rest(sig_alg_input)
         .map_err(|e| LtvError::Ocsp(format!("signatureAlgorithm: {e}")))?;
     if sig_alg_tag != 0x30 {
         return Err(LtvError::Ocsp(format!(
             "expected signatureAlgorithm SEQUENCE, got 0x{sig_alg_tag:02x}"
         )));
     }
-    let sig_alg_oid = parse_oid_from_algorithm_identifier(&sig_alg_body)?;
+    let sig_alg_der = &sig_alg_input[..sig_alg_input.len() - rest.len()];
+    let signature_algorithm = {
+        use der::Decode as _;
+        spki::AlgorithmIdentifierOwned::from_der(sig_alg_der)
+            .map_err(|e| LtvError::Ocsp(format!("signatureAlgorithm decode: {e}")))?
+    };
 
     // signature BIT STRING
     let (sig_tag, sig_body, rest) = der_utils::parse_tlv_with_rest(rest)
@@ -851,7 +859,7 @@ fn parse_basic_ocsp_response(der: &[u8]) -> Result<ParsedBasicOcspResponse, LtvE
 
     Ok(ParsedBasicOcspResponse {
         tbs_response_data,
-        signature_algorithm_oid: sig_alg_oid,
+        signature_algorithm,
         signature_bytes,
         responder_id,
         produced_at,
@@ -1014,21 +1022,6 @@ fn parse_revoked_info(body: &[u8]) -> Result<CertStatus, LtvError> {
     })
 }
 
-/// Extract OID from an AlgorithmIdentifier body.
-fn parse_oid_from_algorithm_identifier(
-    body: &[u8],
-) -> Result<const_oid::ObjectIdentifier, LtvError> {
-    let (tag, oid_bytes, _) = der_utils::parse_tlv_with_rest(body)
-        .map_err(|e| LtvError::Ocsp(format!("AlgId OID: {e}")))?;
-    if tag != 0x06 {
-        return Err(LtvError::Ocsp(format!(
-            "expected OID (0x06) in AlgorithmIdentifier, got 0x{tag:02x}"
-        )));
-    }
-    const_oid::ObjectIdentifier::from_bytes(oid_bytes)
-        .map_err(|e| LtvError::Ocsp(format!("invalid OID: {e}")))
-}
-
 /// Extract nonce value from response extensions.
 ///
 /// The nonce extension (OID 1.3.6.1.5.5.7.48.1.2) may contain the nonce
@@ -1103,11 +1096,11 @@ fn verify_ocsp_response_signature(
             Err(_) => continue,
         };
 
-        let result = crate::crypto::verify::verify_signature_by_oid(
+        let result = crate::crypto::verify::verify_signature_by_algid(
             &parsed.tbs_response_data,
             &parsed.signature_bytes,
             &spki_der,
-            &parsed.signature_algorithm_oid,
+            &parsed.signature_algorithm,
         );
 
         if result.is_ok() {

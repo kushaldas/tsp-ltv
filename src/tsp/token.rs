@@ -764,19 +764,15 @@ fn verify_cms_signature(
 }
 
 /// Verify an RSASSA-PSS `SignerInfo` signature strictly per its
-/// `RSASSA-PSS-params` (RFC 4055).
+/// `RSASSA-PSS-params` (RFC 4055), then bind the PSS hash to
+/// `SignerInfo.digestAlgorithm`.
 ///
-/// For PSS the salt length, MGF1 hash, and trailer field are part of the
-/// algorithm definition and live in `signature_algorithm.parameters` — they are
-/// not implied by the OID. This decodes them and enforces:
-/// - the PSS `hashAlgorithm` is supported and equals `digestAlgorithm`,
-/// - `maskGenAlgorithm` is MGF1 keyed to that same hash (the only form RFC 4055
-///   recommends and the underlying verifier supports),
-/// - the declared `saltLength` is used for verification (PSS verification is
-///   salt-length sensitive).
-///
-/// `trailerField` can only decode to the single defined value (`0xBC`), so
-/// `RsaPssParams` decoding already rejects anything else.
+/// The parameter handling (hashAlgorithm, MGF1 hash, saltLength, trailerField)
+/// lives in [`crate::crypto::verify::verify_rsa_pss_signature_strict`], shared
+/// with certificate/CRL/OCSP verification. On top of that, CMS requires the
+/// PSS `hashAlgorithm` to equal the `digestAlgorithm` used for the
+/// message-digest attribute, so a token that pairs a mismatched hash with PSS
+/// is rejected here even though the signature itself is well-formed.
 fn verify_pss_signature(
     signed_attrs_der: &[u8],
     signature: &[u8],
@@ -784,33 +780,15 @@ fn verify_pss_signature(
     signature_algorithm: &AlgorithmIdentifierOwned,
     digest_alg: DigestAlgorithm,
 ) -> Result<(), TrustError> {
-    use crate::crypto::verify::verify_rsa_pss_signature_with_salt;
-    use rsa::pkcs1::RsaPssParams;
+    use crate::crypto::verify::verify_rsa_pss_signature_strict;
 
-    /// id-mgf1 (1.2.840.113549.1.1.8).
-    const OID_MGF1: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.840.113549.1.1.8");
+    let pss_hash = verify_rsa_pss_signature_strict(
+        signed_attrs_der,
+        signature,
+        spki_der,
+        signature_algorithm.parameters.as_ref(),
+    )?;
 
-    // RFC 4055: the parameters are REQUIRED for RSASSA-PSS; without them the
-    // hash/MGF/salt are undefined for our purposes.
-    let params_any = signature_algorithm.parameters.as_ref().ok_or_else(|| {
-        TrustError::UnsupportedAlgorithm(
-            "RSASSA-PSS signatureAlgorithm is missing its required parameters".into(),
-        )
-    })?;
-    let params_der = params_any.to_der().map_err(|e| {
-        TrustError::SignatureVerification(format!("failed to re-encode RSASSA-PSS parameters: {e}"))
-    })?;
-    let params = RsaPssParams::try_from(params_der.as_slice()).map_err(|e| {
-        TrustError::SignatureVerification(format!("failed to decode RSASSA-PSS parameters: {e}"))
-    })?;
-
-    // The PSS hash must be one we support and must match digestAlgorithm.
-    let pss_hash = DigestAlgorithm::from_oid(&params.hash.oid).ok_or_else(|| {
-        TrustError::UnsupportedAlgorithm(format!(
-            "unsupported RSASSA-PSS hashAlgorithm OID: {}",
-            params.hash.oid
-        ))
-    })?;
     if pss_hash != digest_alg {
         return Err(TrustError::SignatureVerification(format!(
             "RSASSA-PSS hashAlgorithm ({}) disagrees with SignerInfo.digestAlgorithm ({})",
@@ -819,48 +797,7 @@ fn verify_pss_signature(
         )));
     }
 
-    // maskGenAlgorithm must be MGF1 keyed to the same hash.
-    if params.mask_gen.oid != OID_MGF1 {
-        return Err(TrustError::UnsupportedAlgorithm(format!(
-            "unsupported RSASSA-PSS maskGenAlgorithm OID: {}",
-            params.mask_gen.oid
-        )));
-    }
-    let mgf1_hash_oid = params.mask_gen.parameters.as_ref().map(|h| h.oid);
-    if mgf1_hash_oid != Some(params.hash.oid) {
-        return Err(TrustError::UnsupportedAlgorithm(format!(
-            "RSASSA-PSS MGF1 hash ({}) differs from the message hash ({}); not supported",
-            mgf1_hash_oid
-                .map(|o| o.to_string())
-                .unwrap_or_else(|| "absent".into()),
-            params.hash.oid,
-        )));
-    }
-
-    let salt_len = params.salt_len as usize;
-    match digest_alg {
-        DigestAlgorithm::Sha256 => verify_rsa_pss_signature_with_salt::<sha2::Sha256>(
-            signed_attrs_der,
-            signature,
-            spki_der,
-            salt_len,
-        ),
-        DigestAlgorithm::Sha384 => verify_rsa_pss_signature_with_salt::<sha2::Sha384>(
-            signed_attrs_der,
-            signature,
-            spki_der,
-            salt_len,
-        ),
-        DigestAlgorithm::Sha512 => verify_rsa_pss_signature_with_salt::<sha2::Sha512>(
-            signed_attrs_der,
-            signature,
-            spki_der,
-            salt_len,
-        ),
-        other => Err(TrustError::UnsupportedAlgorithm(format!(
-            "RSASSA-PSS with digest {other:?}"
-        ))),
-    }
+    Ok(())
 }
 
 /// For a *combined* signature-algorithm OID (one that bakes in the hash, e.g.
