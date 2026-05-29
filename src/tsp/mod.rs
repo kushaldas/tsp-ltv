@@ -39,6 +39,6 @@ pub use client::{TsaClient, TsaClientPool};
 pub use token::{
     TimeStampResp, TstInfo, PkiStatus,
     build_timestamp_request, parse_timestamp_response,
-    validate_timestamp_response, extract_tst_info,
+    validate_timestamp_response, verify_timestamp_token, extract_tst_info,
     generate_nonce,
 };

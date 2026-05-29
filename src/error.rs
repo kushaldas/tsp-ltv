@@ -13,6 +13,9 @@ pub enum TspError {
 
     #[error("invalid timestamp response: {0}")]
     InvalidResponse(String),
+
+    #[error("timestamp token verification failed: {0}")]
+    VerificationFailed(String),
 }
 
 /// Errors from long-term validation operations (OCSP, CRL, chain building).

@@ -13,10 +13,14 @@
 //! - Ed25519
 
 use crate::crypto::algorithm::{
-    OID_ECDSA_WITH_SHA1, OID_ED25519, OID_MD5_WITH_RSA, OID_RSASSA_PSS, OID_SHA1_WITH_RSA,
-    OID_SHA224_WITH_RSA,
+    DigestAlgorithm, OID_ECDSA_WITH_SHA1, OID_ED25519, OID_MD5_WITH_RSA, OID_RSASSA_PSS,
+    OID_SHA1_WITH_RSA, OID_SHA224_WITH_RSA,
 };
 use crate::error::TrustError;
+
+/// id-mgf1 (1.2.840.113549.1.1.8) — the mask generation function for PSS.
+const OID_MGF1: const_oid::ObjectIdentifier =
+    const_oid::ObjectIdentifier::new_unwrap("1.2.840.113549.1.1.8");
 
 /// Verify a raw signature over `tbs_bytes` using the signer's SPKI (DER)
 /// and the given signature algorithm OID.
@@ -105,10 +109,117 @@ pub fn verify_signature_by_oid(
     }
 }
 
+/// Verify a signature given the full signature `AlgorithmIdentifier`.
+///
+/// This is the parameter-aware entry point and should be preferred over
+/// [`verify_signature_by_oid`] whenever the caller has the algorithm's
+/// parameters. For RSASSA-PSS it decodes the `RSASSA-PSS-params` and verifies
+/// strictly (hash, MGF1 hash, salt length) per RFC 4055; for every other
+/// algorithm the hash is implied by the OID, so it delegates to
+/// [`verify_signature_by_oid`].
+pub fn verify_signature_by_algid(
+    tbs_bytes: &[u8],
+    signature_bytes: &[u8],
+    spki_der: &[u8],
+    sig_alg: &spki::AlgorithmIdentifierOwned,
+) -> Result<(), TrustError> {
+    if sig_alg.oid == OID_RSASSA_PSS {
+        verify_rsa_pss_signature_strict(
+            tbs_bytes,
+            signature_bytes,
+            spki_der,
+            sig_alg.parameters.as_ref(),
+        )
+        .map(|_| ())
+    } else {
+        verify_signature_by_oid(tbs_bytes, signature_bytes, spki_der, &sig_alg.oid)
+    }
+}
+
+/// Verify an RSASSA-PSS signature strictly according to its `RSASSA-PSS-params`
+/// (RFC 4055), returning the digest the parameters selected.
+///
+/// For PSS the hash, MGF1 hash, salt length, and trailer field are part of the
+/// algorithm definition and live in the signature `AlgorithmIdentifier`
+/// parameters, not in the OID. This enforces:
+/// - the parameters are present (a bare PSS OID is rejected),
+/// - the `hashAlgorithm` is one we support,
+/// - `maskGenAlgorithm` is MGF1 keyed to that same hash (the only form RFC 4055
+///   recommends and the underlying verifier supports),
+/// - the declared `saltLength` is used (PSS verification is salt-length
+///   sensitive).
+///
+/// `trailerField` can only decode to its single defined value (`0xBC`), so
+/// `RsaPssParams` decoding already rejects anything else.
+pub fn verify_rsa_pss_signature_strict(
+    tbs: &[u8],
+    sig: &[u8],
+    spki_der: &[u8],
+    parameters: Option<&der::Any>,
+) -> Result<DigestAlgorithm, TrustError> {
+    use der::Encode;
+    use rsa::pkcs1::RsaPssParams;
+
+    let params_any = parameters.ok_or_else(|| {
+        TrustError::UnsupportedAlgorithm(
+            "RSASSA-PSS signatureAlgorithm is missing its required parameters".into(),
+        )
+    })?;
+    let params_der = params_any.to_der().map_err(|e| {
+        TrustError::SignatureVerification(format!("failed to re-encode RSASSA-PSS parameters: {e}"))
+    })?;
+    let params = RsaPssParams::try_from(params_der.as_slice()).map_err(|e| {
+        TrustError::SignatureVerification(format!("failed to decode RSASSA-PSS parameters: {e}"))
+    })?;
+
+    let hash = DigestAlgorithm::from_oid(&params.hash.oid).ok_or_else(|| {
+        TrustError::UnsupportedAlgorithm(format!(
+            "unsupported RSASSA-PSS hashAlgorithm OID: {}",
+            params.hash.oid
+        ))
+    })?;
+
+    if params.mask_gen.oid != OID_MGF1 {
+        return Err(TrustError::UnsupportedAlgorithm(format!(
+            "unsupported RSASSA-PSS maskGenAlgorithm OID: {}",
+            params.mask_gen.oid
+        )));
+    }
+    let mgf1_hash_oid = params.mask_gen.parameters.as_ref().map(|h| h.oid);
+    if mgf1_hash_oid != Some(params.hash.oid) {
+        return Err(TrustError::UnsupportedAlgorithm(format!(
+            "RSASSA-PSS MGF1 hash ({}) differs from the message hash ({}); not supported",
+            mgf1_hash_oid
+                .map(|o| o.to_string())
+                .unwrap_or_else(|| "absent".into()),
+            params.hash.oid,
+        )));
+    }
+
+    let salt_len = params.salt_len as usize;
+    match hash {
+        DigestAlgorithm::Sha256 => {
+            verify_rsa_pss_signature_with_salt::<sha2::Sha256>(tbs, sig, spki_der, salt_len)?
+        }
+        DigestAlgorithm::Sha384 => {
+            verify_rsa_pss_signature_with_salt::<sha2::Sha384>(tbs, sig, spki_der, salt_len)?
+        }
+        DigestAlgorithm::Sha512 => {
+            verify_rsa_pss_signature_with_salt::<sha2::Sha512>(tbs, sig, spki_der, salt_len)?
+        }
+        other => {
+            return Err(TrustError::UnsupportedAlgorithm(format!(
+                "RSASSA-PSS with digest {other:?}"
+            )))
+        }
+    }
+    Ok(hash)
+}
+
 /// Verify a certificate's signature against its issuer's public key.
 ///
 /// Encodes the TBS portion and checks the outer signature using
-/// [`verify_signature_by_oid`].
+/// [`verify_signature_by_algid`] so that RSASSA-PSS parameters are honoured.
 pub fn verify_certificate_signature(
     cert: &x509_cert::Certificate,
     issuer: &x509_cert::Certificate,
@@ -122,13 +233,17 @@ pub fn verify_certificate_signature(
         .to_der()
         .map_err(|e| TrustError::SignatureVerification(format!("TBS encoding failed: {e}")))?;
     let signature_bytes = cert.signature.raw_bytes();
-    let sig_alg_oid = &cert.signature_algorithm.oid;
 
     let spki_der = issuer_spki
         .to_der()
         .map_err(|e| TrustError::SignatureVerification(format!("SPKI encoding failed: {e}")))?;
 
-    verify_signature_by_oid(&tbs_bytes, signature_bytes, &spki_der, sig_alg_oid)
+    verify_signature_by_algid(
+        &tbs_bytes,
+        signature_bytes,
+        &spki_der,
+        &cert.signature_algorithm,
+    )
 }
 
 /// Verify an RSA PKCS#1 v1.5 signature over `tbs` using the given SPKI.
@@ -155,12 +270,38 @@ pub fn verify_rsa_signature<D: digest::Digest + const_oid::AssociatedOid>(
 }
 
 /// Verify an RSA-PSS (RSASSA-PSS) signature over `tbs` using the given SPKI.
+///
+/// Uses the default salt length (the digest output size). Callers that have
+/// decoded the `RSASSA-PSS-params` saltLength should use
+/// [`verify_rsa_pss_signature_with_salt`] instead, since PSS verification is
+/// salt-length sensitive.
 pub fn verify_rsa_pss_signature<
     D: digest::Digest + digest::FixedOutputReset + Default + Clone + Send + Sync + 'static,
 >(
     tbs: &[u8],
     sig: &[u8],
     spki_der: &[u8],
+) -> Result<(), TrustError> {
+    verify_rsa_pss_signature_with_salt::<D>(tbs, sig, spki_der, <D as digest::Digest>::output_size())
+}
+
+/// Verify an RSA-PSS (RSASSA-PSS) signature over `tbs` with an explicit salt
+/// length.
+///
+/// PSS verification is sensitive to the salt length: the value recovered from
+/// the signature must equal `salt_len`. RFC 4055 carries the salt length in the
+/// `RSASSA-PSS-params` of the signature `AlgorithmIdentifier`, so a compliant
+/// verifier must use that value rather than assuming the default. The mask
+/// generation function is MGF1 keyed to the same hash `D` (the only form this
+/// verifier and the underlying `rsa` crate support); callers are responsible
+/// for rejecting parameters that disagree.
+pub fn verify_rsa_pss_signature_with_salt<
+    D: digest::Digest + digest::FixedOutputReset + Default + Clone + Send + Sync + 'static,
+>(
+    tbs: &[u8],
+    sig: &[u8],
+    spki_der: &[u8],
+    salt_len: usize,
 ) -> Result<(), TrustError> {
     use der::Decode;
     use rsa::pss::Pss;
@@ -173,7 +314,7 @@ pub fn verify_rsa_pss_signature<
         .map_err(|e| TrustError::SignatureVerification(format!("RSA key decode failed: {e}")))?;
 
     let hash = D::digest(tbs);
-    let scheme = Pss::new::<D>();
+    let scheme = Pss::new_with_salt::<D>(salt_len);
     pub_key
         .verify(scheme, &hash, sig)
         .map_err(|e| TrustError::SignatureVerification(format!("RSA-PSS signature invalid: {e}")))
@@ -463,6 +604,69 @@ mod tests {
         assert!(
             !err_msg.contains("unsupported"),
             "RSA-PSS should be dispatched, not unsupported: {err_msg}"
+        );
+    }
+
+    /// Build an RSASSA-PSS signature `AlgorithmIdentifier` (OID + params) for a
+    /// given hash and salt length.
+    fn pss_algid<D>(salt_len: u8) -> spki::AlgorithmIdentifierOwned
+    where
+        D: const_oid::AssociatedOid,
+    {
+        use der::Encode;
+        use rsa::pkcs1::RsaPssParams;
+        let params = RsaPssParams::new::<D>(salt_len);
+        let params_der = params.to_der().unwrap();
+        spki::AlgorithmIdentifierOwned {
+            oid: OID_RSASSA_PSS,
+            parameters: Some(der::Any::from_der(&params_der).unwrap()),
+        }
+    }
+
+    #[test]
+    fn test_pss_algid_uses_declared_salt_length() {
+        // verify_signature_by_algid must honour the saltLength carried in
+        // RSASSA-PSS-params (cert/CRL/OCSP paths), not assume the default.
+        use rsa::pkcs8::EncodePublicKey;
+        use rsa::pss::SigningKey;
+        use rsa::signature::{RandomizedSigner, SignatureEncoding};
+        use sha2::Sha256;
+
+        let key = rsa::RsaPrivateKey::new(&mut rand::thread_rng(), 2048).unwrap();
+        let spki_der = rsa::RsaPublicKey::from(&key)
+            .to_public_key_der()
+            .unwrap()
+            .as_bytes()
+            .to_vec();
+
+        let msg = b"tbs bytes to be signed with PSS";
+        let signing = SigningKey::<Sha256>::new_with_salt_len(key, 48);
+        let sig = signing
+            .sign_with_rng(&mut rand::thread_rng(), msg)
+            .to_vec();
+
+        // Correct salt length declared -> verifies.
+        verify_signature_by_algid(msg, &sig, &spki_der, &pss_algid::<Sha256>(48))
+            .expect("PSS with declared salt 48 must verify");
+
+        // Wrong (default) salt length declared -> fails.
+        assert!(
+            verify_signature_by_algid(msg, &sig, &spki_der, &pss_algid::<Sha256>(32)).is_err(),
+            "PSS with mismatched declared salt length must fail"
+        );
+    }
+
+    #[test]
+    fn test_pss_strict_requires_parameters() {
+        // A bare RSASSA-PSS algid (no params) is rejected as unsupported.
+        let bare = spki::AlgorithmIdentifierOwned {
+            oid: OID_RSASSA_PSS,
+            parameters: None,
+        };
+        let err = verify_signature_by_algid(b"tbs", b"sig", b"spki", &bare).unwrap_err();
+        assert!(
+            matches!(err, TrustError::UnsupportedAlgorithm(_)),
+            "PSS without parameters must be rejected, got {err:?}"
         );
     }
 
