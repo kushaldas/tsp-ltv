@@ -1272,9 +1272,9 @@ fn validate_nonce(request_nonce: &[u8], response_nonce: &[u8]) -> Result<(), Ltv
 /// failure.
 #[derive(Debug, Clone)]
 pub struct OcspFreshness {
-    /// Clock skew tolerance applied to every time comparison, in both
-    /// directions. Accommodates small differences between the responder's and
-    /// the validator's clocks. Default: 5 minutes.
+    /// Clock skew tolerance applied to staleness/max-age comparisons.
+    /// Accommodates small differences between the responder's and the
+    /// validator's clocks. Default: 5 minutes.
     pub clock_skew: chrono::Duration,
 
     /// Maximum age (measured from `thisUpdate`) tolerated for a response that
