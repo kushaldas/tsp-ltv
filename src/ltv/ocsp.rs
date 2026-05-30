@@ -607,20 +607,26 @@ fn validate_ocsp_response_status(der_bytes: &[u8]) -> Result<(), LtvError> {
 
     let status = status_body[0];
     if status != OCSP_RESPONSE_SUCCESSFUL {
-        let status_name = match status {
-            1 => "malformedRequest",
-            2 => "internalError",
-            3 => "tryLater",
-            5 => "sigRequired",
-            6 => "unauthorized",
-            _ => "unknown",
-        };
-        return Err(LtvError::Ocsp(format!(
-            "OCSP response status: {status_name} ({status})"
+        return Err(LtvError::OcspResponderStatus(format!(
+            "{} ({status})",
+            ocsp_response_status_name(status)
         )));
     }
 
     Ok(())
+}
+
+/// Human-readable name for an OCSP `OCSPResponseStatus` code (RFC 6960 §4.2.1).
+fn ocsp_response_status_name(status: u8) -> &'static str {
+    match status {
+        0 => "successful",
+        1 => "malformedRequest",
+        2 => "internalError",
+        3 => "tryLater",
+        5 => "sigRequired",
+        6 => "unauthorized",
+        _ => "unknown",
+    }
 }
 
 /// Parse a DER-encoded OCSPResponse into a BasicOCSPResponse.
@@ -643,8 +649,12 @@ pub fn parse_ocsp_response(response_der: &[u8]) -> Result<ParsedBasicOcspRespons
         return Err(LtvError::Ocsp("invalid responseStatus".into()));
     }
     if status_body[0] != OCSP_RESPONSE_SUCCESSFUL {
-        return Err(LtvError::Ocsp(format!(
-            "OCSP response not successful: {}",
+        // Responder-side / transient status (tryLater, internalError, ...) —
+        // non-determinative, not an integrity failure. Typed distinctly so the
+        // revocation orchestrator maps it to Unknown, not Invalid.
+        return Err(LtvError::OcspResponderStatus(format!(
+            "{} ({})",
+            ocsp_response_status_name(status_body[0]),
             status_body[0]
         )));
     }

@@ -174,13 +174,22 @@ impl ValidationStatus {
 
     /// Priority value for conflict resolution (higher = takes precedence).
     ///
-    /// Order: `Revoked(3) > Valid(2) > Unknown(1) > Invalid(0)`
+    /// Order: `Revoked(3) > Valid(2) > Invalid(1) > Unknown(0)`
+    ///
+    /// `Invalid` (a definitive cryptographic/structural rejection — e.g. a
+    /// forged CRL or a malformed OCSP response) deliberately dominates
+    /// `Unknown` (status simply could not be determined). An attacker who
+    /// serves garbage from one revocation source must not be able to hide that
+    /// behind the other source's `Unknown`. `Valid` still dominates `Invalid`,
+    /// because a genuine, cryptographically verified "good" from one source
+    /// cannot be forged, so a bogus result from the other source should not turn
+    /// a genuinely valid certificate into a hard failure.
     fn priority(&self) -> u8 {
         match self {
             Self::Revoked { .. } => 3,
             Self::Valid { .. } => 2,
-            Self::Unknown { .. } => 1,
-            Self::Invalid { .. } => 0,
+            Self::Invalid { .. } => 1,
+            Self::Unknown { .. } => 0,
         }
     }
 }
@@ -209,13 +218,14 @@ impl std::fmt::Display for ValidationStatus {
 
 /// Resolve two validation statuses using priority rules.
 ///
-/// Priority order: `REVOKED > VALID > UNKNOWN > INVALID`
+/// Priority order: `REVOKED > VALID > INVALID > UNKNOWN`
 ///
-/// This matches the Java stack's `BasicCertificateValidityChecker` behavior:
 /// - If either check returns `Revoked`, the final result is `Revoked`
 /// - If either check returns `Valid` (and neither is `Revoked`), result is `Valid`
+/// - Otherwise a definitive `Invalid` (e.g. a forged CRL or malformed OCSP
+///   response) dominates a non-determinative `Unknown`, so a bogus revocation
+///   source cannot be masked behind the other source's `Unknown`
 /// - If both are `Unknown`, result is `Unknown`
-/// - `Invalid` loses to everything else
 pub fn resolve_priority(a: ValidationStatus, b: ValidationStatus) -> ValidationStatus {
     if a.priority() >= b.priority() {
         a
@@ -303,7 +313,10 @@ mod tests {
     }
 
     #[test]
-    fn test_resolve_priority_unknown_over_invalid() {
+    fn test_resolve_priority_invalid_over_unknown() {
+        // A definitive Invalid (e.g. a forged/malformed revocation source) must
+        // dominate a non-determinative Unknown from the other source, so the
+        // bogus source is surfaced rather than masked.
         let invalid = ValidationStatus::Invalid {
             reason: "bad CRL".into(),
         };
@@ -311,8 +324,24 @@ mod tests {
             reason: "no OCSP".into(),
         };
 
-        let result = resolve_priority(invalid, unknown);
-        assert!(result.is_unknown());
+        // Order of arguments must not matter.
+        assert!(resolve_priority(invalid.clone(), unknown.clone()).is_invalid());
+        assert!(resolve_priority(unknown, invalid).is_invalid());
+    }
+
+    #[test]
+    fn test_resolve_priority_valid_over_invalid() {
+        // A genuine, verified Valid cannot be forged, so it should not be
+        // turned into a hard failure by a bogus result from the other source.
+        let valid = ValidationStatus::Valid {
+            source: RevocationSource::Ocsp,
+            checked_at: Utc::now(),
+        };
+        let invalid = ValidationStatus::Invalid {
+            reason: "forged CRL".into(),
+        };
+        assert!(resolve_priority(valid.clone(), invalid.clone()).is_valid());
+        assert!(resolve_priority(invalid, valid).is_valid());
     }
 
     #[test]

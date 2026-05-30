@@ -3,7 +3,17 @@
 //! This module provides a high-level API for checking a certificate's
 //! revocation status using both OCSP and CRL concurrently. Results from
 //! both sources are merged using the priority rules from [`resolve_priority`]:
-//! `REVOKED > VALID > UNKNOWN > INVALID`.
+//! `REVOKED > VALID > INVALID > UNKNOWN`.
+//!
+//! # Fail-closed policy
+//!
+//! When [`RevocationConfig::require_revocation_check`] is `true` (the default),
+//! a merged result that is not a definitive `Valid` or `Revoked` is a hard
+//! failure: an `Unknown` outcome is upgraded to `Invalid` so that an
+//! unreachable, blocked, or forged revocation source can never be mistaken for
+//! "fine to proceed". Set `require_revocation_check = false`
+//! ([`RevocationConfig::disabled`]) for best-effort/offline validation where
+//! `Unknown` is acceptable.
 //!
 //! # Configuration
 //!
@@ -28,6 +38,7 @@ use std::time::Duration;
 use chrono::{DateTime, Utc};
 use x509_cert::Certificate;
 
+use crate::error::LtvError;
 use crate::ltv::crl::{self, CrlClient};
 use crate::ltv::ocsp::{self, OcspClient};
 use crate::ltv::status::{resolve_priority, ValidationStatus};
@@ -52,8 +63,12 @@ pub struct RevocationConfig {
 
     /// Whether a definitive revocation result is required.
     ///
-    /// When true, an `Unknown` final result is treated as an error by
-    /// downstream validators. Default: `true`.
+    /// When true (the default), [`check_certificate_revocation`] enforces a
+    /// fail-closed policy: any non-definitive merged result (`Unknown`, or an
+    /// `Invalid` from a malformed/forged source) blocks, and `Unknown` is
+    /// upgraded to `Invalid` so callers cannot treat it as acceptable. When
+    /// false, `Unknown` is returned unchanged for best-effort/offline use.
+    /// Default: `true`.
     pub require_revocation_check: bool,
 
     /// OCSP request timeout. Default: 3 seconds.
@@ -137,8 +152,17 @@ impl RevocationConfig {
 ///
 /// # Returns
 ///
-/// A [`ValidationStatus`] reflecting the merged result of both checks.
-/// If both checks fail or time out, returns `Unknown`.
+/// A [`ValidationStatus`] reflecting the merged result of both checks, after
+/// applying the `require_revocation_check` policy.
+///
+/// - With `require_revocation_check == true` (default), only a verified `Valid`
+///   or a `Revoked` passes; any `Unknown` (both sources unreachable/blocked/
+///   absent) or `Invalid` (a source served malformed/forged data) is a hard
+///   failure, with `Unknown` upgraded to `Invalid`. This prevents an attacker
+///   from getting a revoked certificate accepted by blocking or forging the
+///   revocation sources.
+/// - With `require_revocation_check == false`, the merged status is returned
+///   unchanged, so `Unknown` is acceptable (best-effort/offline mode).
 pub async fn check_certificate_revocation(
     cert: &Certificate,
     issuer: &Certificate,
@@ -174,8 +198,64 @@ pub async fn check_certificate_revocation(
 
     log::debug!("OCSP result: {ocsp_status}, CRL result: {crl_status}");
 
-    // Merge results using priority
-    resolve_priority(ocsp_status, crl_status)
+    // Merge results using priority, then apply the fail-closed policy.
+    let merged = resolve_priority(ocsp_status, crl_status);
+    enforce_revocation_policy(merged, config.require_revocation_check)
+}
+
+/// Apply the `require_revocation_check` policy to a merged revocation result.
+///
+/// Under a strict policy a result that is not a definitive `Valid` or `Revoked`
+/// must block. An `Unknown` outcome — no usable revocation information, because
+/// every source was absent, unreachable, blocked, or timed out — is upgraded to
+/// `Invalid` so the returned status is unambiguously non-acceptable; a caller
+/// can no longer mistake a blocked or absent revocation source for "fine to
+/// proceed". An already-`Invalid` result (a source served malformed/forged
+/// data) is left as-is — it already blocks. When the policy is relaxed
+/// (`require_revocation_check == false`), the merged status is returned
+/// unchanged so `Unknown` remains acceptable for offline/best-effort use.
+fn enforce_revocation_policy(
+    status: ValidationStatus,
+    require_revocation_check: bool,
+) -> ValidationStatus {
+    if !require_revocation_check {
+        return status;
+    }
+    match status {
+        ValidationStatus::Unknown { reason } => ValidationStatus::Invalid {
+            reason: format!(
+                "revocation check required but status could not be established: {reason}"
+            ),
+        },
+        other => other,
+    }
+}
+
+/// Classify an error from [`ocsp::check_revocation`] into a [`ValidationStatus`].
+///
+/// Only **definitive integrity failures** — bad signature, malformed/expired
+/// response, nonce mismatch, untrusted responder — become `Invalid` (a hard,
+/// dominating, attack-indicating result). A **responder-side / transient
+/// status** (`tryLater`, `internalError`, `unauthorized`, ...) is reported by
+/// the responder, not proof of a forged or malformed response, so it stays
+/// `Unknown` (non-determinative). This keeps a temporary OCSP outage as
+/// best-effort `Unknown` rather than escalating it to a hard failure that would
+/// dominate a CRL `Unknown` even under a relaxed policy.
+fn ocsp_check_error_to_status(e: LtvError) -> ValidationStatus {
+    match e {
+        LtvError::OcspResponderStatus(_) => {
+            log::warn!("OCSP responder returned a non-successful status: {e}");
+            ValidationStatus::Unknown {
+                reason: format!("OCSP responder unavailable: {e}"),
+            }
+        }
+        other => {
+            log::warn!("OCSP response failed validation: {other}");
+            ValidationStatus::Invalid {
+                reason: format!("OCSP response failed validation: {other}"),
+            }
+        }
+    }
 }
 
 /// Sync wrapper for [`check_certificate_revocation`].
@@ -209,7 +289,11 @@ pub fn check_certificate_revocation_blocking(
 
 /// Run the OCSP check for a single certificate.
 ///
-/// Returns `Unknown` if no OCSP URLs are available or if the check fails.
+/// Returns `Unknown` if no OCSP URLs are available, the fetch fails, the request
+/// times out, or the responder returns a non-successful status (tryLater,
+/// internalError, unauthorized, ...) — all non-determinative. Returns `Invalid`
+/// only for a definitive integrity failure on a received response (bad
+/// signature, malformed, nonce mismatch, untrusted responder).
 async fn run_ocsp_check(
     cert: &Certificate,
     issuer: &Certificate,
@@ -228,31 +312,44 @@ async fn run_ocsp_check(
 
     // Apply OCSP-specific timeout
     let result = tokio::time::timeout(config.ocsp_timeout, async {
-        // Fetch OCSP response (with or without nonce)
-        let fetch_result = if config.use_ocsp_nonce {
-            match ocsp_client.fetch_ocsp_response_with_nonce(cert, issuer).await {
-                Ok((response_der, nonce)) => {
-                    ocsp::check_revocation(&response_der, cert, issuer, Some(&nonce), validation_time)
-                }
-                Err(e) => Err(e),
-            }
+        // Fetch the OCSP response. A fetch failure (network, no endpoint, HTTP
+        // error) is non-determinative → Unknown.
+        let fetched = if config.use_ocsp_nonce {
+            ocsp_client
+                .fetch_ocsp_response_with_nonce(cert, issuer)
+                .await
+                .map(|(der, nonce)| (der, Some(nonce)))
         } else {
-            match ocsp_client.fetch_ocsp_response(cert, issuer).await {
-                Ok(response_der) => {
-                    ocsp::check_revocation(&response_der, cert, issuer, None, validation_time)
-                }
-                Err(e) => Err(e),
+            ocsp_client
+                .fetch_ocsp_response(cert, issuer)
+                .await
+                .map(|der| (der, None))
+        };
+        let (response_der, nonce) = match fetched {
+            Ok(v) => v,
+            Err(e) => {
+                log::warn!("OCSP fetch failed: {e}");
+                return ValidationStatus::Unknown {
+                    reason: format!("OCSP fetch failed: {e}"),
+                };
             }
         };
 
-        match fetch_result {
+        // We received a response. Classify the outcome: a definitive integrity
+        // failure (bad signature, malformed/expired response, nonce mismatch,
+        // untrusted responder) is Invalid, but a responder-side / transient
+        // status (tryLater, internalError, unauthorized, ...) is non-
+        // determinative and stays Unknown — so a temporary responder outage
+        // does not become a hard failure under best-effort/offline policy.
+        match ocsp::check_revocation(
+            &response_der,
+            cert,
+            issuer,
+            nonce.as_deref(),
+            validation_time,
+        ) {
             Ok(status) => status,
-            Err(e) => {
-                log::warn!("OCSP check failed: {e}");
-                ValidationStatus::Unknown {
-                    reason: format!("OCSP check failed: {e}"),
-                }
-            }
+            Err(e) => ocsp_check_error_to_status(e),
         }
     })
     .await;
@@ -272,8 +369,9 @@ async fn run_ocsp_check(
 
 /// Run the CRL check for a single certificate.
 ///
-/// Returns `Unknown` if no CRL distribution points are available or if
-/// the check fails.
+/// Returns `Unknown` if no CRL distribution points are available, no CRL could
+/// be fetched, or the fetch times out. Returns `Invalid` if a CRL was fetched
+/// but failed validation (bad signature, malformed structure).
 async fn run_crl_check(
     cert: &Certificate,
     issuer: &Certificate,
@@ -302,13 +400,17 @@ async fn run_crl_check(
                 }
 
                 // Check the first successfully fetched CRL
-                // (fetch_crls_for_cert already stops after the first success)
+                // (fetch_crls_for_cert already stops after the first success).
+                // A validation failure on a CRL we actually received (bad
+                // signature, malformed structure) is a definitive negative
+                // result → Invalid, not Unknown, so a forged CRL cannot fail
+                // open by masquerading as "status undetermined".
                 match crl::check_revocation(&crls[0], cert, issuer, validation_time) {
                     Ok(status) => status,
                     Err(e) => {
                         log::warn!("CRL revocation check failed: {e}");
-                        ValidationStatus::Unknown {
-                            reason: format!("CRL check failed: {e}"),
+                        ValidationStatus::Invalid {
+                            reason: format!("CRL validation failed: {e}"),
                         }
                     }
                 }
@@ -377,8 +479,7 @@ mod tests {
     // that have no OCSP/CRL endpoints (our test fixtures), so both
     // checks return Unknown → merged result is Unknown.
 
-    #[tokio::test]
-    async fn test_check_no_ocsp_no_crl_returns_unknown() {
+    fn load_ca_and_intermediate() -> (Certificate, Certificate) {
         let ca_pem = include_str!(concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/tests/fixtures/ca_cert.pem"
@@ -393,25 +494,53 @@ mod tests {
 
         let ca = der::Decode::from_der(&ca_der).unwrap();
         let intermediate: Certificate = der::Decode::from_der(&inter_der).unwrap();
+        (ca, intermediate)
+    }
+
+    #[tokio::test]
+    async fn test_check_no_endpoints_strict_hard_fails() {
+        // C-2 regression: with the default (strict) policy, a certificate that
+        // offers no usable revocation source must NOT fail open as Unknown — it
+        // must hard-fail (Invalid) so callers cannot proceed.
+        let (ca, intermediate) = load_ca_and_intermediate();
 
         let config = RevocationConfig::default();
+        assert!(config.require_revocation_check);
         let crl_client = CrlClient::new();
         let ocsp_client = OcspClient::new();
 
-        let status = check_certificate_revocation(
-            &intermediate,
-            &ca,
-            &config,
-            &crl_client,
-            &ocsp_client,
-            None,
-        )
-        .await;
+        let status =
+            check_certificate_revocation(&intermediate, &ca, &config, &crl_client, &ocsp_client, None)
+                .await;
 
-        // Our test certs have no OCSP or CRL endpoints → Unknown
+        assert!(
+            status.is_invalid(),
+            "strict policy must hard-fail when no revocation source is usable, got: {status}"
+        );
+        assert!(
+            !status.is_unknown(),
+            "strict policy must not return Unknown (fail-open), got: {status}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_check_no_endpoints_disabled_returns_unknown() {
+        // With revocation checking disabled, the same certs return Unknown
+        // (best-effort/offline mode) rather than hard-failing.
+        let (ca, intermediate) = load_ca_and_intermediate();
+
+        let config = RevocationConfig::disabled();
+        assert!(!config.require_revocation_check);
+        let crl_client = CrlClient::new();
+        let ocsp_client = OcspClient::new();
+
+        let status =
+            check_certificate_revocation(&intermediate, &ca, &config, &crl_client, &ocsp_client, None)
+                .await;
+
         assert!(
             status.is_unknown(),
-            "expected Unknown for certs without OCSP/CRL endpoints, got: {status}"
+            "disabled policy should return Unknown for certs without endpoints, got: {status}"
         );
     }
 
@@ -477,8 +606,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_check_with_signer_cert_returns_unknown() {
-        // Signer cert also has no OCSP/CRL endpoints in our test fixtures
+    async fn test_check_with_signer_cert_strict_hard_fails() {
+        // Signer cert also has no OCSP/CRL endpoints in our test fixtures, so
+        // the strict default policy hard-fails (Invalid) rather than Unknown.
         let signer_pem = include_str!(concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/tests/fixtures/signer_cert.pem"
@@ -512,9 +642,116 @@ mod tests {
         .await;
 
         assert!(
-            status.is_unknown(),
-            "expected Unknown for signer cert without endpoints, got: {status}"
+            status.is_invalid(),
+            "expected hard fail (Invalid) for signer cert without endpoints under strict policy, got: {status}"
         );
+    }
+
+    // ── Policy enforcement unit tests ─────────────────────────────
+
+    #[test]
+    fn test_enforce_policy_upgrades_unknown_to_invalid_when_required() {
+        let unknown = ValidationStatus::Unknown {
+            reason: "both sources unreachable".into(),
+        };
+        let enforced = enforce_revocation_policy(unknown, true);
+        assert!(
+            enforced.is_invalid(),
+            "strict policy must upgrade Unknown to Invalid, got: {enforced}"
+        );
+    }
+
+    #[test]
+    fn test_enforce_policy_keeps_unknown_when_not_required() {
+        let unknown = ValidationStatus::Unknown {
+            reason: "offline".into(),
+        };
+        assert!(enforce_revocation_policy(unknown, false).is_unknown());
+    }
+
+    #[test]
+    fn test_enforce_policy_passes_valid_and_revoked_through() {
+        let valid = ValidationStatus::Valid {
+            source: RevocationSource::Ocsp,
+            checked_at: Utc::now(),
+        };
+        assert!(enforce_revocation_policy(valid, true).is_valid());
+
+        let revoked = ValidationStatus::Revoked {
+            source: RevocationSource::Crl,
+            reason: crate::ltv::status::RevocationReason::KeyCompromise,
+            revocation_time: Utc::now(),
+        };
+        assert!(enforce_revocation_policy(revoked, true).is_revoked());
+    }
+
+    #[test]
+    fn test_enforce_policy_keeps_invalid_blocking() {
+        // An Invalid (forged/malformed source) already blocks and is left as-is.
+        let invalid = ValidationStatus::Invalid {
+            reason: "forged CRL".into(),
+        };
+        assert!(enforce_revocation_policy(invalid, true).is_invalid());
+    }
+
+    #[test]
+    fn test_ocsp_responder_status_maps_to_unknown_not_invalid() {
+        // Responder-side / transient statuses (tryLater, internalError, ...) are
+        // non-determinative and must NOT escalate to Invalid.
+        for msg in ["tryLater (3)", "internalError (2)", "unauthorized (6)"] {
+            let status = ocsp_check_error_to_status(LtvError::OcspResponderStatus(msg.into()));
+            assert!(
+                status.is_unknown(),
+                "responder status {msg} must map to Unknown, got: {status}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_ocsp_integrity_failure_maps_to_invalid() {
+        // Definitive integrity failures (bad signature, malformed, nonce
+        // mismatch, untrusted responder) must map to Invalid.
+        for e in [
+            LtvError::Ocsp("OCSP signature verification failed".into()),
+            LtvError::Ocsp("nonce mismatch".into()),
+            LtvError::Ocsp("responder certificate not trusted".into()),
+        ] {
+            let status = ocsp_check_error_to_status(e);
+            assert!(
+                status.is_invalid(),
+                "integrity failure must map to Invalid, got: {status}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_ocsp_outage_does_not_dominate_under_relaxed_policy() {
+        // Regression: a transient OCSP responder status (Unknown) must not, when
+        // merged with a CRL Unknown, become a dominating Invalid. Under a
+        // relaxed policy the merged result stays Unknown (best-effort).
+        let ocsp = ocsp_check_error_to_status(LtvError::OcspResponderStatus("tryLater (3)".into()));
+        let crl = ValidationStatus::Unknown {
+            reason: "no CRL distribution points".into(),
+        };
+        let merged = resolve_priority(ocsp, crl);
+        assert!(merged.is_unknown(), "transient OCSP outage must not become Invalid");
+        assert!(enforce_revocation_policy(merged, false).is_unknown());
+    }
+
+    #[test]
+    fn test_forged_source_plus_unreachable_hard_fails_under_strict() {
+        // Attack scenario: one source is forged (→ Invalid), the other is
+        // blocked (→ Unknown). Merge yields Invalid (dominates Unknown), and
+        // the strict policy keeps it blocking. The revoked cert is not accepted.
+        let forged = ValidationStatus::Invalid {
+            reason: "forged CRL signature".into(),
+        };
+        let blocked = ValidationStatus::Unknown {
+            reason: "OCSP egress blocked".into(),
+        };
+        let merged = resolve_priority(forged, blocked);
+        assert!(merged.is_invalid());
+        assert!(enforce_revocation_policy(merged, true).is_invalid());
     }
 
     #[test]
