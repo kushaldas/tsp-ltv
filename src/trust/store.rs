@@ -45,10 +45,7 @@ impl TrustStore {
 
     /// Set the signature-algorithm policy used by
     /// [`verify_chain`](Self::verify_chain).
-    pub fn with_signature_policy(
-        mut self,
-        policy: crate::crypto::verify::SignaturePolicy,
-    ) -> Self {
+    pub fn with_signature_policy(mut self, policy: crate::crypto::verify::SignaturePolicy) -> Self {
         self.signature_policy = policy;
         self
     }
@@ -314,7 +311,9 @@ impl TrustStore {
 
             // Verify signature of cert against issuer's public key
             crate::crypto::verify::verify_certificate_signature_with_policy(
-                cert, issuer_cert, policy,
+                cert,
+                issuer_cert,
+                policy,
             )?;
 
             // Validate extensions: intermediates must have CA:TRUE + keyCertSign
@@ -340,7 +339,9 @@ impl TrustStore {
         if last.tbs_certificate.issuer == last.tbs_certificate.subject {
             if self.contains_der(&last.to_der().unwrap_or_default()) {
                 // Self-signed cert is directly trusted — verify its self-signature
-                crate::crypto::verify::verify_certificate_signature_with_policy(last, last, policy)?;
+                crate::crypto::verify::verify_certificate_signature_with_policy(
+                    last, last, policy,
+                )?;
                 let anchor = self.find_issuer(last).unwrap(); // must exist since contains_der passed
                 return Ok(anchor);
             }

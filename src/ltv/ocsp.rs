@@ -208,9 +208,7 @@ impl OcspClient {
             }
         }
 
-        Err(last_error.unwrap_or_else(|| {
-            LtvError::Ocsp("all OCSP responder URLs failed".into())
-        }))
+        Err(last_error.unwrap_or_else(|| LtvError::Ocsp("all OCSP responder URLs failed".into())))
     }
 
     /// Fetch an OCSP response with a nonce for replay protection.
@@ -243,18 +241,15 @@ impl OcspClient {
             }
         }
 
-        Err(last_error.unwrap_or_else(|| {
-            LtvError::Ocsp("all OCSP responder URLs failed".into())
-        }))
+        Err(last_error.unwrap_or_else(|| LtvError::Ocsp("all OCSP responder URLs failed".into())))
     }
 
     /// Send an OCSP request to the given URL.
-    async fn send_ocsp_request(
-        &self,
-        url: &str,
-        request_der: &[u8],
-    ) -> Result<Vec<u8>, LtvError> {
-        log::debug!("Sending OCSP request to {url} ({} bytes)", request_der.len());
+    async fn send_ocsp_request(&self, url: &str, request_der: &[u8]) -> Result<Vec<u8>, LtvError> {
+        log::debug!(
+            "Sending OCSP request to {url} ({} bytes)",
+            request_der.len()
+        );
 
         let response = self
             .http_client
@@ -327,12 +322,8 @@ pub fn extract_aia_urls(cert: &Certificate, method: AiaAccessMethod) -> Vec<Stri
     let aia_oid = const_oid::ObjectIdentifier::new_unwrap("1.3.6.1.5.5.7.1.1");
 
     let method_oid = match method {
-        AiaAccessMethod::Ocsp => {
-            const_oid::ObjectIdentifier::new_unwrap("1.3.6.1.5.5.7.48.1")
-        }
-        AiaAccessMethod::CaIssuers => {
-            const_oid::ObjectIdentifier::new_unwrap("1.3.6.1.5.5.7.48.2")
-        }
+        AiaAccessMethod::Ocsp => const_oid::ObjectIdentifier::new_unwrap("1.3.6.1.5.5.7.48.1"),
+        AiaAccessMethod::CaIssuers => const_oid::ObjectIdentifier::new_unwrap("1.3.6.1.5.5.7.48.2"),
     };
 
     if let Some(extensions) = &cert.tbs_certificate.extensions {
@@ -366,7 +357,9 @@ fn parse_aia_extension(
     let (tag, body) = der_utils::parse_tlv(der_bytes)
         .map_err(|e| LtvError::Ocsp(format!("AIA parse error: {e}")))?;
     if tag != 0x30 {
-        return Err(LtvError::Ocsp(format!("AIA: expected SEQUENCE, got 0x{tag:02x}")));
+        return Err(LtvError::Ocsp(format!(
+            "AIA: expected SEQUENCE, got 0x{tag:02x}"
+        )));
     }
 
     let target_oid_der = target_method_oid
@@ -432,10 +425,7 @@ fn parse_aia_extension(
 ///     serialNumber      CertificateSerialNumber
 /// }
 /// ```
-fn build_ocsp_request(
-    cert: &Certificate,
-    issuer: &Certificate,
-) -> Result<Vec<u8>, LtvError> {
+fn build_ocsp_request(cert: &Certificate, issuer: &Certificate) -> Result<Vec<u8>, LtvError> {
     let cert_id = build_cert_id(cert, issuer)?;
 
     // Request SEQUENCE { reqCert CertID }
@@ -488,8 +478,7 @@ pub fn build_ocsp_request_with_nonce(
     let request_extensions = der_utils::encode_tlv(0xA2, &extensions_seq);
 
     // TBSRequest SEQUENCE { requestList, requestExtensions }
-    let tbs_request =
-        der_utils::encode_sequence_from_parts(&[&request_list, &request_extensions]);
+    let tbs_request = der_utils::encode_sequence_from_parts(&[&request_list, &request_extensions]);
 
     // OCSPRequest SEQUENCE { tbsRequest }
     let ocsp_request = der_utils::encode_sequence_from_parts(&[&tbs_request]);
@@ -498,10 +487,7 @@ pub fn build_ocsp_request_with_nonce(
 }
 
 /// Build a CertID SEQUENCE for an OCSP request.
-fn build_cert_id(
-    cert: &Certificate,
-    issuer: &Certificate,
-) -> Result<Vec<u8>, LtvError> {
+fn build_cert_id(cert: &Certificate, issuer: &Certificate) -> Result<Vec<u8>, LtvError> {
     // Hash the issuer's distinguished name
     let issuer_name_der = issuer
         .tbs_certificate
@@ -569,7 +555,9 @@ fn build_sha1_algorithm_identifier() -> Result<Vec<u8>, LtvError> {
         .to_der()
         .map_err(|e| LtvError::Ocsp(format!("failed to encode SHA-1 OID: {e}")))?;
     let null_der = vec![0x05, 0x00]; // NULL
-    Ok(der_utils::encode_sequence_from_parts(&[&oid_der, &null_der]))
+    Ok(der_utils::encode_sequence_from_parts(&[
+        &oid_der, &null_der,
+    ]))
 }
 
 // ── OCSP response parsing ──────────────────────────────────────────
@@ -708,8 +696,8 @@ pub fn parse_ocsp_response(response_der: &[u8]) -> Result<ParsedBasicOcspRespons
 /// Parse a DER-encoded BasicOCSPResponse.
 fn parse_basic_ocsp_response(der: &[u8]) -> Result<ParsedBasicOcspResponse, LtvError> {
     // BasicOCSPResponse SEQUENCE
-    let (tag, body) = der_utils::parse_tlv(der)
-        .map_err(|e| LtvError::Ocsp(format!("BasicOCSPResponse: {e}")))?;
+    let (tag, body) =
+        der_utils::parse_tlv(der).map_err(|e| LtvError::Ocsp(format!("BasicOCSPResponse: {e}")))?;
     if tag != 0x30 {
         return Err(LtvError::Ocsp(format!(
             "expected BasicOCSPResponse SEQUENCE, got 0x{tag:02x}"
@@ -884,8 +872,8 @@ fn parse_single_response(body: &[u8]) -> Result<SingleResponse, LtvError> {
     let mut pos = body;
 
     // certID SEQUENCE
-    let (cid_tag, cid_body, rest) = der_utils::parse_tlv_with_rest(pos)
-        .map_err(|e| LtvError::Ocsp(format!("CertID: {e}")))?;
+    let (cid_tag, cid_body, rest) =
+        der_utils::parse_tlv_with_rest(pos).map_err(|e| LtvError::Ocsp(format!("CertID: {e}")))?;
     if cid_tag != 0x30 {
         return Err(LtvError::Ocsp(format!(
             "expected CertID SEQUENCE, got 0x{cid_tag:02x}"
@@ -911,7 +899,9 @@ fn parse_single_response(body: &[u8]) -> Result<SingleResponse, LtvError> {
     let (inh_tag, inh_body, cid_rest) = der_utils::parse_tlv_with_rest(cid_rest)
         .map_err(|e| LtvError::Ocsp(format!("issuerNameHash: {e}")))?;
     if inh_tag != 0x04 {
-        return Err(LtvError::Ocsp("expected issuerNameHash OCTET STRING".into()));
+        return Err(LtvError::Ocsp(
+            "expected issuerNameHash OCTET STRING".into(),
+        ));
     }
     let issuer_name_hash = inh_body.to_vec();
 
@@ -1239,10 +1229,7 @@ pub fn has_ocsp_nocheck_extension(cert: &Certificate) -> bool {
 /// Supports dual-format comparison per the Java stack:
 /// - Direct comparison of raw nonce bytes
 /// - Comparison with DER OCTET STRING wrapped nonce
-fn validate_nonce(
-    request_nonce: &[u8],
-    response_nonce: &[u8],
-) -> Result<(), LtvError> {
+fn validate_nonce(request_nonce: &[u8], response_nonce: &[u8]) -> Result<(), LtvError> {
     // Direct comparison
     if response_nonce == request_nonce {
         return Ok(());
@@ -1711,19 +1698,15 @@ mod tests {
         next_update_str: Option<&str>,
     ) -> Vec<u8> {
         use rsa::pkcs1v15::SigningKey;
-        use rsa::signature::{Signer, SignatureEncoding};
         use rsa::pkcs8::DecodePrivateKey;
+        use rsa::signature::{SignatureEncoding, Signer};
         use sha2::Sha256;
 
         // Build tbsResponseData body
         let mut tbs_body = Vec::new();
 
         // responderID: byName [1] — use issuer's subject
-        let issuer_subject_der = issuer_cert
-            .tbs_certificate
-            .subject
-            .to_der()
-            .unwrap();
+        let issuer_subject_der = issuer_cert.tbs_certificate.subject.to_der().unwrap();
         let responder_id = der_utils::encode_tlv(0xA1, &issuer_subject_der);
         tbs_body.extend_from_slice(&responder_id);
 
@@ -1732,8 +1715,13 @@ mod tests {
         tbs_body.extend_from_slice(&produced_at);
 
         // Build SingleResponse
-        let single_response =
-            build_test_single_response_with_times(issuer_cert, cert, status, this_update_str, next_update_str);
+        let single_response = build_test_single_response_with_times(
+            issuer_cert,
+            cert,
+            status,
+            this_update_str,
+            next_update_str,
+        );
 
         // responses SEQUENCE OF SingleResponse
         let responses_seq = der_utils::encode_sequence_from_parts(&[&single_response]);
@@ -1803,11 +1791,7 @@ mod tests {
         next_update_str: Option<&str>,
     ) -> Vec<u8> {
         // CertID
-        let issuer_name_der = issuer_cert
-            .tbs_certificate
-            .subject
-            .to_der()
-            .unwrap();
+        let issuer_name_der = issuer_cert.tbs_certificate.subject.to_der().unwrap();
         let issuer_name_hash = sha1_hash(&issuer_name_der);
         let issuer_key_bytes = issuer_cert
             .tbs_certificate
@@ -1904,17 +1888,15 @@ mod tests {
         let issuer = intermediate_ca_cert();
         let cert = signer_cert();
 
-        let revocation_time =
-            chrono::DateTime::parse_from_rfc3339("2026-03-01T00:00:00Z")
-                .unwrap()
-                .with_timezone(&chrono::Utc);
+        let revocation_time = chrono::DateTime::parse_from_rfc3339("2026-03-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
         let status = CertStatus::Revoked {
             revocation_time,
             reason: RevocationReason::KeyCompromise,
         };
 
-        let response_der =
-            build_test_ocsp_response(&issuer, &key_pem, &cert, &status, None);
+        let response_der = build_test_ocsp_response(&issuer, &key_pem, &cert, &status, None);
 
         let parsed = parse_ocsp_response(&response_der).unwrap();
         assert_eq!(parsed.responses.len(), 1);
@@ -1961,10 +1943,9 @@ mod tests {
         let response_der =
             build_test_ocsp_response(&issuer, &key_pem, &cert, &CertStatus::Good, None);
 
-        let validation_time =
-            chrono::DateTime::parse_from_rfc3339("2026-06-01T12:00:00Z")
-                .unwrap()
-                .with_timezone(&chrono::Utc);
+        let validation_time = chrono::DateTime::parse_from_rfc3339("2026-06-01T12:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
 
         let status =
             check_revocation(&response_der, &cert, &issuer, None, Some(validation_time)).unwrap();
@@ -1982,22 +1963,19 @@ mod tests {
         let issuer = intermediate_ca_cert();
         let cert = signer_cert();
 
-        let revocation_time =
-            chrono::DateTime::parse_from_rfc3339("2026-03-01T00:00:00Z")
-                .unwrap()
-                .with_timezone(&chrono::Utc);
+        let revocation_time = chrono::DateTime::parse_from_rfc3339("2026-03-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
         let cert_status = CertStatus::Revoked {
             revocation_time,
             reason: RevocationReason::Superseded,
         };
 
-        let response_der =
-            build_test_ocsp_response(&issuer, &key_pem, &cert, &cert_status, None);
+        let response_der = build_test_ocsp_response(&issuer, &key_pem, &cert, &cert_status, None);
 
-        let validation_time =
-            chrono::DateTime::parse_from_rfc3339("2026-06-01T12:00:00Z")
-                .unwrap()
-                .with_timezone(&chrono::Utc);
+        let validation_time = chrono::DateTime::parse_from_rfc3339("2026-06-01T12:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
 
         let status =
             check_revocation(&response_der, &cert, &issuer, None, Some(validation_time)).unwrap();
@@ -2017,26 +1995,23 @@ mod tests {
 
         // Revocation time is 2027-01-01, validation time is 2026-06-01
         // → should be VALID at validation_time
-        let revocation_time =
-            chrono::DateTime::parse_from_rfc3339("2027-01-01T00:00:00Z")
-                .unwrap()
-                .with_timezone(&chrono::Utc);
+        let revocation_time = chrono::DateTime::parse_from_rfc3339("2027-01-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
         let cert_status = CertStatus::Revoked {
             revocation_time,
             reason: RevocationReason::Unspecified,
         };
 
-        let response_der =
-            build_test_ocsp_response(&issuer, &key_pem, &cert, &cert_status, None);
+        let response_der = build_test_ocsp_response(&issuer, &key_pem, &cert, &cert_status, None);
 
         // Validation time (2026-06-01T00:00Z) is the historical instant; the
         // response was produced shortly after (thisUpdate 2026-06-01T12:00Z,
         // nextUpdate 2026-06-08T12:00Z). Later-collected evidence is accepted,
         // and the 2027 revocation is in the future, so the result is Valid.
-        let validation_time =
-            chrono::DateTime::parse_from_rfc3339("2026-06-01T00:00:00Z")
-                .unwrap()
-                .with_timezone(&chrono::Utc);
+        let validation_time = chrono::DateTime::parse_from_rfc3339("2026-06-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
 
         let status =
             check_revocation(&response_der, &cert, &issuer, None, Some(validation_time)).unwrap();
@@ -2102,9 +2077,9 @@ mod tests {
             &cert,
             &CertStatus::Good,
             None,
-            "20260601140000Z",        // producedAt (after validation_time)
-            "20260601120000Z",        // thisUpdate (<= validation_time)
-            Some("20260608120000Z"),  // nextUpdate
+            "20260601140000Z",       // producedAt (after validation_time)
+            "20260601120000Z",       // thisUpdate (<= validation_time)
+            Some("20260608120000Z"), // nextUpdate
         );
 
         let validation_time = chrono::DateTime::parse_from_rfc3339("2026-06-01T13:00:00Z")
@@ -2176,7 +2151,10 @@ mod tests {
         let beyond = this_update + chrono::Duration::hours(25);
         let err = validate_response_freshness(&sr, beyond, &freshness)
             .expect_err("response older than max age must be rejected");
-        assert!(matches!(err, LtvError::Ocsp(ref m) if m.contains("too old")), "got: {err}");
+        assert!(
+            matches!(err, LtvError::Ocsp(ref m) if m.contains("too old")),
+            "got: {err}"
+        );
     }
 
     #[test]
@@ -2193,10 +2171,9 @@ mod tests {
         let response_der =
             build_test_ocsp_response(&issuer, &key_pem, &cert, &CertStatus::Unknown, None);
 
-        let validation_time =
-            chrono::DateTime::parse_from_rfc3339("2026-06-01T12:00:00Z")
-                .unwrap()
-                .with_timezone(&chrono::Utc);
+        let validation_time = chrono::DateTime::parse_from_rfc3339("2026-06-01T12:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
 
         let status =
             check_revocation(&response_der, &cert, &issuer, None, Some(validation_time)).unwrap();
@@ -2215,18 +2192,12 @@ mod tests {
         let cert = signer_cert();
         let nonce = b"test-nonce-1234567890abcdef1234";
 
-        let response_der = build_test_ocsp_response(
-            &issuer,
-            &key_pem,
-            &cert,
-            &CertStatus::Good,
-            Some(nonce),
-        );
+        let response_der =
+            build_test_ocsp_response(&issuer, &key_pem, &cert, &CertStatus::Good, Some(nonce));
 
-        let validation_time =
-            chrono::DateTime::parse_from_rfc3339("2026-06-01T12:00:00Z")
-                .unwrap()
-                .with_timezone(&chrono::Utc);
+        let validation_time = chrono::DateTime::parse_from_rfc3339("2026-06-01T12:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
 
         let status = check_revocation(
             &response_der,

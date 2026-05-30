@@ -9,9 +9,9 @@ use der::{Decode, Encode};
 use reqwest::Client;
 use x509_cert::Certificate;
 
+use super::ocsp::{extract_aia_urls, AiaAccessMethod};
 use crate::error::LtvError;
 use crate::trust::TrustStore;
-use super::ocsp::{extract_aia_urls, AiaAccessMethod};
 
 /// Maximum chain depth to prevent infinite loops.
 const MAX_CHAIN_DEPTH: usize = 10;
@@ -85,9 +85,7 @@ impl ChainBuilder {
             // Follow AIA caIssuers to find the issuer
             let ca_issuer_urls = extract_aia_urls(&current, AiaAccessMethod::CaIssuers);
             if ca_issuer_urls.is_empty() {
-                log::debug!(
-                    "Chain building stopped at depth {depth}: no AIA caIssuers URLs"
-                );
+                log::debug!("Chain building stopped at depth {depth}: no AIA caIssuers URLs");
                 return Ok(chain);
             }
 
@@ -147,9 +145,9 @@ impl ChainBuilder {
 
             // Find issuer among available certs
             let issuer_name = &current.tbs_certificate.issuer;
-            let found = available_certs.iter().find(|c| {
-                &c.tbs_certificate.subject == issuer_name
-            });
+            let found = available_certs
+                .iter()
+                .find(|c| &c.tbs_certificate.subject == issuer_name);
 
             match found {
                 Some(issuer) => {
@@ -247,7 +245,10 @@ mod tests {
         ));
         let (_label, der) = pem_rfc7468::decode_vec(cert_pem.as_bytes()).unwrap();
         let cert = Certificate::from_der(&der).unwrap();
-        assert!(!is_self_signed(&cert), "signer cert should not be self-signed");
+        assert!(
+            !is_self_signed(&cert),
+            "signer cert should not be self-signed"
+        );
     }
 
     #[test]
@@ -271,10 +272,7 @@ mod tests {
         trust_store.add_der_certificate(&ca_der).unwrap();
 
         // Check if there's an intermediate cert
-        let chain_pem_path = concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/tests/fixtures/chain.pem"
-        );
+        let chain_pem_path = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/chain.pem");
         let chain_pem = std::fs::read_to_string(chain_pem_path).unwrap_or_default();
 
         let mut available_certs = vec![signer_cert.clone()];
@@ -291,11 +289,8 @@ mod tests {
             break;
         }
 
-        let chain = ChainBuilder::build_chain_from_certs(
-            &signer_cert,
-            &available_certs,
-            &trust_store,
-        );
+        let chain =
+            ChainBuilder::build_chain_from_certs(&signer_cert, &available_certs, &trust_store);
 
         assert!(!chain.is_empty(), "chain should not be empty");
         // First cert in chain should be the signer cert

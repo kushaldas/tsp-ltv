@@ -13,8 +13,8 @@ use reqwest::Client;
 use x509_cert::Certificate;
 
 use crate::der_utils::{
-    find_tagged_value, integer_bodies_equal, parse_integer_body, parse_tlv,
-    parse_tlv_with_rest, parse_x509_time,
+    find_tagged_value, integer_bodies_equal, parse_integer_body, parse_tlv, parse_tlv_with_rest,
+    parse_x509_time,
 };
 use crate::error::LtvError;
 use crate::ltv::status::{RevocationReason, RevocationSource, ValidationStatus};
@@ -99,9 +99,10 @@ impl CrlClient {
     pub async fn fetch_crl(&self, url: &str) -> Result<Vec<u8>, LtvError> {
         // Check cache first
         {
-            let cache = self.cache.lock().map_err(|e| {
-                LtvError::Crl(format!("cache lock poisoned: {e}"))
-            })?;
+            let cache = self
+                .cache
+                .lock()
+                .map_err(|e| LtvError::Crl(format!("cache lock poisoned: {e}")))?;
             if let Some(entry) = cache.get(url) {
                 if entry.fetched_at.elapsed() < self.grace_period {
                     log::debug!("CRL cache hit for {url}");
@@ -144,9 +145,10 @@ impl CrlClient {
 
         // Update cache
         {
-            let mut cache = self.cache.lock().map_err(|e| {
-                LtvError::Crl(format!("cache lock poisoned: {e}"))
-            })?;
+            let mut cache = self
+                .cache
+                .lock()
+                .map_err(|e| LtvError::Crl(format!("cache lock poisoned: {e}")))?;
             cache.insert(
                 url.to_string(),
                 CrlCacheEntry {
@@ -160,10 +162,7 @@ impl CrlClient {
     }
 
     /// Fetch all CRLs for a certificate (from all distribution points).
-    pub async fn fetch_crls_for_cert(
-        &self,
-        cert: &Certificate,
-    ) -> Result<Vec<Vec<u8>>, LtvError> {
+    pub async fn fetch_crls_for_cert(&self, cert: &Certificate) -> Result<Vec<Vec<u8>>, LtvError> {
         let urls = Self::extract_crl_urls(cert);
         let mut crls = Vec::new();
 
@@ -381,8 +380,8 @@ pub fn parse_crl(crl_der: &[u8]) -> Result<ParsedCrl, LtvError> {
         // and v1 CRLs might omit it. The next field after optional version
         // is a SEQUENCE (AlgorithmIdentifier). Let's peek:
         // If we see INTEGER, skip it as version.
-        let (_, _, r) = parse_tlv_with_rest(tbs_pos)
-            .map_err(|e| LtvError::Crl(format!("CRL version: {e}")))?;
+        let (_, _, r) =
+            parse_tlv_with_rest(tbs_pos).map_err(|e| LtvError::Crl(format!("CRL version: {e}")))?;
         tbs_pos = r;
     }
 
@@ -396,8 +395,8 @@ pub fn parse_crl(crl_der: &[u8]) -> Result<ParsedCrl, LtvError> {
     }
 
     // issuer Name (SEQUENCE)
-    let (issuer_tag, _issuer_body, rest_after_issuer) = parse_tlv_with_rest(tbs_pos)
-        .map_err(|e| LtvError::Crl(format!("CRL issuer: {e}")))?;
+    let (issuer_tag, _issuer_body, rest_after_issuer) =
+        parse_tlv_with_rest(tbs_pos).map_err(|e| LtvError::Crl(format!("CRL issuer: {e}")))?;
     if issuer_tag != 0x30 {
         return Err(LtvError::Crl(format!(
             "expected issuer SEQUENCE, got 0x{issuer_tag:02x}"
@@ -409,8 +408,8 @@ pub fn parse_crl(crl_der: &[u8]) -> Result<ParsedCrl, LtvError> {
     tbs_pos = rest_after_issuer;
 
     // thisUpdate Time (UTCTime 0x17 or GeneralizedTime 0x18)
-    let (time_tag, time_body, rest_after_this) = parse_tlv_with_rest(tbs_pos)
-        .map_err(|e| LtvError::Crl(format!("CRL thisUpdate: {e}")))?;
+    let (time_tag, time_body, rest_after_this) =
+        parse_tlv_with_rest(tbs_pos).map_err(|e| LtvError::Crl(format!("CRL thisUpdate: {e}")))?;
     let this_update = parse_x509_time(time_tag, time_body)
         .map_err(|e| LtvError::Crl(format!("CRL thisUpdate parse: {e}")))?;
     tbs_pos = rest_after_this;
@@ -466,8 +465,8 @@ fn parse_revoked_certificates(
 ) -> Result<(), LtvError> {
     let mut pos = body;
     while !pos.is_empty() {
-        let (entry_tag, entry_body, rest) = parse_tlv_with_rest(pos)
-            .map_err(|e| LtvError::Crl(format!("revoked entry: {e}")))?;
+        let (entry_tag, entry_body, rest) =
+            parse_tlv_with_rest(pos).map_err(|e| LtvError::Crl(format!("revoked entry: {e}")))?;
         if entry_tag != 0x30 {
             return Err(LtvError::Crl(format!(
                 "expected revoked entry SEQUENCE, got 0x{entry_tag:02x}"
@@ -556,10 +555,7 @@ fn parse_revocation_reason(extensions_area: &[u8]) -> RevocationReason {
 /// Extracts the issuer's SPKI, then delegates to
 /// [`crate::crypto::verify::verify_signature_by_algid`] so RSASSA-PSS
 /// parameters are honoured.
-pub fn verify_crl_signature(
-    parsed_crl: &ParsedCrl,
-    issuer: &Certificate,
-) -> Result<(), LtvError> {
+pub fn verify_crl_signature(parsed_crl: &ParsedCrl, issuer: &Certificate) -> Result<(), LtvError> {
     verify_crl_signature_with_policy(
         parsed_crl,
         issuer,
@@ -708,7 +704,9 @@ fn get_cert_serial_body(cert: &Certificate) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::der_utils::{encode_integer_u64, encode_sequence_from_parts, encode_sequence_raw, encode_tlv};
+    use crate::der_utils::{
+        encode_integer_u64, encode_sequence_from_parts, encode_sequence_raw, encode_tlv,
+    };
     use der::{Decode, Encode};
 
     #[test]
@@ -756,9 +754,9 @@ mod tests {
         revoked_serials: &[(Vec<u8>, &str)], // (serial_bytes, "YYMMDDHHMMSSZ")
     ) -> Vec<u8> {
         use rsa::pkcs1v15::SigningKey;
-        use rsa::signature::Signer;
-        use rsa::signature::SignatureEncoding;
         use rsa::pkcs8::DecodePrivateKey;
+        use rsa::signature::SignatureEncoding;
+        use rsa::signature::Signer;
         use sha2::Sha256;
 
         // Build TBSCertList body
@@ -775,11 +773,7 @@ mod tests {
         tbs_body.extend_from_slice(&alg_id);
 
         // issuer Name — use the issuer cert's subject DER
-        let issuer_name_der = issuer_cert
-            .tbs_certificate
-            .subject
-            .to_der()
-            .unwrap();
+        let issuer_name_der = issuer_cert.tbs_certificate.subject.to_der().unwrap();
         tbs_body.extend_from_slice(&issuer_name_der);
 
         // thisUpdate UTCTime
@@ -811,8 +805,7 @@ mod tests {
         let key_der = pem_rfc7468::decode_vec(issuer_key_pem.as_bytes())
             .unwrap()
             .1;
-        let private_key =
-            rsa::RsaPrivateKey::from_pkcs8_der(&key_der).unwrap();
+        let private_key = rsa::RsaPrivateKey::from_pkcs8_der(&key_der).unwrap();
         let signing_key = SigningKey::<Sha256>::new(private_key);
         let signature: rsa::pkcs1v15::Signature = signing_key.sign(&tbs_der);
         let sig_bytes = signature.to_vec();
@@ -824,8 +817,7 @@ mod tests {
         bit_string_value.extend_from_slice(&sig_bytes);
         let sig_bit_string = encode_tlv(0x03, &bit_string_value);
 
-        let cert_list =
-            encode_sequence_from_parts(&[&tbs_der, &outer_alg_id, &sig_bit_string]);
+        let cert_list = encode_sequence_from_parts(&[&tbs_der, &outer_alg_id, &sig_bit_string]);
         cert_list
     }
 
@@ -865,7 +857,9 @@ mod tests {
         // We need the intermediate CA key to sign. If it doesn't exist, skip.
         let key_path = intermediate_ca_key_pem();
         let Ok(key_pem) = std::fs::read_to_string(key_path) else {
-            eprintln!("skipping test: intermediate_ca_key.pem not found (run gen-test-fixtures.sh)");
+            eprintln!(
+                "skipping test: intermediate_ca_key.pem not found (run gen-test-fixtures.sh)"
+            );
             return;
         };
 
@@ -875,10 +869,7 @@ mod tests {
 
         assert!(parsed.revoked_entries.is_empty());
         assert!(parsed.next_update.is_some());
-        assert_eq!(
-            parsed.this_update.to_rfc3339(),
-            "2026-01-01T00:00:00+00:00"
-        );
+        assert_eq!(parsed.this_update.to_rfc3339(), "2026-01-01T00:00:00+00:00");
     }
 
     #[test]

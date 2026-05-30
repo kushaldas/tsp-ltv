@@ -7,9 +7,9 @@ use std::time::Duration;
 
 use reqwest::Client;
 
+use super::token;
 use crate::crypto::algorithm::DigestAlgorithm;
 use crate::error::TspError;
-use super::token;
 
 /// HTTP Content-Type for RFC 3161 timestamp requests.
 const TSP_REQUEST_CONTENT_TYPE: &str = "application/timestamp-query";
@@ -256,7 +256,10 @@ impl TsaClientPool {
     ///
     /// Panics if `clients` is empty.
     pub fn new(clients: Vec<TsaClient>) -> Self {
-        assert!(!clients.is_empty(), "TsaClientPool requires at least one client");
+        assert!(
+            !clients.is_empty(),
+            "TsaClientPool requires at least one client"
+        );
         Self { clients }
     }
 
@@ -294,9 +297,7 @@ impl TsaClientPool {
             }
         }
 
-        Err(last_error.unwrap_or_else(|| {
-            TspError::HttpError("no TSA clients configured".into())
-        }))
+        Err(last_error.unwrap_or_else(|| TspError::HttpError("no TSA clients configured".into())))
     }
 
     /// Blocking variant of [`timestamp`](Self::timestamp).

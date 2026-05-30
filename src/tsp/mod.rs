@@ -37,8 +37,6 @@ pub mod token;
 // Re-exports
 pub use client::{TsaClient, TsaClientPool};
 pub use token::{
-    TimeStampResp, TstInfo, PkiStatus,
-    build_timestamp_request, parse_timestamp_response,
-    validate_timestamp_response, verify_timestamp_token, extract_tst_info,
-    generate_nonce,
+    build_timestamp_request, extract_tst_info, generate_nonce, parse_timestamp_response,
+    validate_timestamp_response, verify_timestamp_token, PkiStatus, TimeStampResp, TstInfo,
 };

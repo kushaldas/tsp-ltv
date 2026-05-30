@@ -14,7 +14,7 @@ use x509_cert::Certificate;
 
 use crate::crypto::algorithm::DigestAlgorithm;
 use crate::der_utils;
-use crate::error::{TspError, TrustError};
+use crate::error::{TrustError, TspError};
 use crate::trust::TrustStore;
 
 // ---------------------------------------------------------------------------
@@ -29,8 +29,7 @@ pub const ID_CT_TST_INFO: ObjectIdentifier =
 pub const ID_SIGNED_DATA: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.840.113549.1.7.2");
 
 /// id-contentType signed attribute (1.2.840.113549.1.9.3)
-const ID_CONTENT_TYPE_ATTR: ObjectIdentifier =
-    ObjectIdentifier::new_unwrap("1.2.840.113549.1.9.3");
+const ID_CONTENT_TYPE_ATTR: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.840.113549.1.9.3");
 
 /// id-messageDigest signed attribute (1.2.840.113549.1.9.4)
 const ID_MESSAGE_DIGEST_ATTR: ObjectIdentifier =
@@ -385,7 +384,11 @@ pub fn verify_timestamp_token(
         // allowed, a weak-but-valid link is still preferred over a bare
         // same-subject name match (which would otherwise pick the wrong
         // re-issued intermediate and make verify_chain fail).
-        let chain = order_chain(&verified.signer, &verified.embedded, store.signature_policy());
+        let chain = order_chain(
+            &verified.signer,
+            &verified.embedded,
+            store.signature_policy(),
+        );
 
         // Default the chain validation time to the token's authenticated
         // genTime. verify_chain skips intermediate/anchor time-validity checks
@@ -469,9 +472,10 @@ fn verify_token_cms(
 
     // Signed attributes are mandatory: the signature is computed over them, and
     // they carry the message-digest binding to the eContent.
-    let signed_attrs = signer_info.signed_attrs.as_ref().ok_or_else(|| {
-        TspError::VerificationFailed("SignerInfo has no signedAttrs".into())
-    })?;
+    let signed_attrs = signer_info
+        .signed_attrs
+        .as_ref()
+        .ok_or_else(|| TspError::VerificationFailed("SignerInfo has no signedAttrs".into()))?;
 
     // Collect candidate certificates: those embedded in the token (CMS
     // `certificates` is optional and may be absent) plus any supplied
@@ -521,12 +525,13 @@ fn verify_token_cms(
     })?;
 
     // --- content-type signed attribute must equal id-ct-TSTInfo ---
-    let content_type_attr = find_attribute(signed_attrs, &ID_CONTENT_TYPE_ATTR)?.ok_or_else(|| {
-        TspError::VerificationFailed("signedAttrs missing content-type attribute".into())
+    let content_type_attr =
+        find_attribute(signed_attrs, &ID_CONTENT_TYPE_ATTR)?.ok_or_else(|| {
+            TspError::VerificationFailed("signedAttrs missing content-type attribute".into())
+        })?;
+    let signed_content_type: ObjectIdentifier = content_type_attr.decode_as().map_err(|e| {
+        TspError::VerificationFailed(format!("invalid content-type attribute: {e}"))
     })?;
-    let signed_content_type: ObjectIdentifier = content_type_attr
-        .decode_as()
-        .map_err(|e| TspError::VerificationFailed(format!("invalid content-type attribute: {e}")))?;
     if signed_content_type != ID_CT_TST_INFO {
         return Err(TspError::VerificationFailed(format!(
             "signed content-type is not id-ct-TSTInfo (got {signed_content_type})"
@@ -557,9 +562,9 @@ fn verify_token_cms(
 
     // --- verify the SignerInfo signature over the DER-encoded signedAttrs ---
     // CMS signs the SET OF SignedAttributes (tag 0x31), not the [0] IMPLICIT form.
-    let signed_attrs_der = signed_attrs
-        .to_der()
-        .map_err(|e| TspError::VerificationFailed(format!("failed to re-encode signedAttrs: {e}")))?;
+    let signed_attrs_der = signed_attrs.to_der().map_err(|e| {
+        TspError::VerificationFailed(format!("failed to re-encode signedAttrs: {e}"))
+    })?;
     let spki_der = signer
         .tbs_certificate
         .subject_public_key_info
@@ -572,9 +577,7 @@ fn verify_token_cms(
         &signer_info.signature_algorithm,
         digest_alg,
     )
-    .map_err(|e| {
-        TspError::VerificationFailed(format!("TSA signature verification failed: {e}"))
-    })?;
+    .map_err(|e| TspError::VerificationFailed(format!("TSA signature verification failed: {e}")))?;
 
     // --- require a critical id-kp-timeStamping EKU on the signer ---
     require_timestamping_eku(&signer)?;
@@ -835,7 +838,9 @@ fn require_timestamping_eku(cert: &Certificate) -> Result<(), TspError> {
         .iter()
         .find(|e| e.extn_id == ID_CE_EXT_KEY_USAGE)
         .ok_or_else(|| {
-            TspError::VerificationFailed("TSA certificate lacks an extendedKeyUsage extension".into())
+            TspError::VerificationFailed(
+                "TSA certificate lacks an extendedKeyUsage extension".into(),
+            )
         })?;
 
     if !eku_ext.critical {
@@ -942,7 +947,10 @@ fn gen_time_datetime(tst_info: &TstInfo) -> Result<der::DateTime, TspError> {
 
 /// Confirm the timestamp's `genTime` falls within the signer certificate's
 /// validity window (RFC 3161).
-fn check_gen_time_within_validity(signer: &Certificate, tst_info: &TstInfo) -> Result<(), TspError> {
+fn check_gen_time_within_validity(
+    signer: &Certificate,
+    tst_info: &TstInfo,
+) -> Result<(), TspError> {
     let gen_time = gen_time_datetime(tst_info)?;
 
     let validity = &signer.tbs_certificate.validity;
@@ -1342,8 +1350,10 @@ mod tests {
         env!("CARGO_MANIFEST_DIR"),
         "/tests/fixtures/intermediate_ca_key.pem"
     ));
-    const ROOT_CERT_PEM: &str =
-        include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/ca_cert.pem"));
+    const ROOT_CERT_PEM: &str = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/ca_cert.pem"
+    ));
 
     fn load_cert(pem: &str) -> Certificate {
         let (_, der) = pem_rfc7468::decode_vec(pem.as_bytes()).unwrap();
@@ -1478,7 +1488,15 @@ mod tests {
         let serial = der_utils::encode_integer_u64(42);
         let gen_time = der_utils::encode_tlv(0x18, gen_time_bytes);
         let nonce_int = der_utils::encode_integer_u64(nonce);
-        let body = [version, policy, message_imprint, serial, gen_time, nonce_int].concat();
+        let body = [
+            version,
+            policy,
+            message_imprint,
+            serial,
+            gen_time,
+            nonce_int,
+        ]
+        .concat();
         der_utils::encode_sequence_raw(&body)
     }
 
@@ -1549,7 +1567,11 @@ mod tests {
         // Sign the DER of the SET OF signed attributes (RFC 5652 §5.4).
         let signed_attrs_der = signed_attrs.to_der().unwrap();
         let signing_key = SigningKey::<Sha256>::new(signer_key.clone());
-        let to_sign: &[u8] = if corrupt_sig { b"not the signed attributes" } else { &signed_attrs_der };
+        let to_sign: &[u8] = if corrupt_sig {
+            b"not the signed attributes"
+        } else {
+            &signed_attrs_der
+        };
         let signature: Signature = signing_key.sign(to_sign);
 
         let sha256_alg = AlgorithmIdentifierOwned {
@@ -1604,7 +1626,6 @@ mod tests {
         };
         content_info.to_der().unwrap()
     }
-
 
     #[test]
     fn test_verify_valid_token_no_trust_store() {
@@ -1702,8 +1723,16 @@ mod tests {
             true,  // embed certs
             false, // valid signature
         );
-        let err = verify_timestamp_token(&token, &hash, DigestAlgorithm::Sha256, None, None, None, &[])
-            .unwrap_err();
+        let err = verify_timestamp_token(
+            &token,
+            &hash,
+            DigestAlgorithm::Sha256,
+            None,
+            None,
+            None,
+            &[],
+        )
+        .unwrap_err();
         assert!(
             matches!(err, TspError::VerificationFailed(_)),
             "genTime outside TSA cert validity must be rejected, got {err:?}"
@@ -1714,8 +1743,16 @@ mod tests {
     fn test_reject_tampered_signature() {
         let hash = vec![0x22u8; 32];
         let token = build_signed_token(&tsa_cert(), &tsa_key(), &[], &hash, 1, true);
-        let err = verify_timestamp_token(&token, &hash, DigestAlgorithm::Sha256, None, None, None, &[])
-            .unwrap_err();
+        let err = verify_timestamp_token(
+            &token,
+            &hash,
+            DigestAlgorithm::Sha256,
+            None,
+            None,
+            None,
+            &[],
+        )
+        .unwrap_err();
         assert!(
             matches!(err, TspError::VerificationFailed(_)),
             "tampered signature must be rejected, got {err:?}"
@@ -1757,10 +1794,24 @@ mod tests {
         // as the signer. The signature verifies, but the cert lacks the critical
         // id-kp-timeStamping EKU, so verification must fail.
         let hash = vec![0x44u8; 32];
-        let token =
-            build_signed_token(&intermediate_cert(), &intermediate_key(), &[], &hash, 1, false);
-        let err = verify_timestamp_token(&token, &hash, DigestAlgorithm::Sha256, None, None, None, &[])
-            .unwrap_err();
+        let token = build_signed_token(
+            &intermediate_cert(),
+            &intermediate_key(),
+            &[],
+            &hash,
+            1,
+            false,
+        );
+        let err = verify_timestamp_token(
+            &token,
+            &hash,
+            DigestAlgorithm::Sha256,
+            None,
+            None,
+            None,
+            &[],
+        )
+        .unwrap_err();
         assert!(
             matches!(err, TspError::VerificationFailed(_)),
             "signer without timeStamping EKU must be rejected, got {err:?}"
@@ -1790,8 +1841,16 @@ mod tests {
         };
         let token = content_info.to_der().unwrap();
 
-        let err = verify_timestamp_token(&token, &hash, DigestAlgorithm::Sha256, None, None, None, &[])
-            .unwrap_err();
+        let err = verify_timestamp_token(
+            &token,
+            &hash,
+            DigestAlgorithm::Sha256,
+            None,
+            None,
+            None,
+            &[],
+        )
+        .unwrap_err();
         assert!(
             matches!(err, TspError::InvalidResponse(_)),
             "unsigned token must be rejected, got {err:?}"
@@ -1820,8 +1879,16 @@ mod tests {
         let real_hash = vec![0x66u8; 32];
         let token = build_signed_token(&tsa_cert(), &tsa_key(), &[], &real_hash, 1, false);
         let expected = vec![0x99u8; 32];
-        let err = verify_timestamp_token(&token, &expected, DigestAlgorithm::Sha256, None, None, None, &[])
-            .unwrap_err();
+        let err = verify_timestamp_token(
+            &token,
+            &expected,
+            DigestAlgorithm::Sha256,
+            None,
+            None,
+            None,
+            &[],
+        )
+        .unwrap_err();
         assert!(matches!(err, TspError::InvalidResponse(_)));
     }
 
@@ -1989,8 +2056,16 @@ mod tests {
 
         // Without the cert there is no key to check the signature; this is
         // reported as InvalidResponse (missing material), not a crypto failure.
-        let err = verify_timestamp_token(&token, &hash, DigestAlgorithm::Sha256, None, None, None, &[])
-            .unwrap_err();
+        let err = verify_timestamp_token(
+            &token,
+            &hash,
+            DigestAlgorithm::Sha256,
+            None,
+            None,
+            None,
+            &[],
+        )
+        .unwrap_err();
         assert!(
             matches!(err, TspError::InvalidResponse(_)),
             "token without certs and no extra_certs must fail as InvalidResponse, got {err:?}"

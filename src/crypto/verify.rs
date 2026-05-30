@@ -69,7 +69,9 @@ pub struct SignaturePolicy {
 impl SignaturePolicy {
     /// Fail-closed policy: signatures over MD5 / SHA-1 / SHA-224 are rejected.
     pub const fn strict() -> Self {
-        Self { allow_legacy: false }
+        Self {
+            allow_legacy: false,
+        }
     }
 
     /// Permissive policy that additionally accepts MD5 / SHA-1 / SHA-224
@@ -437,7 +439,12 @@ pub fn verify_rsa_pss_signature<
     sig: &[u8],
     spki_der: &[u8],
 ) -> Result<(), TrustError> {
-    verify_rsa_pss_signature_with_salt::<D>(tbs, sig, spki_der, <D as digest::Digest>::output_size())
+    verify_rsa_pss_signature_with_salt::<D>(
+        tbs,
+        sig,
+        spki_der,
+        <D as digest::Digest>::output_size(),
+    )
 }
 
 /// Verify an RSA-PSS (RSASSA-PSS) signature over `tbs` with an explicit salt
@@ -796,9 +803,7 @@ mod tests {
 
         let msg = b"tbs bytes to be signed with PSS";
         let signing = SigningKey::<Sha256>::new_with_salt_len(key, 48);
-        let sig = signing
-            .sign_with_rng(&mut rand::thread_rng(), msg)
-            .to_vec();
+        let sig = signing.sign_with_rng(&mut rand::thread_rng(), msg).to_vec();
 
         // Correct salt length declared -> verifies.
         verify_signature_by_algid(msg, &sig, &spki_der, &pss_algid::<Sha256>(48))
