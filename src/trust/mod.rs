@@ -37,6 +37,8 @@ mod chain_build;
 mod store;
 mod store_set;
 
-pub use chain_build::{build_chain_from_pool, trust_anchor_subjects};
+pub use chain_build::{
+    build_chain_from_pool, build_chain_from_pool_with_policy, trust_anchor_subjects,
+};
 pub use store::TrustStore;
 pub use store_set::{StoreKind, TrustStoreSet};

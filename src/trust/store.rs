@@ -21,6 +21,10 @@ pub struct TrustStore {
     anchors: Vec<TrustAnchor>,
     /// Human-readable label for diagnostics (e.g., "sig", "tsa", "svt").
     label: Option<String>,
+    /// Signature-algorithm policy applied during chain verification. Defaults
+    /// to strict (weak digests MD5/SHA-1/SHA-224 rejected); opt into legacy via
+    /// [`TrustStore::allow_legacy_signatures`].
+    signature_policy: crate::crypto::verify::SignaturePolicy,
 }
 
 impl TrustStore {
@@ -29,6 +33,7 @@ impl TrustStore {
         Self {
             anchors: Vec::new(),
             label: None,
+            signature_policy: crate::crypto::verify::SignaturePolicy::default(),
         }
     }
 
@@ -36,6 +41,32 @@ impl TrustStore {
     pub fn with_label(mut self, label: impl Into<String>) -> Self {
         self.label = Some(label.into());
         self
+    }
+
+    /// Set the signature-algorithm policy used by
+    /// [`verify_chain`](Self::verify_chain).
+    pub fn with_signature_policy(
+        mut self,
+        policy: crate::crypto::verify::SignaturePolicy,
+    ) -> Self {
+        self.signature_policy = policy;
+        self
+    }
+
+    /// Accept certificates signed with weak/legacy digests (MD5/SHA-1/SHA-224)
+    /// during chain verification.
+    ///
+    /// Off by default — weak digests are rejected. Enable this only to validate
+    /// historical material (e.g. legacy XML-DSig interop certificates) whose
+    /// risk you have accepted; never for fresh trust decisions.
+    pub fn allow_legacy_signatures(mut self) -> Self {
+        self.signature_policy = crate::crypto::verify::SignaturePolicy::allow_legacy();
+        self
+    }
+
+    /// The signature-algorithm policy this store applies during verification.
+    pub fn signature_policy(&self) -> crate::crypto::verify::SignaturePolicy {
+        self.signature_policy
     }
 
     /// The diagnostic label, if set.
@@ -232,11 +263,18 @@ impl TrustStore {
     /// 4. Time validity (not before / not after) if `validation_time` is provided
     ///
     /// Returns the matching trust anchor on success.
+    ///
+    /// Signature verification honours this store's
+    /// [`signature_policy`](Self::signature_policy): by default a chain
+    /// containing a certificate signed with MD5/SHA-1/SHA-224 is rejected.
+    /// Build the store with [`allow_legacy_signatures`](Self::allow_legacy_signatures)
+    /// to validate such historical chains.
     pub fn verify_chain(
         &self,
         chain: &[Certificate],
         validation_time: Option<der::DateTime>,
     ) -> Result<&Certificate, TrustError> {
+        let policy = &self.signature_policy;
         if chain.is_empty() {
             return Err(TrustError::EmptyChain);
         }
@@ -275,7 +313,9 @@ impl TrustStore {
             }
 
             // Verify signature of cert against issuer's public key
-            crate::crypto::verify::verify_certificate_signature(cert, issuer_cert)?;
+            crate::crypto::verify::verify_certificate_signature_with_policy(
+                cert, issuer_cert, policy,
+            )?;
 
             // Validate extensions: intermediates must have CA:TRUE + keyCertSign
             #[cfg(feature = "ltv")]
@@ -300,7 +340,7 @@ impl TrustStore {
         if last.tbs_certificate.issuer == last.tbs_certificate.subject {
             if self.contains_der(&last.to_der().unwrap_or_default()) {
                 // Self-signed cert is directly trusted — verify its self-signature
-                crate::crypto::verify::verify_certificate_signature(last, last)?;
+                crate::crypto::verify::verify_certificate_signature_with_policy(last, last, policy)?;
                 let anchor = self.find_issuer(last).unwrap(); // must exist since contains_der passed
                 return Ok(anchor);
             }
@@ -317,7 +357,9 @@ impl TrustStore {
         // subject name but have different keys (e.g., re-issued roots).
         let mut last_err = None;
         for anchor in &candidates {
-            match crate::crypto::verify::verify_certificate_signature(last, anchor) {
+            match crate::crypto::verify::verify_certificate_signature_with_policy(
+                last, anchor, policy,
+            ) {
                 Ok(()) => {
                     // Signature verified — now check anchor time validity
                     if let Some(time) = validation_time {
@@ -365,3 +407,102 @@ impl std::fmt::Debug for TrustStore {
 }
 
 // Signature verification is now in crate::crypto::verify
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::crypto::verify::SignaturePolicy;
+
+    /// Build a self-signed root certificate signed with SHA-1 + RSA
+    /// (`sha1WithRSAEncryption`) at runtime, so we can exercise the weak-digest
+    /// policy without committing a legacy fixture.
+    ///
+    /// `rsa`'s builder signer only emits SHA-2/3 signature OIDs, so we build a
+    /// well-formed TBS with SHA-256, then re-sign that TBS with SHA-1 and
+    /// relabel the outer `signatureAlgorithm` — yielding a certificate whose
+    /// outer signature is a genuine, valid `sha1WithRSAEncryption` signature.
+    fn sha1_self_signed_root() -> Certificate {
+        use der::asn1::BitString;
+        use der::{Any, Encode};
+        use rsa::pkcs1v15::SigningKey;
+        use rsa::signature::Keypair;
+        use rsa::{Pkcs1v15Sign, RsaPrivateKey};
+        use sha1::{Digest, Sha1};
+        use sha2::Sha256;
+        use spki::AlgorithmIdentifierOwned;
+        use x509_cert::builder::{Builder, CertificateBuilder, Profile};
+        use x509_cert::name::Name;
+        use x509_cert::serial_number::SerialNumber;
+        use x509_cert::spki::SubjectPublicKeyInfoOwned;
+        use x509_cert::time::Validity;
+
+        let mut rng = rand::thread_rng();
+        let key = RsaPrivateKey::new(&mut rng, 2048).expect("RSA keygen");
+        let signer = SigningKey::<Sha256>::new(key.clone());
+        let spki =
+            SubjectPublicKeyInfoOwned::from_key(signer.verifying_key()).expect("SPKI from key");
+
+        let serial = SerialNumber::new(&[0x01]).unwrap();
+        let validity =
+            Validity::from_now(std::time::Duration::from_secs(3650 * 24 * 3600)).unwrap();
+        let subject: Name = "CN=Legacy SHA-1 Root,O=tsp-ltv tests".parse().unwrap();
+        let base = CertificateBuilder::new(Profile::Root, serial, validity, subject, spki, &signer)
+            .expect("cert builder")
+            .build()
+            .expect("build base root");
+
+        // Re-sign the TBS with SHA-1 and relabel the outer algorithm.
+        let tbs_der = base.tbs_certificate.to_der().unwrap();
+        let hash = Sha1::digest(&tbs_der);
+        let sig = key
+            .sign(Pkcs1v15Sign::new::<Sha1>(), &hash)
+            .expect("SHA-1 RSA sign");
+        Certificate {
+            tbs_certificate: base.tbs_certificate.clone(),
+            signature_algorithm: AlgorithmIdentifierOwned {
+                oid: crate::crypto::algorithm::OID_SHA1_WITH_RSA,
+                // sha1WithRSAEncryption carries an explicit NULL parameter.
+                parameters: Some(Any::from_der(&[0x05, 0x00]).unwrap()),
+            },
+            signature: BitString::from_bytes(&sig).unwrap(),
+        }
+    }
+
+    #[test]
+    fn test_verify_chain_rejects_sha1_by_default_and_accepts_with_legacy() {
+        let root = sha1_self_signed_root();
+        // Sanity: it really is a weak (SHA-1) signature algorithm.
+        assert!(crate::crypto::verify::is_weak_signature_oid(
+            &root.signature_algorithm.oid
+        ));
+
+        let mut store = TrustStore::new();
+        store.add_certificate(root.clone()).unwrap();
+        let chain = [root];
+
+        // Strict default: the SHA-1 self-signature is refused.
+        let err = store.verify_chain(&chain, None).unwrap_err();
+        assert!(
+            matches!(err, TrustError::WeakAlgorithm(_)),
+            "strict store must reject a SHA-1-signed chain, got {err:?}"
+        );
+
+        // Legacy opt-in via the builder: the same chain now verifies. This is
+        // the reachable path a consumer (e.g. bergshamra's XML-DSig interop
+        // fixtures) uses.
+        let legacy_store = TrustStore::new()
+            .allow_legacy_signatures()
+            .with_label("legacy");
+        let mut legacy_store = legacy_store;
+        legacy_store.add_certificate(chain[0].clone()).unwrap();
+        legacy_store
+            .verify_chain(&chain, None)
+            .expect("legacy store must accept a SHA-1-signed chain");
+
+        assert_eq!(
+            legacy_store.signature_policy(),
+            SignaturePolicy::allow_legacy()
+        );
+        assert_eq!(store.signature_policy(), SignaturePolicy::strict());
+    }
+}

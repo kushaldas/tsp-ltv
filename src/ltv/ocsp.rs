@@ -1083,6 +1083,7 @@ fn extract_nonce_from_extensions(ext_area: &[u8]) -> Option<Vec<u8>> {
 fn verify_ocsp_response_signature(
     parsed: &ParsedBasicOcspResponse,
     issuer: &Certificate,
+    policy: &crate::crypto::verify::SignaturePolicy,
 ) -> Result<Certificate, LtvError> {
     use der::Decode;
 
@@ -1106,11 +1107,12 @@ fn verify_ocsp_response_signature(
             Err(_) => continue,
         };
 
-        let result = crate::crypto::verify::verify_signature_by_algid(
+        let result = crate::crypto::verify::verify_signature_by_algid_with_policy(
             &parsed.tbs_response_data,
             &parsed.signature_bytes,
             &spki_der,
             &parsed.signature_algorithm,
+            policy,
         );
 
         if result.is_ok() {
@@ -1137,6 +1139,7 @@ fn verify_ocsp_response_signature(
 fn validate_responder_trust(
     responder_cert: &Certificate,
     issuer: &Certificate,
+    policy: &crate::crypto::verify::SignaturePolicy,
 ) -> Result<(), LtvError> {
     // Case 1: responder IS the issuer
     if certs_have_same_subject(responder_cert, issuer) {
@@ -1145,7 +1148,11 @@ fn validate_responder_trust(
 
     // Case 2: responder is a delegated OCSP signer
     // Must be issued by the same CA (issuer)
-    let issuer_signed = crate::crypto::verify::verify_certificate_signature(responder_cert, issuer);
+    let issuer_signed = crate::crypto::verify::verify_certificate_signature_with_policy(
+        responder_cert,
+        issuer,
+        policy,
+    );
     if issuer_signed.is_err() {
         return Err(LtvError::Ocsp(
             "OCSP responder certificate is not issued by the expected CA".into(),
@@ -1280,16 +1287,39 @@ pub fn check_revocation(
     nonce: Option<&[u8]>,
     validation_time: Option<chrono::DateTime<chrono::Utc>>,
 ) -> Result<ValidationStatus, LtvError> {
+    check_revocation_with_policy(
+        response_der,
+        cert,
+        issuer,
+        nonce,
+        validation_time,
+        &crate::crypto::verify::SignaturePolicy::default(),
+    )
+}
+
+/// Like [`check_revocation`] but with an explicit
+/// [`SignaturePolicy`](crate::crypto::verify::SignaturePolicy) for the response
+/// and responder-certificate signature checks. The default rejects OCSP
+/// material signed with MD5/SHA-1/SHA-224.
+#[allow(clippy::too_many_arguments)]
+pub fn check_revocation_with_policy(
+    response_der: &[u8],
+    cert: &Certificate,
+    issuer: &Certificate,
+    nonce: Option<&[u8]>,
+    validation_time: Option<chrono::DateTime<chrono::Utc>>,
+    policy: &crate::crypto::verify::SignaturePolicy,
+) -> Result<ValidationStatus, LtvError> {
     let now = validation_time.unwrap_or_else(chrono::Utc::now);
 
     // 1. Parse OCSP response
     let parsed = parse_ocsp_response(response_der)?;
 
     // 2. Verify signature — returns the responder certificate
-    let responder_cert = verify_ocsp_response_signature(&parsed, issuer)?;
+    let responder_cert = verify_ocsp_response_signature(&parsed, issuer, policy)?;
 
     // 3. Validate responder trust
-    validate_responder_trust(&responder_cert, issuer)?;
+    validate_responder_trust(&responder_cert, issuer, policy)?;
 
     // 4. Validate nonce (if provided)
     if let Some(request_nonce) = nonce {

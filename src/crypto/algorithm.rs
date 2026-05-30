@@ -306,6 +306,13 @@ impl std::fmt::Display for SignatureAlgorithm {
 /// By default, the registry allows all supported algorithms. Use the builder
 /// methods to restrict or customize the allowed set.
 ///
+/// Note: this registry is a *signing-profile* allowlist and is **not** the
+/// mechanism that rejects weak signature hashes during verification. Weak
+/// digests (MD5/SHA-1/SHA-224) are refused by the
+/// [`crate::crypto::verify::SignaturePolicy`] gate in the verification path;
+/// the `DigestAlgorithm`/`SignatureAlgorithm` enums here cannot even represent
+/// those digests, so `allow_all()` already excludes them by construction.
+///
 /// # Example
 ///
 /// ```
@@ -448,6 +455,11 @@ impl AlgorithmRegistry {
 
 impl Default for AlgorithmRegistry {
     /// Default registry allows all supported algorithms.
+    ///
+    /// This is *not* a weak-hash vector: the `DigestAlgorithm` /
+    /// `SignatureAlgorithm` enums cannot represent MD5/SHA-1/SHA-224, so
+    /// `allow_all()` already excludes them. Weak hashes are refused separately
+    /// by [`crate::crypto::verify::SignaturePolicy`] in the verification path.
     fn default() -> Self {
         Self::allow_all()
     }

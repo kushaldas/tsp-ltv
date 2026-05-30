@@ -380,8 +380,12 @@ pub fn verify_timestamp_token(
     if let Some(store) = trust_store {
         // Build the chain [signer, intermediate, ...] from embedded certs and
         // verify it reaches a trust anchor. verify_chain performs the actual
-        // signature checks on every link, so the ordering is safe.
-        let chain = order_chain(&verified.signer, &verified.embedded);
+        // signature checks on every link, so the ordering is safe. Order using
+        // the store's signature policy so that, when legacy algorithms are
+        // allowed, a weak-but-valid link is still preferred over a bare
+        // same-subject name match (which would otherwise pick the wrong
+        // re-issued intermediate and make verify_chain fail).
+        let chain = order_chain(&verified.signer, &verified.embedded, store.signature_policy());
 
         // Default the chain validation time to the token's authenticated
         // genTime. verify_chain skips intermediate/anchor time-validity checks
@@ -883,7 +887,11 @@ fn eku_contains(eku_der: &[u8], target: &ObjectIdentifier) -> bool {
 /// would otherwise make a valid chain fail in [`TrustStore::verify_chain`]. If
 /// no candidate verifies, the first name match is used so verify_chain still
 /// produces a meaningful error.
-fn order_chain(signer: &Certificate, embedded: &[Certificate]) -> Vec<Certificate> {
+fn order_chain(
+    signer: &Certificate,
+    embedded: &[Certificate],
+    policy: crate::crypto::verify::SignaturePolicy,
+) -> Vec<Certificate> {
     let mut chain = vec![signer.clone()];
     // Bounded to avoid loops on adversarial inputs.
     for _ in 0..16 {
@@ -901,11 +909,17 @@ fn order_chain(signer: &Certificate, embedded: &[Certificate]) -> Vec<Certificat
             })
             .collect();
 
-        // Prefer a candidate whose key actually signed `current`.
+        // Prefer a candidate whose key actually signed `current`. Use the same
+        // policy verify_chain will use, so a legacy-but-valid link is preferred
+        // (under allow_legacy) instead of being skipped and falling back to a
+        // possibly-wrong same-subject name match.
         let chosen = candidates
             .iter()
             .find(|c| {
-                crate::crypto::verify::verify_certificate_signature(&current, c).is_ok()
+                crate::crypto::verify::verify_certificate_signature_with_policy(
+                    &current, c, &policy,
+                )
+                .is_ok()
             })
             .or_else(|| candidates.first());
 
@@ -1994,5 +2008,131 @@ mod tests {
         )
         .expect("token must verify with externally-supplied signer cert");
         assert_eq!(tst.message_hash, hash);
+    }
+
+    /// Regression for the ambiguous-embedded-chain case: when several embedded
+    /// certs share the issuer's subject, `order_chain` must prefer the one whose
+    /// key actually signed the current cert. Under `allow_legacy` a SHA-1 link
+    /// is valid and must win over a same-subject decoy that the strict precheck
+    /// would otherwise let it fall back to.
+    #[test]
+    fn test_order_chain_prefers_legacy_valid_issuer_among_same_subject_candidates() {
+        use crate::crypto::verify::SignaturePolicy;
+        use der::asn1::BitString;
+        use der::{Any, Decode, Encode};
+        use rsa::pkcs1v15::SigningKey;
+        use rsa::signature::Keypair;
+        use rsa::{Pkcs1v15Sign, RsaPrivateKey};
+        use sha1::{Digest as _, Sha1};
+        use sha2::Sha256;
+        use spki::AlgorithmIdentifierOwned;
+        use x509_cert::builder::{Builder, CertificateBuilder, Profile};
+        use x509_cert::name::Name;
+        use x509_cert::serial_number::SerialNumber;
+        use x509_cert::spki::SubjectPublicKeyInfoOwned;
+        use x509_cert::time::Validity;
+
+        let mut rng = rand::thread_rng();
+        let validity =
+            Validity::from_now(std::time::Duration::from_secs(3650 * 24 * 3600)).unwrap();
+        let issuer_name: Name = "CN=Ambiguous Issuer,O=tsp-ltv tests".parse().unwrap();
+
+        let self_signed = |name: &Name, key: &RsaPrivateKey, serial: u8| {
+            let signer = SigningKey::<Sha256>::new(key.clone());
+            let spki = SubjectPublicKeyInfoOwned::from_key(signer.verifying_key()).unwrap();
+            CertificateBuilder::new(
+                Profile::Root,
+                SerialNumber::new(&[serial]).unwrap(),
+                validity,
+                name.clone(),
+                spki,
+                &signer,
+            )
+            .unwrap()
+            .build()
+            .unwrap()
+        };
+
+        // Real issuer and a decoy sharing the same subject but a different key.
+        let real_key = RsaPrivateKey::new(&mut rng, 2048).unwrap();
+        let real_issuer = self_signed(&issuer_name, &real_key, 0x01);
+        let decoy_key = RsaPrivateKey::new(&mut rng, 2048).unwrap();
+        let decoy = self_signed(&issuer_name, &decoy_key, 0x02);
+
+        // Leaf issued by the real issuer, re-signed with SHA-1.
+        let leaf_key = RsaPrivateKey::new(&mut rng, 2048).unwrap();
+        let leaf_spki = SubjectPublicKeyInfoOwned::from_key(
+            SigningKey::<Sha256>::new(leaf_key).verifying_key(),
+        )
+        .unwrap();
+        let real_signer = SigningKey::<Sha256>::new(real_key.clone());
+        let base = CertificateBuilder::new(
+            Profile::Leaf {
+                issuer: issuer_name.clone(),
+                enable_key_agreement: false,
+                enable_key_encipherment: false,
+            },
+            SerialNumber::new(&[0x03]).unwrap(),
+            validity,
+            "CN=Ambiguous Leaf,O=tsp-ltv tests".parse().unwrap(),
+            leaf_spki,
+            &real_signer,
+        )
+        .unwrap()
+        .build()
+        .unwrap();
+        let tbs_der = base.tbs_certificate.to_der().unwrap();
+        let hash = Sha1::digest(&tbs_der);
+        let sig = real_key
+            .sign(Pkcs1v15Sign::new::<Sha1>(), &hash)
+            .expect("SHA-1 RSA sign");
+        let leaf = Certificate {
+            tbs_certificate: base.tbs_certificate.clone(),
+            signature_algorithm: AlgorithmIdentifierOwned {
+                oid: crate::crypto::algorithm::OID_SHA1_WITH_RSA,
+                parameters: Some(Any::from_der(&[0x05, 0x00]).unwrap()),
+            },
+            signature: BitString::from_bytes(&sig).unwrap(),
+        };
+
+        // Decoy first, so the strict fallback (first name match) picks it.
+        let embedded = vec![decoy.clone(), real_issuer.clone()];
+        let real_spki = real_issuer
+            .tbs_certificate
+            .subject_public_key_info
+            .to_der()
+            .unwrap();
+        let decoy_spki = decoy
+            .tbs_certificate
+            .subject_public_key_info
+            .to_der()
+            .unwrap();
+
+        // Strict: the SHA-1 link can't be verified, so order_chain falls back to
+        // the first same-subject match — the wrong (decoy) cert.
+        let strict = order_chain(&leaf, &embedded, SignaturePolicy::strict());
+        assert_eq!(strict.len(), 2);
+        assert_eq!(
+            strict[1]
+                .tbs_certificate
+                .subject_public_key_info
+                .to_der()
+                .unwrap(),
+            decoy_spki,
+            "strict precheck falls back to the wrong same-subject cert"
+        );
+
+        // allow_legacy: order_chain prefers the cryptographically-correct issuer.
+        let legacy = order_chain(&leaf, &embedded, SignaturePolicy::allow_legacy());
+        assert_eq!(legacy.len(), 2);
+        assert_eq!(
+            legacy[1]
+                .tbs_certificate
+                .subject_public_key_info
+                .to_der()
+                .unwrap(),
+            real_spki,
+            "allow_legacy prefers the issuer whose key actually signed the leaf"
+        );
     }
 }

@@ -560,6 +560,21 @@ pub fn verify_crl_signature(
     parsed_crl: &ParsedCrl,
     issuer: &Certificate,
 ) -> Result<(), LtvError> {
+    verify_crl_signature_with_policy(
+        parsed_crl,
+        issuer,
+        &crate::crypto::verify::SignaturePolicy::default(),
+    )
+}
+
+/// Like [`verify_crl_signature`] but with an explicit
+/// [`SignaturePolicy`](crate::crypto::verify::SignaturePolicy). The default
+/// rejects CRLs signed with MD5/SHA-1/SHA-224.
+pub fn verify_crl_signature_with_policy(
+    parsed_crl: &ParsedCrl,
+    issuer: &Certificate,
+    policy: &crate::crypto::verify::SignaturePolicy,
+) -> Result<(), LtvError> {
     use der::Encode;
 
     let spki_der = issuer
@@ -568,11 +583,12 @@ pub fn verify_crl_signature(
         .to_der()
         .map_err(|e| LtvError::Crl(format!("issuer SPKI encode failed: {e}")))?;
 
-    crate::crypto::verify::verify_signature_by_algid(
+    crate::crypto::verify::verify_signature_by_algid_with_policy(
         &parsed_crl.tbs_bytes,
         &parsed_crl.signature_bytes,
         &spki_der,
         &parsed_crl.signature_algorithm,
+        policy,
     )
     .map_err(|e| LtvError::Crl(format!("CRL signature verification failed: {e}")))
 }
@@ -594,13 +610,32 @@ pub fn check_revocation(
     issuer: &Certificate,
     validation_time: Option<chrono::DateTime<chrono::Utc>>,
 ) -> Result<ValidationStatus, LtvError> {
+    check_revocation_with_policy(
+        crl_der,
+        cert,
+        issuer,
+        validation_time,
+        &crate::crypto::verify::SignaturePolicy::default(),
+    )
+}
+
+/// Like [`check_revocation`] but with an explicit
+/// [`SignaturePolicy`](crate::crypto::verify::SignaturePolicy) for the CRL
+/// signature check. The default rejects CRLs signed with MD5/SHA-1/SHA-224.
+pub fn check_revocation_with_policy(
+    crl_der: &[u8],
+    cert: &Certificate,
+    issuer: &Certificate,
+    validation_time: Option<chrono::DateTime<chrono::Utc>>,
+    policy: &crate::crypto::verify::SignaturePolicy,
+) -> Result<ValidationStatus, LtvError> {
     let now = validation_time.unwrap_or_else(chrono::Utc::now);
 
     // 1. Parse CRL
     let parsed = parse_crl(crl_der)?;
 
     // 2. Verify CRL signature
-    verify_crl_signature(&parsed, issuer)?;
+    verify_crl_signature_with_policy(&parsed, issuer, policy)?;
 
     // 3. Check CRL freshness: nextUpdate should be in the future
     if let Some(next_update) = parsed.next_update {

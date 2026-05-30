@@ -4,13 +4,39 @@
 //! verification can all reuse the same cryptographic primitives.
 //!
 //! Supports:
-//! - RSA PKCS#1 v1.5 with MD5 (legacy), SHA-1 (legacy), SHA-224, SHA-256, SHA-384, SHA-512
+//! - RSA PKCS#1 v1.5 with MD5 (legacy), SHA-1 (legacy), SHA-224 (legacy), SHA-256, SHA-384, SHA-512
 //! - RSA-PSS (RSASSA-PSS) with SHA-256, SHA-384, SHA-512
 //! - ECDSA P-256/P-384 with SHA-1 (legacy)
 //! - ECDSA P-256 with SHA-256
 //! - ECDSA P-384 with SHA-384
 //! - ECDSA P-521 with SHA-512
 //! - Ed25519
+//!
+//! ## Weak-algorithm policy (H-1)
+//!
+//! Signatures built on a broken/deprecated digest — MD5, SHA-1, or SHA-224 —
+//! are **rejected by default**: the strict [`SignaturePolicy`] (the default for
+//! every public entry point) refuses them before any cryptographic work, so the
+//! whole crate is fail-closed against weak hashes. Such a digest must never
+//! underpin a *fresh* trust decision.
+//!
+//! Callers that must validate genuinely historical material (e.g. a legacy
+//! XML-DSig interop certificate signed with SHA-1/MD5) can opt in explicitly.
+//! The opt-in is reachable from the public API, not just these low-level
+//! primitives:
+//!
+//! - [`crate::trust::TrustStore::allow_legacy_signatures`] — certificate-chain
+//!   verification (including the TSA certificate chain reached by
+//!   [`crate::tsp::verify_timestamp_token`]).
+//! - [`crate::ltv::RevocationConfig::allow_legacy_signatures`] — OCSP response
+//!   and CRL signatures.
+//! - The `*_with_policy` free functions here — for direct callers.
+//!
+//! The RFC 3161 token's own CMS `SignerInfo` signature is always verified
+//! strictly: a timestamp token must not itself be freshly signed with a weak
+//! digest (and a SHA-1 `digestAlgorithm` is not representable in
+//! [`DigestAlgorithm`] anyway). Legacy TSA *certificate chains* are still
+//! accepted via the trust store's policy above.
 
 use crate::crypto::algorithm::{
     DigestAlgorithm, OID_ECDSA_WITH_SHA1, OID_ED25519, OID_MD5_WITH_RSA, OID_RSASSA_PSS,
@@ -22,37 +48,126 @@ use crate::error::TrustError;
 const OID_MGF1: const_oid::ObjectIdentifier =
     const_oid::ObjectIdentifier::new_unwrap("1.2.840.113549.1.1.8");
 
-/// Verify a raw signature over `tbs_bytes` using the signer's SPKI (DER)
-/// and the given signature algorithm OID.
+/// Policy controlling whether signatures over weak/deprecated digests are
+/// accepted (finding H-1).
 ///
-/// This is the primary entry point — it dispatches to the correct
-/// algorithm based on the OID.
+/// The default ([`SignaturePolicy::strict`]) refuses signatures built on MD5,
+/// SHA-1, or SHA-224: MD5 chosen-prefix collisions are trivial, SHA-1 has been
+/// broken since SHAttered (2017), and SHA-224 falls below the modern 128-bit
+/// security floor. Strong SHA-2 / SHA-3 based RSA, RSASSA-PSS, ECDSA (incl.
+/// P-521) and Ed25519 signatures are always accepted.
+///
+/// [`SignaturePolicy::allow_legacy`] re-enables the weak algorithms. Use it
+/// only for explicit backward-compatibility scenarios (validating archival or
+/// interop material whose risk you have accepted); never for fresh trust
+/// decisions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SignaturePolicy {
+    allow_legacy: bool,
+}
+
+impl SignaturePolicy {
+    /// Fail-closed policy: signatures over MD5 / SHA-1 / SHA-224 are rejected.
+    pub const fn strict() -> Self {
+        Self { allow_legacy: false }
+    }
+
+    /// Permissive policy that additionally accepts MD5 / SHA-1 / SHA-224
+    /// signatures. Use only for explicit backward-compatibility scenarios.
+    pub const fn allow_legacy() -> Self {
+        Self { allow_legacy: true }
+    }
+
+    /// Whether legacy weak-digest signatures are permitted under this policy.
+    pub const fn legacy_allowed(&self) -> bool {
+        self.allow_legacy
+    }
+}
+
+impl Default for SignaturePolicy {
+    /// The default policy is [`SignaturePolicy::strict`] (fail-closed).
+    fn default() -> Self {
+        Self::strict()
+    }
+}
+
+/// True if `oid` names a signature algorithm built on a broken or deprecated
+/// message digest (MD5, SHA-1, or SHA-224) that the strict policy refuses.
+///
+/// Unknown OIDs return `false` so they fall through to the regular
+/// `UnsupportedAlgorithm` handling rather than being misreported as "weak".
+pub fn is_weak_signature_oid(oid: &const_oid::ObjectIdentifier) -> bool {
+    *oid == OID_MD5_WITH_RSA
+        || *oid == OID_SHA1_WITH_RSA
+        || *oid == OID_SHA224_WITH_RSA
+        || *oid == OID_ECDSA_WITH_SHA1
+}
+
+/// Verify a raw signature over `tbs_bytes` using the signer's SPKI (DER) and the
+/// given signature algorithm OID, under the strict (default) [`SignaturePolicy`].
+///
+/// Equivalent to [`verify_signature_by_oid_with_policy`] with
+/// [`SignaturePolicy::strict`]; weak-digest signatures are rejected.
 ///
 /// # Supported algorithms
 ///
-/// | OID | Algorithm |
-/// |-----|-----------|
-/// | `1.2.840.113549.1.1.4`  | MD5 with RSA (legacy) |
-/// | `1.2.840.113549.1.1.5`  | SHA-1 with RSA (legacy) |
-/// | `1.2.840.113549.1.1.11` | SHA-256 with RSA |
-/// | `1.2.840.113549.1.1.12` | SHA-384 with RSA |
-/// | `1.2.840.113549.1.1.13` | SHA-512 with RSA |
-/// | `1.2.840.113549.1.1.14` | SHA-224 with RSA |
-/// | `1.2.840.113549.1.1.10` | RSASSA-PSS (tries SHA-256/384/512) |
-/// | `1.2.840.10045.4.1`     | ECDSA with SHA-1 (legacy) |
-/// | `1.2.840.10045.4.3.2`   | ECDSA with SHA-256 |
-/// | `1.2.840.10045.4.3.3`   | ECDSA with SHA-384 |
-/// | `1.2.840.10045.4.3.4`   | ECDSA with SHA-512 |
-/// | `1.3.101.112`           | Ed25519 |
+/// | OID | Algorithm | Strict policy |
+/// |-----|-----------|---------------|
+/// | `1.2.840.113549.1.1.4`  | MD5 with RSA (legacy) | rejected |
+/// | `1.2.840.113549.1.1.5`  | SHA-1 with RSA (legacy) | rejected |
+/// | `1.2.840.113549.1.1.14` | SHA-224 with RSA (legacy) | rejected |
+/// | `1.2.840.10045.4.1`     | ECDSA with SHA-1 (legacy) | rejected |
+/// | `1.2.840.113549.1.1.11` | SHA-256 with RSA | accepted |
+/// | `1.2.840.113549.1.1.12` | SHA-384 with RSA | accepted |
+/// | `1.2.840.113549.1.1.13` | SHA-512 with RSA | accepted |
+/// | `1.2.840.113549.1.1.10` | RSASSA-PSS (tries SHA-256/384/512) | accepted |
+/// | `1.2.840.10045.4.3.2`   | ECDSA with SHA-256 | accepted |
+/// | `1.2.840.10045.4.3.3`   | ECDSA with SHA-384 | accepted |
+/// | `1.2.840.10045.4.3.4`   | ECDSA with SHA-512 | accepted |
+/// | `1.3.101.112`           | Ed25519 | accepted |
 pub fn verify_signature_by_oid(
     tbs_bytes: &[u8],
     signature_bytes: &[u8],
     spki_der: &[u8],
     sig_alg_oid: &const_oid::ObjectIdentifier,
 ) -> Result<(), TrustError> {
+    verify_signature_by_oid_with_policy(
+        tbs_bytes,
+        signature_bytes,
+        spki_der,
+        sig_alg_oid,
+        &SignaturePolicy::default(),
+    )
+}
+
+/// Like [`verify_signature_by_oid`] but with an explicit [`SignaturePolicy`].
+///
+/// Under the strict policy, signatures built on MD5 / SHA-1 / SHA-224 are
+/// rejected **before any cryptographic work** with [`TrustError::WeakAlgorithm`].
+/// This is the single chokepoint every in-tree path flows through
+/// (certificate-chain, CRL, OCSP, and CMS/RFC 3161 token verification all reach
+/// it directly or via [`verify_signature_by_algid`]).
+pub fn verify_signature_by_oid_with_policy(
+    tbs_bytes: &[u8],
+    signature_bytes: &[u8],
+    spki_der: &[u8],
+    sig_alg_oid: &const_oid::ObjectIdentifier,
+    policy: &SignaturePolicy,
+) -> Result<(), TrustError> {
     use const_oid::db;
 
-    // --- Legacy RSA algorithms ---
+    // Algorithm policy (H-1): refuse signatures over broken/deprecated digests
+    // before touching any key material, unless the caller has explicitly opted
+    // into legacy verification. Unknown OIDs are not "weak" — they fall through
+    // to the UnsupportedAlgorithm arm below.
+    if !policy.allow_legacy && is_weak_signature_oid(sig_alg_oid) {
+        return Err(TrustError::WeakAlgorithm(format!(
+            "signature algorithm OID {sig_alg_oid} relies on a weak digest \
+             (MD5/SHA-1/SHA-224); pass SignaturePolicy::allow_legacy() to accept it"
+        )));
+    }
+
+    // --- Legacy RSA algorithms (only reachable under allow_legacy) ---
     if *sig_alg_oid == OID_MD5_WITH_RSA {
         verify_rsa_signature::<md5::Md5>(tbs_bytes, signature_bytes, spki_der)
     } else if *sig_alg_oid == OID_SHA1_WITH_RSA {
@@ -78,9 +193,9 @@ pub fn verify_signature_by_oid(
                 verify_rsa_pss_signature::<sha2::Sha512>(tbs_bytes, signature_bytes, spki_der)
             })
     }
-    // --- Legacy ECDSA ---
+    // --- Legacy ECDSA (only reachable under allow_legacy) ---
     else if *sig_alg_oid == OID_ECDSA_WITH_SHA1 {
-        // ECDSA-SHA1: try P-256 first, then P-384, then P-521
+        // ECDSA-SHA1: try P-256 first, then P-384
         verify_ecdsa_p256_sha1_signature(tbs_bytes, signature_bytes, spki_der)
             .or_else(|_| verify_ecdsa_p384_sha1_signature(tbs_bytes, signature_bytes, spki_der))
     }
@@ -123,6 +238,27 @@ pub fn verify_signature_by_algid(
     spki_der: &[u8],
     sig_alg: &spki::AlgorithmIdentifierOwned,
 ) -> Result<(), TrustError> {
+    verify_signature_by_algid_with_policy(
+        tbs_bytes,
+        signature_bytes,
+        spki_der,
+        sig_alg,
+        &SignaturePolicy::default(),
+    )
+}
+
+/// Like [`verify_signature_by_algid`] but with an explicit [`SignaturePolicy`].
+///
+/// RSASSA-PSS is always strong here — the strict PSS decoder only accepts
+/// SHA-256/384/512 — so the weak-digest gate is enforced on the delegated
+/// [`verify_signature_by_oid_with_policy`] path for every other algorithm.
+pub fn verify_signature_by_algid_with_policy(
+    tbs_bytes: &[u8],
+    signature_bytes: &[u8],
+    spki_der: &[u8],
+    sig_alg: &spki::AlgorithmIdentifierOwned,
+    policy: &SignaturePolicy,
+) -> Result<(), TrustError> {
     if sig_alg.oid == OID_RSASSA_PSS {
         verify_rsa_pss_signature_strict(
             tbs_bytes,
@@ -132,7 +268,13 @@ pub fn verify_signature_by_algid(
         )
         .map(|_| ())
     } else {
-        verify_signature_by_oid(tbs_bytes, signature_bytes, spki_der, &sig_alg.oid)
+        verify_signature_by_oid_with_policy(
+            tbs_bytes,
+            signature_bytes,
+            spki_der,
+            &sig_alg.oid,
+            policy,
+        )
     }
 }
 
@@ -224,6 +366,18 @@ pub fn verify_certificate_signature(
     cert: &x509_cert::Certificate,
     issuer: &x509_cert::Certificate,
 ) -> Result<(), TrustError> {
+    verify_certificate_signature_with_policy(cert, issuer, &SignaturePolicy::default())
+}
+
+/// Like [`verify_certificate_signature`] but with an explicit
+/// [`SignaturePolicy`]. The default rejects certificates signed with
+/// MD5/SHA-1/SHA-224; pass [`SignaturePolicy::allow_legacy`] to accept them
+/// (e.g. for historical interop fixtures).
+pub fn verify_certificate_signature_with_policy(
+    cert: &x509_cert::Certificate,
+    issuer: &x509_cert::Certificate,
+    policy: &SignaturePolicy,
+) -> Result<(), TrustError> {
     use der::Encode;
 
     let issuer_spki = &issuer.tbs_certificate.subject_public_key_info;
@@ -238,11 +392,12 @@ pub fn verify_certificate_signature(
         .to_der()
         .map_err(|e| TrustError::SignatureVerification(format!("SPKI encoding failed: {e}")))?;
 
-    verify_signature_by_algid(
+    verify_signature_by_algid_with_policy(
         &tbs_bytes,
         signature_bytes,
         &spki_der,
         &cert.signature_algorithm,
+        policy,
     )
 }
 
@@ -668,6 +823,58 @@ mod tests {
             matches!(err, TrustError::UnsupportedAlgorithm(_)),
             "PSS without parameters must be rejected, got {err:?}"
         );
+    }
+
+    #[test]
+    fn test_weak_signature_oids_rejected_by_default() {
+        // H-1: MD5/SHA-1/SHA-224 based signatures must be refused before any
+        // crypto, under the strict default policy.
+        for oid in [
+            OID_MD5_WITH_RSA,
+            OID_SHA1_WITH_RSA,
+            OID_SHA224_WITH_RSA,
+            OID_ECDSA_WITH_SHA1,
+        ] {
+            let err = verify_signature_by_oid(b"tbs", b"sig", b"spki", &oid).unwrap_err();
+            assert!(
+                matches!(err, TrustError::WeakAlgorithm(_)),
+                "{oid} should be rejected as weak, got {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_weak_signature_oids_accepted_with_legacy_policy() {
+        // With an explicit legacy opt-in the gate is lifted: verification then
+        // proceeds and fails at SPKI decode, not at the policy gate.
+        let legacy = SignaturePolicy::allow_legacy();
+        for oid in [OID_MD5_WITH_RSA, OID_SHA1_WITH_RSA, OID_SHA224_WITH_RSA] {
+            let err =
+                verify_signature_by_oid_with_policy(b"tbs", b"sig", b"bad_spki", &oid, &legacy)
+                    .unwrap_err();
+            assert!(
+                !matches!(err, TrustError::WeakAlgorithm(_)),
+                "{oid} should pass the gate under allow_legacy, got {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_unknown_oid_is_unsupported_not_weak() {
+        // An unrecognized OID must remain UnsupportedAlgorithm, never WeakAlgorithm.
+        let fake = const_oid::ObjectIdentifier::new_unwrap("1.2.3.4.5.6.7.8.9");
+        let err = verify_signature_by_oid(b"tbs", b"sig", b"spki", &fake).unwrap_err();
+        assert!(
+            matches!(err, TrustError::UnsupportedAlgorithm(_)),
+            "unknown OID should be unsupported, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn test_signature_policy_default_is_strict() {
+        assert_eq!(SignaturePolicy::default(), SignaturePolicy::strict());
+        assert!(!SignaturePolicy::default().legacy_allowed());
+        assert!(SignaturePolicy::allow_legacy().legacy_allowed());
     }
 
     #[test]

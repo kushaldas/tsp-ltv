@@ -91,6 +91,9 @@ pub enum TrustError {
     #[error("unsupported signature algorithm: {0}")]
     UnsupportedAlgorithm(String),
 
+    #[error("weak/disabled signature algorithm rejected by policy: {0}")]
+    WeakAlgorithm(String),
+
     #[error("trust store not configured for {0}")]
     StoreNotConfigured(String),
 

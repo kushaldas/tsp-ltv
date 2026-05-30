@@ -91,6 +91,14 @@ pub struct RevocationConfig {
     /// If both checks together take longer than this, the remaining check
     /// is abandoned and whatever results are available are used. Default: 10 seconds.
     pub per_cert_timeout: Duration,
+
+    /// Signature-algorithm policy applied to OCSP responses and CRLs.
+    ///
+    /// Defaults to strict — an OCSP response or CRL signed with MD5/SHA-1/SHA-224
+    /// fails validation (→ `Invalid`). Set via
+    /// [`RevocationConfig::allow_legacy_signatures`] to accept such signatures
+    /// when validating historical revocation material.
+    pub signature_policy: crate::crypto::verify::SignaturePolicy,
 }
 
 impl Default for RevocationConfig {
@@ -103,6 +111,7 @@ impl Default for RevocationConfig {
             use_ocsp_nonce: true,
             max_ocsp_recursion: 1,
             per_cert_timeout: Duration::from_secs(10),
+            signature_policy: crate::crypto::verify::SignaturePolicy::default(),
         }
     }
 }
@@ -128,6 +137,16 @@ impl RevocationConfig {
             per_cert_timeout: Duration::from_secs(8),
             ..Default::default()
         }
+    }
+
+    /// Accept OCSP responses and CRLs signed with weak/legacy digests
+    /// (MD5/SHA-1/SHA-224).
+    ///
+    /// Off by default. Enable only to validate historical revocation material
+    /// whose risk you have accepted; never for fresh trust decisions.
+    pub fn allow_legacy_signatures(mut self) -> Self {
+        self.signature_policy = crate::crypto::verify::SignaturePolicy::allow_legacy();
+        self
     }
 }
 
@@ -341,12 +360,13 @@ async fn run_ocsp_check(
         // status (tryLater, internalError, unauthorized, ...) is non-
         // determinative and stays Unknown — so a temporary responder outage
         // does not become a hard failure under best-effort/offline policy.
-        match ocsp::check_revocation(
+        match ocsp::check_revocation_with_policy(
             &response_der,
             cert,
             issuer,
             nonce.as_deref(),
             validation_time,
+            &config.signature_policy,
         ) {
             Ok(status) => status,
             Err(e) => ocsp_check_error_to_status(e),
@@ -405,7 +425,13 @@ async fn run_crl_check(
                 // signature, malformed structure) is a definitive negative
                 // result → Invalid, not Unknown, so a forged CRL cannot fail
                 // open by masquerading as "status undetermined".
-                match crl::check_revocation(&crls[0], cert, issuer, validation_time) {
+                match crl::check_revocation_with_policy(
+                    &crls[0],
+                    cert,
+                    issuer,
+                    validation_time,
+                    &config.signature_policy,
+                ) {
                     Ok(status) => status,
                     Err(e) => {
                         log::warn!("CRL revocation check failed: {e}");
@@ -764,6 +790,7 @@ mod tests {
             use_ocsp_nonce: false,
             max_ocsp_recursion: 0,
             per_cert_timeout: Duration::from_secs(2),
+            signature_policy: crate::crypto::verify::SignaturePolicy::default(),
         };
         assert!(!config.prefer_ocsp);
         assert!(!config.require_revocation_check);

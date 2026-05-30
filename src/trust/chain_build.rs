@@ -45,6 +45,32 @@ pub fn build_chain_from_pool(
     trust_anchor_subjects: &[Vec<u8>],
     max_depth: Option<usize>,
 ) -> Result<Vec<Certificate>, TrustError> {
+    build_chain_from_pool_with_policy(
+        leaf,
+        pool,
+        trust_anchor_subjects,
+        max_depth,
+        &crate::crypto::verify::SignaturePolicy::default(),
+    )
+}
+
+/// Like [`build_chain_from_pool`] but with an explicit
+/// [`SignaturePolicy`](crate::crypto::verify::SignaturePolicy) for the per-link
+/// signature checks.
+///
+/// Pass [`SignaturePolicy::allow_legacy`](crate::crypto::verify::SignaturePolicy::allow_legacy)
+/// to build chains whose links are signed with weak digests (MD5/SHA-1/SHA-224)
+/// — e.g. historical XML-DSig interop fixtures. The default rejects them, which
+/// would otherwise make chain construction fail before
+/// [`TrustStore::verify_chain`](super::TrustStore::verify_chain) (and its own
+/// policy) ever runs. Use the same policy the verifying store was built with.
+pub fn build_chain_from_pool_with_policy(
+    leaf: &Certificate,
+    pool: &[Certificate],
+    trust_anchor_subjects: &[Vec<u8>],
+    max_depth: Option<usize>,
+    policy: &crate::crypto::verify::SignaturePolicy,
+) -> Result<Vec<Certificate>, TrustError> {
     let max_depth = max_depth.unwrap_or(10);
     let mut chain = vec![leaf.clone()];
     let mut current = leaf.clone();
@@ -87,7 +113,10 @@ pub fn build_chain_from_pool(
 
             if candidate_subject_der == issuer_name_der {
                 // Verify the signature before accepting this link
-                if crate::crypto::verify::verify_certificate_signature(&current, candidate).is_ok()
+                if crate::crypto::verify::verify_certificate_signature_with_policy(
+                    &current, candidate, policy,
+                )
+                .is_ok()
                 {
                     visited.push(candidate_der);
                     chain.push(candidate.clone());
@@ -108,6 +137,121 @@ pub fn build_chain_from_pool(
     }
 
     Ok(chain)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::crypto::verify::SignaturePolicy;
+
+    /// Build (issuer, leaf) where the leaf is signed by the issuer with SHA-1
+    /// (`sha1WithRSAEncryption`). The issuer is a self-signed SHA-256 root, so
+    /// only the leaf→issuer link is weak — exactly the case that must fail at
+    /// chain construction under the strict default.
+    fn issuer_and_sha1_leaf() -> (Certificate, Certificate) {
+        use der::asn1::BitString;
+        use der::{Any, Decode};
+        use rsa::pkcs1v15::SigningKey;
+        use rsa::signature::Keypair;
+        use rsa::{Pkcs1v15Sign, RsaPrivateKey};
+        use sha1::{Digest, Sha1};
+        use sha2::Sha256;
+        use spki::AlgorithmIdentifierOwned;
+        use x509_cert::builder::{Builder, CertificateBuilder, Profile};
+        use x509_cert::name::Name;
+        use x509_cert::serial_number::SerialNumber;
+        use x509_cert::spki::SubjectPublicKeyInfoOwned;
+        use x509_cert::time::Validity;
+
+        let mut rng = rand::thread_rng();
+        let validity =
+            Validity::from_now(std::time::Duration::from_secs(3650 * 24 * 3600)).unwrap();
+
+        // Self-signed SHA-256 issuer.
+        let issuer_key = RsaPrivateKey::new(&mut rng, 2048).unwrap();
+        let issuer_signer = SigningKey::<Sha256>::new(issuer_key.clone());
+        let issuer_spki =
+            SubjectPublicKeyInfoOwned::from_key(issuer_signer.verifying_key()).unwrap();
+        let issuer_name: Name = "CN=Legacy Issuer,O=tsp-ltv tests".parse().unwrap();
+        let issuer = CertificateBuilder::new(
+            Profile::Root,
+            SerialNumber::new(&[0x01]).unwrap(),
+            validity,
+            issuer_name.clone(),
+            issuer_spki,
+            &issuer_signer,
+        )
+        .unwrap()
+        .build()
+        .unwrap();
+
+        // Leaf issued by the issuer; build a well-formed TBS with SHA-256, then
+        // re-sign that TBS with the issuer key under SHA-1.
+        let leaf_key = RsaPrivateKey::new(&mut rng, 2048).unwrap();
+        let leaf_spki = SubjectPublicKeyInfoOwned::from_key(
+            SigningKey::<Sha256>::new(leaf_key).verifying_key(),
+        )
+        .unwrap();
+        let leaf_subject: Name = "CN=Legacy Leaf,O=tsp-ltv tests".parse().unwrap();
+        let base = CertificateBuilder::new(
+            Profile::Leaf {
+                issuer: issuer.tbs_certificate.subject.clone(),
+                enable_key_agreement: false,
+                enable_key_encipherment: false,
+            },
+            SerialNumber::new(&[0x02]).unwrap(),
+            validity,
+            leaf_subject,
+            leaf_spki,
+            &issuer_signer,
+        )
+        .unwrap()
+        .build()
+        .unwrap();
+
+        let tbs_der = base.tbs_certificate.to_der().unwrap();
+        let hash = Sha1::digest(&tbs_der);
+        let sig = issuer_key
+            .sign(Pkcs1v15Sign::new::<Sha1>(), &hash)
+            .expect("SHA-1 RSA sign");
+        let leaf = Certificate {
+            tbs_certificate: base.tbs_certificate.clone(),
+            signature_algorithm: AlgorithmIdentifierOwned {
+                oid: crate::crypto::algorithm::OID_SHA1_WITH_RSA,
+                parameters: Some(Any::from_der(&[0x05, 0x00]).unwrap()),
+            },
+            signature: BitString::from_bytes(&sig).unwrap(),
+        };
+
+        (issuer, leaf)
+    }
+
+    #[test]
+    fn test_build_chain_rejects_sha1_link_by_default_and_accepts_with_legacy() {
+        let (issuer, leaf) = issuer_and_sha1_leaf();
+        let pool = [issuer];
+
+        // Strict default: the SHA-1 leaf→issuer link fails the per-link check,
+        // so the chain cannot be built — this is the contract break the policy
+        // must let callers avoid.
+        let err = build_chain_from_pool(&leaf, &pool, &[], None).unwrap_err();
+        assert!(
+            matches!(err, TrustError::ChainBroken { .. }),
+            "strict build must fail on a SHA-1 link, got {err:?}"
+        );
+
+        // Legacy opt-in (same policy a legacy TrustStore is built with): the
+        // chain now constructs end-to-end.
+        let chain = build_chain_from_pool_with_policy(
+            &leaf,
+            &pool,
+            &[],
+            None,
+            &SignaturePolicy::allow_legacy(),
+        )
+        .expect("legacy build must succeed on a SHA-1 link");
+        assert_eq!(chain.len(), 2, "chain should be [leaf, issuer]");
+    }
 }
 
 /// Convenience: extract the DER-encoded subject names from a [`TrustStore`](super::TrustStore).
