@@ -31,7 +31,7 @@ pub use chain::ChainBuilder;
 pub use crl::CrlClient;
 pub use ocsp::{
     OcspClient, AiaAccessMethod, extract_aia_urls,
-    CertStatus, SingleResponse, ParsedBasicOcspResponse, ResponderId,
+    CertStatus, SingleResponse, ParsedBasicOcspResponse, ResponderId, OcspFreshness,
     build_ocsp_request_with_nonce, has_ocsp_nocheck_extension,
     parse_ocsp_response, check_revocation as ocsp_check_revocation,
 };

@@ -99,6 +99,14 @@ pub struct RevocationConfig {
     /// [`RevocationConfig::allow_legacy_signatures`] to accept such signatures
     /// when validating historical revocation material.
     pub signature_policy: crate::crypto::verify::SignaturePolicy,
+
+    /// Freshness policy applied to OCSP responses (RFC 6960 §4.2.2.1).
+    ///
+    /// Bounds the `thisUpdate`/`nextUpdate` window a response may be relied upon
+    /// for, relative to the validation time. A stale response fails validation
+    /// (→ `Invalid`), so a legitimate "good" response cannot be replayed after
+    /// the certificate is later revoked.
+    pub ocsp_freshness: crate::ltv::ocsp::OcspFreshness,
 }
 
 impl Default for RevocationConfig {
@@ -112,6 +120,7 @@ impl Default for RevocationConfig {
             max_ocsp_recursion: 1,
             per_cert_timeout: Duration::from_secs(10),
             signature_policy: crate::crypto::verify::SignaturePolicy::default(),
+            ocsp_freshness: crate::ltv::ocsp::OcspFreshness::default(),
         }
     }
 }
@@ -203,7 +212,10 @@ pub async fn check_certificate_revocation(
     let (ocsp_status, crl_status) = match result {
         Ok((ocsp, crl)) => (ocsp, crl),
         Err(_elapsed) => {
-            log::warn!("per-certificate revocation check timed out after {:?}", config.per_cert_timeout);
+            log::warn!(
+                "per-certificate revocation check timed out after {:?}",
+                config.per_cert_timeout
+            );
             (
                 ValidationStatus::Unknown {
                     reason: "OCSP check timed out".into(),
@@ -360,13 +372,14 @@ async fn run_ocsp_check(
         // status (tryLater, internalError, unauthorized, ...) is non-
         // determinative and stays Unknown — so a temporary responder outage
         // does not become a hard failure under best-effort/offline policy.
-        match ocsp::check_revocation_with_policy(
+        match ocsp::check_revocation_with_options(
             &response_der,
             cert,
             issuer,
             nonce.as_deref(),
             validation_time,
             &config.signature_policy,
+            &config.ocsp_freshness,
         ) {
             Ok(status) => status,
             Err(e) => ocsp_check_error_to_status(e),
@@ -535,9 +548,15 @@ mod tests {
         let crl_client = CrlClient::new();
         let ocsp_client = OcspClient::new();
 
-        let status =
-            check_certificate_revocation(&intermediate, &ca, &config, &crl_client, &ocsp_client, None)
-                .await;
+        let status = check_certificate_revocation(
+            &intermediate,
+            &ca,
+            &config,
+            &crl_client,
+            &ocsp_client,
+            None,
+        )
+        .await;
 
         assert!(
             status.is_invalid(),
@@ -560,9 +579,15 @@ mod tests {
         let crl_client = CrlClient::new();
         let ocsp_client = OcspClient::new();
 
-        let status =
-            check_certificate_revocation(&intermediate, &ca, &config, &crl_client, &ocsp_client, None)
-                .await;
+        let status = check_certificate_revocation(
+            &intermediate,
+            &ca,
+            &config,
+            &crl_client,
+            &ocsp_client,
+            None,
+        )
+        .await;
 
         assert!(
             status.is_unknown(),
@@ -760,7 +785,10 @@ mod tests {
             reason: "no CRL distribution points".into(),
         };
         let merged = resolve_priority(ocsp, crl);
-        assert!(merged.is_unknown(), "transient OCSP outage must not become Invalid");
+        assert!(
+            merged.is_unknown(),
+            "transient OCSP outage must not become Invalid"
+        );
         assert!(enforce_revocation_policy(merged, false).is_unknown());
     }
 
@@ -791,6 +819,7 @@ mod tests {
             max_ocsp_recursion: 0,
             per_cert_timeout: Duration::from_secs(2),
             signature_policy: crate::crypto::verify::SignaturePolicy::default(),
+            ocsp_freshness: crate::ltv::ocsp::OcspFreshness::default(),
         };
         assert!(!config.prefer_ocsp);
         assert!(!config.require_revocation_check);

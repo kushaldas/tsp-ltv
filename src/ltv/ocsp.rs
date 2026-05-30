@@ -1267,6 +1267,106 @@ fn validate_nonce(
     Err(LtvError::Ocsp("OCSP response nonce mismatch".into()))
 }
 
+// ── Freshness policy ───────────────────────────────────────────────
+
+/// Freshness policy for OCSP responses (RFC 6960 §4.2.2.1).
+///
+/// An OCSP response carries a validity window: the status is asserted as of
+/// `thisUpdate` and the responder promises fresher information by `nextUpdate`.
+/// A response must not be relied upon once the validation time is past
+/// `nextUpdate` (widened by an allowed clock skew); without this check a
+/// legitimately-issued "good" response can be replayed forever — including
+/// after the certificate has been compromised and revoked.
+///
+/// All comparisons are made against the *validation time* (`now`), which for
+/// long-term validation is the historical instant being validated, not the
+/// wall clock. A response produced *after* that instant (later-collected
+/// archival evidence) is accepted; only staleness relative to `now` is a
+/// failure.
+#[derive(Debug, Clone)]
+pub struct OcspFreshness {
+    /// Clock skew tolerance applied to every time comparison, in both
+    /// directions. Accommodates small differences between the responder's and
+    /// the validator's clocks. Default: 5 minutes.
+    pub clock_skew: chrono::Duration,
+
+    /// Maximum age (measured from `thisUpdate`) tolerated for a response that
+    /// omits the optional `nextUpdate` field. RFC 6960 allows `nextUpdate` to be
+    /// absent ("fresher information is always available"); rather than treat
+    /// such a response as eternally fresh, it is rejected once it is older than
+    /// this bound. Default: 24 hours.
+    pub max_age_without_next_update: chrono::Duration,
+}
+
+impl Default for OcspFreshness {
+    fn default() -> Self {
+        Self {
+            clock_skew: chrono::Duration::minutes(5),
+            max_age_without_next_update: chrono::Duration::hours(24),
+        }
+    }
+}
+
+/// Validate that an OCSP response is fresh enough to be relied upon at `now`.
+///
+/// The anti-replay guarantee (RFC 6960 §4.2.2.1) is that a response must not be
+/// **stale** as of the validation time: the validation instant must not be past
+/// `nextUpdate`. When `nextUpdate` is absent, the response is instead bounded by
+/// [`OcspFreshness::max_age_without_next_update`] measured from `thisUpdate`.
+///
+/// A response produced *after* the validation instant is explicitly **accepted**:
+/// in archival / long-term validation, `validation_time` is the historical
+/// instant being validated (e.g. signing or timestamp `genTime`) and the
+/// revocation evidence is normally collected shortly afterwards, so its
+/// `thisUpdate`/`producedAt` legitimately fall after `validation_time`.
+/// `producedAt` is the time the responder signed the response — not a status
+/// assertion time — so it is not used to gate freshness at all.
+///
+/// Fails closed: an out-of-range (stale) response returns an `Err`, which the
+/// orchestrator classifies as a definitive `Invalid` (a received-but-unusable
+/// response), never the fail-open `Unknown`.
+fn validate_response_freshness(
+    sr: &SingleResponse,
+    now: chrono::DateTime<chrono::Utc>,
+    freshness: &OcspFreshness,
+) -> Result<(), LtvError> {
+    let skew = freshness.clock_skew;
+
+    match sr.next_update {
+        Some(next_update) => {
+            // Sanity: a window that ends before it starts is malformed.
+            if next_update < sr.this_update {
+                return Err(LtvError::Ocsp(format!(
+                    "OCSP response has nextUpdate ({next_update}) before thisUpdate ({})",
+                    sr.this_update
+                )));
+            }
+            // Anti-replay: reject once the validation instant is past nextUpdate.
+            // (A response whose window lies at/after the validation instant —
+            // later-collected archival evidence — is not stale and is kept.)
+            if now > next_update + skew {
+                return Err(LtvError::Ocsp(format!(
+                    "OCSP response is stale: nextUpdate ({next_update}) is before validation time ({now})"
+                )));
+            }
+        }
+        None => {
+            // No nextUpdate: bound the response's age from thisUpdate so an old
+            // response cannot be relied on indefinitely. A response whose window
+            // starts at/after the validation time is always within bound.
+            let max_valid = sr.this_update + freshness.max_age_without_next_update + skew;
+            if now > max_valid {
+                return Err(LtvError::Ocsp(format!(
+                    "OCSP response without nextUpdate is too old: thisUpdate ({}), validation time ({now}), max age {}",
+                    sr.this_update, freshness.max_age_without_next_update
+                )));
+            }
+        }
+    }
+
+    Ok(())
+}
+
 // ── Main revocation check function ─────────────────────────────────
 
 /// Check whether a certificate is revoked according to an OCSP response.
@@ -1301,6 +1401,9 @@ pub fn check_revocation(
 /// [`SignaturePolicy`](crate::crypto::verify::SignaturePolicy) for the response
 /// and responder-certificate signature checks. The default rejects OCSP
 /// material signed with MD5/SHA-1/SHA-224.
+///
+/// Freshness is validated with [`OcspFreshness::default`]; use
+/// [`check_revocation_with_options`] to supply a custom freshness policy.
 #[allow(clippy::too_many_arguments)]
 pub fn check_revocation_with_policy(
     response_der: &[u8],
@@ -1309,6 +1412,36 @@ pub fn check_revocation_with_policy(
     nonce: Option<&[u8]>,
     validation_time: Option<chrono::DateTime<chrono::Utc>>,
     policy: &crate::crypto::verify::SignaturePolicy,
+) -> Result<ValidationStatus, LtvError> {
+    check_revocation_with_options(
+        response_der,
+        cert,
+        issuer,
+        nonce,
+        validation_time,
+        policy,
+        &OcspFreshness::default(),
+    )
+}
+
+/// Like [`check_revocation_with_policy`] but with an explicit [`OcspFreshness`]
+/// policy controlling the RFC 6960 §4.2.2.1 time-window check.
+///
+/// A response that is stale as of `validation_time` (the validation instant is
+/// past `nextUpdate`, or — lacking `nextUpdate` — the response is older than the
+/// configured maximum age) fails closed with an `Err`, classified by the
+/// orchestrator as `Invalid` (a received-but-unusable response), never the
+/// fail-open `Unknown`. Later-collected evidence (window at/after the validation
+/// instant) is accepted.
+#[allow(clippy::too_many_arguments)]
+pub fn check_revocation_with_options(
+    response_der: &[u8],
+    cert: &Certificate,
+    issuer: &Certificate,
+    nonce: Option<&[u8]>,
+    validation_time: Option<chrono::DateTime<chrono::Utc>>,
+    policy: &crate::crypto::verify::SignaturePolicy,
+    freshness: &OcspFreshness,
 ) -> Result<ValidationStatus, LtvError> {
     let now = validation_time.unwrap_or_else(chrono::Utc::now);
 
@@ -1368,7 +1501,13 @@ pub fn check_revocation_with_policy(
         }
     };
 
-    // 6. Map CertStatus to ValidationStatus
+    // 6. Validate response freshness (RFC 6960 §4.2.2.1). A response that is
+    //    stale as of `now` (validation instant past nextUpdate) is rejected —
+    //    fail closed — so a stale "good" response cannot be replayed
+    //    indefinitely. Later-collected evidence (window at/after `now`) is kept.
+    validate_response_freshness(sr, now, freshness)?;
+
+    // 7. Map CertStatus to ValidationStatus
     match &sr.cert_status {
         CertStatus::Good => Ok(ValidationStatus::Valid {
             source: RevocationSource::Ocsp,
@@ -1544,6 +1683,33 @@ mod tests {
         status: &CertStatus,
         nonce: Option<&[u8]>,
     ) -> Vec<u8> {
+        // Default window: produced/thisUpdate 2026-06-01T12:00Z,
+        // nextUpdate 2026-06-08T12:00Z.
+        build_test_ocsp_response_with_times(
+            issuer_cert,
+            issuer_key_pem,
+            cert,
+            status,
+            nonce,
+            "20260601120000Z",
+            "20260601120000Z",
+            Some("20260608120000Z"),
+        )
+    }
+
+    /// Like [`build_test_ocsp_response`] but with explicit `producedAt`,
+    /// `thisUpdate`, and optional `nextUpdate` GeneralizedTime strings.
+    #[allow(clippy::too_many_arguments)]
+    fn build_test_ocsp_response_with_times(
+        issuer_cert: &Certificate,
+        issuer_key_pem: &str,
+        cert: &Certificate,
+        status: &CertStatus,
+        nonce: Option<&[u8]>,
+        produced_at_str: &str,
+        this_update_str: &str,
+        next_update_str: Option<&str>,
+    ) -> Vec<u8> {
         use rsa::pkcs1v15::SigningKey;
         use rsa::signature::{Signer, SignatureEncoding};
         use rsa::pkcs8::DecodePrivateKey;
@@ -1562,11 +1728,12 @@ mod tests {
         tbs_body.extend_from_slice(&responder_id);
 
         // producedAt GeneralizedTime
-        let produced_at = der_utils::encode_tlv(0x18, b"20260601120000Z");
+        let produced_at = der_utils::encode_tlv(0x18, produced_at_str.as_bytes());
         tbs_body.extend_from_slice(&produced_at);
 
         // Build SingleResponse
-        let single_response = build_test_single_response(issuer_cert, cert, status);
+        let single_response =
+            build_test_single_response_with_times(issuer_cert, cert, status, this_update_str, next_update_str);
 
         // responses SEQUENCE OF SingleResponse
         let responses_seq = der_utils::encode_sequence_from_parts(&[&single_response]);
@@ -1626,11 +1793,14 @@ mod tests {
         der_utils::encode_sequence_from_parts(&[&response_status, &response_bytes_tagged])
     }
 
-    /// Build a synthetic SingleResponse for a certificate.
-    fn build_test_single_response(
+    /// Build a synthetic SingleResponse for a certificate with explicit
+    /// `thisUpdate` and optional `nextUpdate` GeneralizedTime strings.
+    fn build_test_single_response_with_times(
         issuer_cert: &Certificate,
         cert: &Certificate,
         status: &CertStatus,
+        this_update_str: &str,
+        next_update_str: Option<&str>,
     ) -> Vec<u8> {
         // CertID
         let issuer_name_der = issuer_cert
@@ -1686,19 +1856,20 @@ mod tests {
         };
 
         // thisUpdate GeneralizedTime
-        let this_update = der_utils::encode_tlv(0x18, b"20260601120000Z");
+        let this_update = der_utils::encode_tlv(0x18, this_update_str.as_bytes());
 
-        // nextUpdate [0] EXPLICIT GeneralizedTime
-        let next_update_gt = der_utils::encode_tlv(0x18, b"20260608120000Z");
-        let next_update = der_utils::encode_tlv(0xA0, &next_update_gt);
+        // SingleResponse SEQUENCE { certID, certStatus, thisUpdate[, nextUpdate] }
+        let mut parts: Vec<&[u8]> = vec![&cert_id, &cert_status_der, &this_update];
 
-        // SingleResponse SEQUENCE
-        der_utils::encode_sequence_from_parts(&[
-            &cert_id,
-            &cert_status_der,
-            &this_update,
-            &next_update,
-        ])
+        // nextUpdate [0] EXPLICIT GeneralizedTime OPTIONAL
+        let next_update;
+        if let Some(nu_str) = next_update_str {
+            let next_update_gt = der_utils::encode_tlv(0x18, nu_str.as_bytes());
+            next_update = der_utils::encode_tlv(0xA0, &next_update_gt);
+            parts.push(&next_update);
+        }
+
+        der_utils::encode_sequence_from_parts(&parts)
     }
 
     #[test]
@@ -1858,6 +2029,10 @@ mod tests {
         let response_der =
             build_test_ocsp_response(&issuer, &key_pem, &cert, &cert_status, None);
 
+        // Validation time (2026-06-01T00:00Z) is the historical instant; the
+        // response was produced shortly after (thisUpdate 2026-06-01T12:00Z,
+        // nextUpdate 2026-06-08T12:00Z). Later-collected evidence is accepted,
+        // and the 2027 revocation is in the future, so the result is Valid.
         let validation_time =
             chrono::DateTime::parse_from_rfc3339("2026-06-01T00:00:00Z")
                 .unwrap()
@@ -1869,6 +2044,139 @@ mod tests {
             status.is_valid(),
             "should be valid (revocation in future): {status}"
         );
+    }
+
+    // ── H-2: OCSP response freshness (RFC 6960 §4.2.2.1) ─────────────
+
+    #[test]
+    fn test_check_revocation_rejects_stale_good() {
+        // A legitimately-signed "good" response is replayed long after its
+        // nextUpdate (2026-06-08T12:00Z). It must NOT be accepted as Valid.
+        let key_path = intermediate_ca_key_pem_path();
+        let Ok(key_pem) = std::fs::read_to_string(key_path) else {
+            eprintln!("skipping test: intermediate_ca_key.pem not found");
+            return;
+        };
+
+        let issuer = intermediate_ca_cert();
+        let cert = signer_cert();
+
+        let response_der =
+            build_test_ocsp_response(&issuer, &key_pem, &cert, &CertStatus::Good, None);
+
+        // Far past nextUpdate (the replay window the old code accepted forever).
+        let validation_time = chrono::DateTime::parse_from_rfc3339("2026-09-01T12:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+
+        let err = check_revocation(&response_der, &cert, &issuer, None, Some(validation_time))
+            .expect_err("stale OCSP response must be rejected");
+        assert!(
+            matches!(err, LtvError::Ocsp(ref m) if m.contains("stale")),
+            "expected stale error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_check_revocation_accepts_later_produced_evidence() {
+        // Archival/LTV: the response is produced *after* the historical
+        // validation instant. With thisUpdate <= validation_time < producedAt
+        // <= nextUpdate, the response is valid evidence and must be accepted —
+        // producedAt being after the validation instant is not a freshness
+        // failure (producedAt is the responder's signing time, not a status
+        // assertion time).
+        let key_path = intermediate_ca_key_pem_path();
+        let Ok(key_pem) = std::fs::read_to_string(key_path) else {
+            eprintln!("skipping test: intermediate_ca_key.pem not found");
+            return;
+        };
+
+        let issuer = intermediate_ca_cert();
+        let cert = signer_cert();
+
+        // thisUpdate 12:00, producedAt 14:00, nextUpdate 2026-06-08; the
+        // validation instant 13:00 sits between thisUpdate and producedAt.
+        let response_der = build_test_ocsp_response_with_times(
+            &issuer,
+            &key_pem,
+            &cert,
+            &CertStatus::Good,
+            None,
+            "20260601140000Z",        // producedAt (after validation_time)
+            "20260601120000Z",        // thisUpdate (<= validation_time)
+            Some("20260608120000Z"),  // nextUpdate
+        );
+
+        let validation_time = chrono::DateTime::parse_from_rfc3339("2026-06-01T13:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+
+        let status =
+            check_revocation(&response_der, &cert, &issuer, None, Some(validation_time)).unwrap();
+        assert!(
+            status.is_valid(),
+            "later-produced OCSP evidence must remain acceptable: {status}"
+        );
+    }
+
+    #[test]
+    fn test_check_revocation_accepts_stale_within_skew() {
+        // Just past nextUpdate (2026-06-08T12:00Z) but within the default 5m
+        // clock skew — still accepted.
+        let key_path = intermediate_ca_key_pem_path();
+        let Ok(key_pem) = std::fs::read_to_string(key_path) else {
+            eprintln!("skipping test: intermediate_ca_key.pem not found");
+            return;
+        };
+
+        let issuer = intermediate_ca_cert();
+        let cert = signer_cert();
+
+        let response_der =
+            build_test_ocsp_response(&issuer, &key_pem, &cert, &CertStatus::Good, None);
+
+        // 3 minutes after nextUpdate — inside the 5-minute skew.
+        let validation_time = chrono::DateTime::parse_from_rfc3339("2026-06-08T12:03:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+
+        let status =
+            check_revocation(&response_der, &cert, &issuer, None, Some(validation_time)).unwrap();
+        assert!(status.is_valid(), "should be valid within skew: {status}");
+    }
+
+    #[test]
+    fn test_validate_response_freshness_no_next_update_max_age() {
+        // With nextUpdate absent, the response is fresh up to max_age from
+        // thisUpdate and stale beyond it.
+        let this_update = chrono::DateTime::parse_from_rfc3339("2026-06-01T12:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let sr = SingleResponse {
+            hash_algorithm_oid: vec![],
+            issuer_name_hash: vec![],
+            issuer_key_hash: vec![],
+            serial_number: vec![],
+            cert_status: CertStatus::Good,
+            this_update,
+            next_update: None,
+        };
+        let freshness = OcspFreshness::default(); // 24h max age, 5m skew
+
+        // 12 hours later — within the 24h bound.
+        let within = this_update + chrono::Duration::hours(12);
+        assert!(validate_response_freshness(&sr, within, &freshness).is_ok());
+
+        // Validation instant *before* thisUpdate (later-collected evidence) is
+        // always within bound.
+        let before = this_update - chrono::Duration::hours(6);
+        assert!(validate_response_freshness(&sr, before, &freshness).is_ok());
+
+        // 25 hours later — beyond the 24h bound (+ skew).
+        let beyond = this_update + chrono::Duration::hours(25);
+        let err = validate_response_freshness(&sr, beyond, &freshness)
+            .expect_err("response older than max age must be rejected");
+        assert!(matches!(err, LtvError::Ocsp(ref m) if m.contains("too old")), "got: {err}");
     }
 
     #[test]
