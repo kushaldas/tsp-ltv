@@ -25,6 +25,16 @@ pub enum LtvError {
     #[error("OCSP error: {0}")]
     Ocsp(String),
 
+    /// The OCSP responder returned a non-successful `responseStatus`
+    /// (malformedRequest, internalError, tryLater, sigRequired, unauthorized).
+    ///
+    /// This is a responder-side or transient condition — **not** proof that the
+    /// response was malformed or forged — so it is non-determinative. Callers
+    /// must treat it as `Unknown` (status could not be determined), never as a
+    /// definitive `Invalid`.
+    #[error("OCSP responder returned non-successful status: {0}")]
+    OcspResponderStatus(String),
+
     #[error("CRL error: {0}")]
     Crl(String),
 
