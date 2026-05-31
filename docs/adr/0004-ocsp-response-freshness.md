@@ -129,5 +129,5 @@ earlier as `OcspResponderStatus` and still maps to `Unknown`.
   this relies on).
 - ADR 0003 — reject weak signature algorithms (the `signature_policy` threading
   pattern this mirrors).
-- The analogous CRL freshness gap (stale CRL accepted with only a warning) is
-  tracked separately as finding H-3.
+- ADR 0005 — CRL freshness (the analogous CRL gap, finding H-3, resolved with the
+  same model as this ADR).

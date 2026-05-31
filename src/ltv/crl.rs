@@ -40,6 +40,14 @@ pub struct CrlClient {
     cache: Arc<Mutex<HashMap<String, CrlCacheEntry>>>,
     /// How long cached CRLs remain valid.
     grace_period: Duration,
+    /// Freshness policy used to decide whether a cached or just-fetched CRL is
+    /// still current (within its own `thisUpdate`/`nextUpdate` window). This is a
+    /// *fetch-time* check against the wall clock — distinct from the orchestrator's
+    /// authoritative [`check_revocation`] check against the historical
+    /// `validation_time`. It ensures a CRL that has crossed its `nextUpdate` is
+    /// re-fetched (not served from cache) and that a stale distribution point does
+    /// not shadow a fresh one.
+    freshness: CrlFreshness,
 }
 
 impl CrlClient {
@@ -52,6 +60,7 @@ impl CrlClient {
             timeout: Duration::from_secs(30),
             cache: Arc::new(Mutex::new(HashMap::new())),
             grace_period: Duration::from_secs(3600),
+            freshness: CrlFreshness::default(),
         }
     }
 
@@ -70,6 +79,12 @@ impl CrlClient {
     /// Set the cache grace period.
     pub fn grace_period(mut self, grace: Duration) -> Self {
         self.grace_period = grace;
+        self
+    }
+
+    /// Set the fetch-time freshness policy (see [`CrlFreshness`]).
+    pub fn freshness(mut self, freshness: CrlFreshness) -> Self {
+        self.freshness = freshness;
         self
     }
 
@@ -96,6 +111,13 @@ impl CrlClient {
     }
 
     /// Fetch a CRL from the given URL, using cache if available.
+    ///
+    /// A cached entry is only served while it is both within the local cache
+    /// grace period *and* still inside its own `thisUpdate`/`nextUpdate` validity
+    /// window (as of the wall clock). A cached CRL that has crossed its
+    /// `nextUpdate` is treated as a cache miss and re-fetched, so the freshness
+    /// enforcement in [`check_revocation`] never hard-fails on a superseded CRL
+    /// that the issuer has already replaced.
     pub async fn fetch_crl(&self, url: &str) -> Result<Vec<u8>, LtvError> {
         // Check cache first
         {
@@ -104,10 +126,13 @@ impl CrlClient {
                 .lock()
                 .map_err(|e| LtvError::Crl(format!("cache lock poisoned: {e}")))?;
             if let Some(entry) = cache.get(url) {
-                if entry.fetched_at.elapsed() < self.grace_period {
+                if entry.fetched_at.elapsed() < self.grace_period
+                    && crl_is_current(&entry.der, chrono::Utc::now(), &self.freshness)
+                {
                     log::debug!("CRL cache hit for {url}");
                     return Ok(entry.der.clone());
                 }
+                log::debug!("CRL cache entry for {url} is stale or expired; re-fetching");
             }
         }
 
@@ -161,17 +186,34 @@ impl CrlClient {
         Ok(crl_bytes)
     }
 
-    /// Fetch all CRLs for a certificate (from all distribution points).
+    /// Fetch a usable CRL for a certificate, trying every distribution point.
+    ///
+    /// Distribution points are tried in order. The **first CRL that both downloads
+    /// and is current** (within its own `nextUpdate` window as of the wall clock)
+    /// is returned immediately — so a stale or lagging endpoint never shadows a
+    /// fresh one at a later distribution point.
+    ///
+    /// If no distribution point yields a current CRL, the first one that merely
+    /// downloaded is returned as a fallback. That CRL is stale, so the
+    /// orchestrator's [`check_revocation`] freshness check will make a definitive
+    /// fail-closed (`Invalid`) decision — rather than the caller silently seeing
+    /// "no CRL" (`Unknown`). When nothing downloads at all, an empty vec is
+    /// returned (→ `Unknown`), unchanged from before.
     pub async fn fetch_crls_for_cert(&self, cert: &Certificate) -> Result<Vec<Vec<u8>>, LtvError> {
         let urls = Self::extract_crl_urls(cert);
-        let mut crls = Vec::new();
+        let now = chrono::Utc::now();
+        let mut stale_fallback: Option<Vec<u8>> = None;
 
         for url in &urls {
             match self.fetch_crl(url).await {
                 Ok(crl) => {
-                    crls.push(crl);
-                    // One CRL is sufficient for most validation scenarios
-                    break;
+                    if crl_is_current(&crl, now, &self.freshness) {
+                        // Current CRL at this distribution point — authoritative.
+                        return Ok(vec![crl]);
+                    }
+                    log::warn!("CRL from {url} is stale; trying other distribution points");
+                    // Keep the first stale CRL as a fail-closed fallback.
+                    stale_fallback.get_or_insert(crl);
                 }
                 Err(e) => {
                     log::warn!("Failed to fetch CRL from {url}: {e}");
@@ -180,7 +222,7 @@ impl CrlClient {
             }
         }
 
-        Ok(crls)
+        Ok(stale_fallback.into_iter().collect())
     }
 
     /// Clear the in-memory cache.
@@ -589,6 +631,133 @@ pub fn verify_crl_signature_with_policy(
     .map_err(|e| LtvError::Crl(format!("CRL signature verification failed: {e}")))
 }
 
+// ── Freshness policy ───────────────────────────────────────────────
+
+/// Freshness policy for CRLs (RFC 5280 §6.3.3).
+///
+/// A CRL carries a validity window: it asserts revocation status as of
+/// `thisUpdate` and the issuer promises a fresher list by `nextUpdate`. RFC 5280
+/// §6.3.3 forbids relying on a CRL whose `nextUpdate` is in the past — without
+/// this check a legitimately-signed but superseded CRL can be replayed forever
+/// (served by an on-path attacker or a stale CDN/cache), hiding a serial that a
+/// later CRL revokes.
+///
+/// All comparisons are made against the *validation time* (`now`), which for
+/// long-term validation is the historical instant being validated, not the wall
+/// clock. A CRL whose window lies at or after that instant (later-collected
+/// archival evidence) is accepted; only staleness relative to `now` is a
+/// failure. This mirrors [`OcspFreshness`](crate::ltv::ocsp::OcspFreshness).
+#[derive(Debug, Clone)]
+pub struct CrlFreshness {
+    /// Clock skew tolerance applied to every time comparison, in both
+    /// directions. Accommodates small differences between the issuer's and the
+    /// validator's clocks. Default: 5 minutes.
+    pub clock_skew: chrono::Duration,
+
+    /// Maximum age (measured from `thisUpdate`) tolerated for a CRL that omits
+    /// the optional `nextUpdate` field. RFC 5280 makes `nextUpdate` optional;
+    /// rather than treat such a CRL as eternally fresh, it is rejected once it is
+    /// older than this bound. Default: 24 hours.
+    pub max_age_without_next_update: chrono::Duration,
+}
+
+impl Default for CrlFreshness {
+    fn default() -> Self {
+        Self {
+            clock_skew: chrono::Duration::minutes(5),
+            max_age_without_next_update: chrono::Duration::hours(24),
+        }
+    }
+}
+
+/// Validate that a CRL is fresh enough to be relied upon at `now`.
+///
+/// Enforces RFC 5280 §6.3.3: a CRL must not be **stale** as of the validation
+/// time — the validation instant must not be past `nextUpdate` (widened by the
+/// allowed clock skew). When `nextUpdate` is absent the CRL is instead bounded by
+/// [`CrlFreshness::max_age_without_next_update`] measured from `thisUpdate`, so a
+/// `nextUpdate`-less CRL is never treated as eternally fresh.
+///
+/// A CRL whose window lies at or after the validation instant is explicitly
+/// **accepted**: in archival / long-term validation, `validation_time` is the
+/// historical instant being validated (e.g. signing or timestamp `genTime`) and
+/// the revocation evidence is normally collected shortly afterwards, so its
+/// `thisUpdate` legitimately falls after `validation_time`.
+///
+/// Fails closed: an out-of-range (stale/expired) CRL returns an `Err`, which the
+/// orchestrator classifies as a definitive `Invalid` (a received-but-unusable
+/// CRL), never the fail-open `Unknown`.
+fn validate_crl_freshness(
+    parsed: &ParsedCrl,
+    now: chrono::DateTime<chrono::Utc>,
+    freshness: &CrlFreshness,
+) -> Result<(), LtvError> {
+    let skew = freshness.clock_skew;
+
+    match parsed.next_update {
+        Some(next_update) => {
+            // Sanity: a window that ends before it starts is malformed.
+            if next_update < parsed.this_update {
+                return Err(LtvError::Crl(format!(
+                    "CRL has nextUpdate ({next_update}) before thisUpdate ({})",
+                    parsed.this_update
+                )));
+            }
+            // Anti-replay: reject once the validation instant is past nextUpdate.
+            // (A CRL whose window lies at/after the validation instant —
+            // later-collected archival evidence — is not stale and is kept.)
+            if now > next_update + skew {
+                return Err(LtvError::Crl(format!(
+                    "CRL is stale: nextUpdate ({next_update}) is before validation time ({now})"
+                )));
+            }
+        }
+        None => {
+            // No nextUpdate: bound the CRL's age from thisUpdate so an old CRL
+            // cannot be relied on indefinitely. A CRL whose window starts at/after
+            // the validation time is always within bound.
+            let max_valid = parsed.this_update + freshness.max_age_without_next_update + skew;
+            if now > max_valid {
+                return Err(LtvError::Crl(format!(
+                    "CRL without nextUpdate is too old: thisUpdate ({}), validation time ({now}), max age {}",
+                    parsed.this_update, freshness.max_age_without_next_update
+                )));
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Whether a raw CRL is **current** (inside its own validity window) as of `now`.
+///
+/// Used by the fetch/cache layer ([`CrlClient::fetch_crl`],
+/// [`CrlClient::fetch_crls_for_cert`]) to decide whether a cached or just-fetched
+/// CRL is still the issuer's live list, or has been superseded and should be
+/// re-fetched / skipped in favour of another distribution point.
+///
+/// Unlike [`validate_crl_freshness`], this is a presence check on a *current*
+/// CRL: a CRL whose window lies entirely in the future relative to `now` is not
+/// "current" either, so it is never treated as live in the cache. (The
+/// archival "later-collected evidence" carve-out lives in the orchestrator's
+/// `validation_time` check, not here.) An unparseable CRL is treated as not
+/// current so it is re-fetched rather than trusted.
+fn crl_is_current(
+    der: &[u8],
+    now: chrono::DateTime<chrono::Utc>,
+    freshness: &CrlFreshness,
+) -> bool {
+    let Ok(parsed) = parse_crl(der) else {
+        return false;
+    };
+    // Not yet valid (window starts in the future, beyond skew) → not current.
+    if now + freshness.clock_skew < parsed.this_update {
+        return false;
+    }
+    // Past nextUpdate / max-age → not current.
+    validate_crl_freshness(&parsed, now, freshness).is_ok()
+}
+
 /// Check whether a certificate is revoked according to a CRL.
 ///
 /// Performs the full CRL validation pipeline:
@@ -618,12 +787,41 @@ pub fn check_revocation(
 /// Like [`check_revocation`] but with an explicit
 /// [`SignaturePolicy`](crate::crypto::verify::SignaturePolicy) for the CRL
 /// signature check. The default rejects CRLs signed with MD5/SHA-1/SHA-224.
+///
+/// Freshness is validated with [`CrlFreshness::default`]; use
+/// [`check_revocation_with_options`] to supply a custom freshness policy.
 pub fn check_revocation_with_policy(
     crl_der: &[u8],
     cert: &Certificate,
     issuer: &Certificate,
     validation_time: Option<chrono::DateTime<chrono::Utc>>,
     policy: &crate::crypto::verify::SignaturePolicy,
+) -> Result<ValidationStatus, LtvError> {
+    check_revocation_with_options(
+        crl_der,
+        cert,
+        issuer,
+        validation_time,
+        policy,
+        &CrlFreshness::default(),
+    )
+}
+
+/// Like [`check_revocation_with_policy`] but with an explicit [`CrlFreshness`]
+/// policy controlling the RFC 5280 §6.3.3 time-window check.
+///
+/// A CRL that is stale as of `validation_time` (the validation instant is past
+/// `nextUpdate`, or — lacking `nextUpdate` — the CRL is older than the configured
+/// maximum age) fails closed with an `Err`, classified by the orchestrator as
+/// `Invalid` (a received-but-unusable CRL), never the fail-open `Unknown`.
+/// Later-collected evidence (window at/after the validation instant) is accepted.
+pub fn check_revocation_with_options(
+    crl_der: &[u8],
+    cert: &Certificate,
+    issuer: &Certificate,
+    validation_time: Option<chrono::DateTime<chrono::Utc>>,
+    policy: &crate::crypto::verify::SignaturePolicy,
+    freshness: &CrlFreshness,
 ) -> Result<ValidationStatus, LtvError> {
     let now = validation_time.unwrap_or_else(chrono::Utc::now);
 
@@ -633,15 +831,12 @@ pub fn check_revocation_with_policy(
     // 2. Verify CRL signature
     verify_crl_signature_with_policy(&parsed, issuer, policy)?;
 
-    // 3. Check CRL freshness: nextUpdate should be in the future
-    if let Some(next_update) = parsed.next_update {
-        if now > next_update {
-            log::warn!("CRL is stale: nextUpdate={next_update}, validation_time={now}");
-            // Stale CRL — we still process it but log a warning.
-            // The Java stack treats stale CRLs as valid for revocation
-            // checking but flags it in diagnostics.
-        }
-    }
+    // 3. Check CRL freshness (RFC 5280 §6.3.3). A CRL that is stale as of `now`
+    //    (validation instant past nextUpdate, or — lacking nextUpdate — older
+    //    than the configured maximum age) is rejected — fail closed — so a
+    //    superseded CRL cannot be replayed to hide a serial that a fresher CRL
+    //    revokes. Later-collected archival evidence is kept.
+    validate_crl_freshness(&parsed, now, freshness)?;
 
     // 4. Verify CRL issuer matches cert's issuer
     // We compare raw DER issuer names
@@ -753,6 +948,26 @@ mod tests {
         issuer_key_pem: &str,
         revoked_serials: &[(Vec<u8>, &str)], // (serial_bytes, "YYMMDDHHMMSSZ")
     ) -> Vec<u8> {
+        // Default window: thisUpdate 2026-01-01, nextUpdate 2027-01-01.
+        build_test_crl_with_window(
+            issuer_cert,
+            issuer_key_pem,
+            revoked_serials,
+            "260101000000Z",
+            Some("270101000000Z"),
+        )
+    }
+
+    /// Like [`build_test_crl`] but with an explicit `thisUpdate` and optional
+    /// `nextUpdate` (both `"YYMMDDHHMMSSZ"` UTCTime). Used to construct CRLs that
+    /// are stale or `nextUpdate`-less for freshness tests.
+    fn build_test_crl_with_window(
+        issuer_cert: &Certificate,
+        issuer_key_pem: &str,
+        revoked_serials: &[(Vec<u8>, &str)],
+        this_update: &str,
+        next_update: Option<&str>,
+    ) -> Vec<u8> {
         use rsa::pkcs1v15::SigningKey;
         use rsa::pkcs8::DecodePrivateKey;
         use rsa::signature::SignatureEncoding;
@@ -777,12 +992,14 @@ mod tests {
         tbs_body.extend_from_slice(&issuer_name_der);
 
         // thisUpdate UTCTime
-        let this_update_utc = encode_tlv(0x17, b"260101000000Z");
+        let this_update_utc = encode_tlv(0x17, this_update.as_bytes());
         tbs_body.extend_from_slice(&this_update_utc);
 
-        // nextUpdate UTCTime
-        let next_update_utc = encode_tlv(0x17, b"270101000000Z");
-        tbs_body.extend_from_slice(&next_update_utc);
+        // nextUpdate UTCTime (OPTIONAL)
+        if let Some(next_update) = next_update {
+            let next_update_utc = encode_tlv(0x17, next_update.as_bytes());
+            tbs_body.extend_from_slice(&next_update_utc);
+        }
 
         // revokedCertificates SEQUENCE OF
         if !revoked_serials.is_empty() {
@@ -998,6 +1215,291 @@ mod tests {
         assert!(
             status.is_valid(),
             "should be valid (revocation in future): {status}"
+        );
+    }
+
+    #[test]
+    fn test_check_revocation_stale_crl_rejected() {
+        // H-3: a legitimately-signed but superseded CRL (nextUpdate in the past
+        // relative to the validation instant) must NOT be relied upon. An on-path
+        // attacker replaying CRL v1 to hide a serial that CRL v2 revokes must
+        // fail closed.
+        let key_path = intermediate_ca_key_pem();
+        let Ok(key_pem) = std::fs::read_to_string(key_path) else {
+            eprintln!("skipping test: intermediate_ca_key.pem not found");
+            return;
+        };
+
+        let issuer = intermediate_ca_cert();
+        let cert = signer_cert();
+
+        // CRL window is thisUpdate 2026-01-01 / nextUpdate 2027-01-01.
+        let crl_der = build_test_crl(&issuer, &key_pem, &[]);
+        // Validate well past nextUpdate (+ skew): the CRL is stale.
+        let validation_time = chrono::DateTime::parse_from_rfc3339("2027-06-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+
+        let result = check_revocation(&crl_der, &cert, &issuer, Some(validation_time));
+        assert!(
+            result.is_err(),
+            "stale CRL must fail closed (Err → Invalid), got {result:?}"
+        );
+    }
+
+    /// Parse a real signed test CRL into a `ParsedCrl` for freshness unit tests,
+    /// or `None` if the signing key fixture is unavailable.
+    fn parse_test_crl() -> Option<ParsedCrl> {
+        let key_pem = std::fs::read_to_string(intermediate_ca_key_pem()).ok()?;
+        let issuer = intermediate_ca_cert();
+        let crl_der = build_test_crl(&issuer, &key_pem, &[]);
+        Some(parse_crl(&crl_der).unwrap())
+    }
+
+    fn instant(s: &str) -> chrono::DateTime<chrono::Utc> {
+        chrono::DateTime::parse_from_rfc3339(s)
+            .unwrap()
+            .with_timezone(&chrono::Utc)
+    }
+
+    #[test]
+    fn test_validate_crl_freshness_within_window() {
+        let Some(parsed) = parse_test_crl() else {
+            eprintln!("skipping: intermediate_ca_key.pem not found");
+            return;
+        };
+        // thisUpdate 2026-01-01 .. nextUpdate 2027-01-01; validate mid-window.
+        let res = validate_crl_freshness(
+            &parsed,
+            instant("2026-06-01T00:00:00Z"),
+            &CrlFreshness::default(),
+        );
+        assert!(res.is_ok(), "in-window CRL should be fresh: {res:?}");
+    }
+
+    #[test]
+    fn test_validate_crl_freshness_stale() {
+        let Some(parsed) = parse_test_crl() else {
+            eprintln!("skipping: intermediate_ca_key.pem not found");
+            return;
+        };
+        // Past nextUpdate (2027-01-01) beyond the 5-minute skew → stale.
+        let res = validate_crl_freshness(
+            &parsed,
+            instant("2027-01-01T00:10:00Z"),
+            &CrlFreshness::default(),
+        );
+        assert!(res.is_err(), "CRL past nextUpdate must be stale");
+    }
+
+    #[test]
+    fn test_validate_crl_freshness_skew_grace() {
+        let Some(parsed) = parse_test_crl() else {
+            eprintln!("skipping: intermediate_ca_key.pem not found");
+            return;
+        };
+        // Two minutes past nextUpdate is within the default 5-minute skew → fresh.
+        let res = validate_crl_freshness(
+            &parsed,
+            instant("2027-01-01T00:02:00Z"),
+            &CrlFreshness::default(),
+        );
+        assert!(res.is_ok(), "within-skew CRL should be accepted: {res:?}");
+    }
+
+    #[test]
+    fn test_validate_crl_freshness_later_collected_evidence() {
+        let Some(parsed) = parse_test_crl() else {
+            eprintln!("skipping: intermediate_ca_key.pem not found");
+            return;
+        };
+        // Validation instant BEFORE the CRL window (archival/LTV: the CRL was
+        // collected after the historical instant being validated). Accepted.
+        let res = validate_crl_freshness(
+            &parsed,
+            instant("2025-06-01T00:00:00Z"),
+            &CrlFreshness::default(),
+        );
+        assert!(res.is_ok(), "later-collected CRL should be kept: {res:?}");
+    }
+
+    #[test]
+    fn test_validate_crl_freshness_no_next_update_within_max_age() {
+        let Some(mut parsed) = parse_test_crl() else {
+            eprintln!("skipping: intermediate_ca_key.pem not found");
+            return;
+        };
+        // Drop nextUpdate: bounded by max_age_without_next_update (24h) from
+        // thisUpdate (2026-01-01T00:00:00Z).
+        parsed.next_update = None;
+        let res = validate_crl_freshness(
+            &parsed,
+            instant("2026-01-01T12:00:00Z"),
+            &CrlFreshness::default(),
+        );
+        assert!(res.is_ok(), "within max-age should be fresh: {res:?}");
+    }
+
+    #[test]
+    fn test_validate_crl_freshness_no_next_update_too_old() {
+        let Some(mut parsed) = parse_test_crl() else {
+            eprintln!("skipping: intermediate_ca_key.pem not found");
+            return;
+        };
+        // Drop nextUpdate and validate well beyond the 24h max age → rejected,
+        // so a nextUpdate-less CRL is not treated as eternally fresh.
+        parsed.next_update = None;
+        let res = validate_crl_freshness(
+            &parsed,
+            instant("2026-01-03T00:00:00Z"),
+            &CrlFreshness::default(),
+        );
+        assert!(
+            res.is_err(),
+            "beyond max-age without nextUpdate must be rejected"
+        );
+    }
+
+    #[test]
+    fn test_validate_crl_freshness_malformed_window() {
+        let Some(mut parsed) = parse_test_crl() else {
+            eprintln!("skipping: intermediate_ca_key.pem not found");
+            return;
+        };
+        // nextUpdate before thisUpdate is malformed → rejected.
+        parsed.next_update = Some(parsed.this_update - chrono::Duration::hours(1));
+        let res = validate_crl_freshness(
+            &parsed,
+            instant("2026-06-01T00:00:00Z"),
+            &CrlFreshness::default(),
+        );
+        assert!(
+            res.is_err(),
+            "nextUpdate before thisUpdate must be rejected"
+        );
+    }
+
+    // ── Fetch/cache freshness (crl_is_current) ─────────────────────
+
+    /// Build a signed test CRL with a custom validity window, or `None` if the
+    /// signing-key fixture is unavailable.
+    fn build_crl_or_skip(this_update: &str, next_update: Option<&str>) -> Option<Vec<u8>> {
+        let key_pem = std::fs::read_to_string(intermediate_ca_key_pem()).ok()?;
+        let issuer = intermediate_ca_cert();
+        Some(build_test_crl_with_window(
+            &issuer,
+            &key_pem,
+            &[],
+            this_update,
+            next_update,
+        ))
+    }
+
+    #[test]
+    fn test_crl_is_current_within_window() {
+        let Some(der) = build_crl_or_skip("260101000000Z", Some("270101000000Z")) else {
+            eprintln!("skipping: intermediate_ca_key.pem not found");
+            return;
+        };
+        assert!(crl_is_current(
+            &der,
+            instant("2026-06-01T00:00:00Z"),
+            &CrlFreshness::default()
+        ));
+    }
+
+    #[test]
+    fn test_crl_is_current_stale_window() {
+        // Window entirely in the past relative to `now` → superseded, not current.
+        let Some(der) = build_crl_or_skip("200101000000Z", Some("210101000000Z")) else {
+            eprintln!("skipping: intermediate_ca_key.pem not found");
+            return;
+        };
+        assert!(!crl_is_current(
+            &der,
+            instant("2026-06-01T00:00:00Z"),
+            &CrlFreshness::default()
+        ));
+    }
+
+    #[test]
+    fn test_crl_is_current_future_window_not_current() {
+        // Window starts well in the future relative to `now`. For *cache* purposes
+        // this CRL is not the issuer's live list yet, so it must not be cached as
+        // current. (Archival acceptance of after-the-instant evidence is the
+        // orchestrator's job, against validation_time — not the fetch layer.)
+        let Some(der) = build_crl_or_skip("300101000000Z", Some("310101000000Z")) else {
+            eprintln!("skipping: intermediate_ca_key.pem not found");
+            return;
+        };
+        assert!(!crl_is_current(
+            &der,
+            instant("2026-06-01T00:00:00Z"),
+            &CrlFreshness::default()
+        ));
+    }
+
+    #[test]
+    fn test_crl_is_current_unparseable() {
+        // Garbage bytes are never "current" → re-fetch rather than trust.
+        assert!(!crl_is_current(
+            &[0x04, 0x00],
+            instant("2026-06-01T00:00:00Z"),
+            &CrlFreshness::default()
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_fetch_crl_serves_fresh_cache_entry() {
+        // A cached CRL that is within both the grace period and its own validity
+        // window is served without touching the network.
+        let Some(der) = build_crl_or_skip("260101000000Z", Some("270101000000Z")) else {
+            eprintln!("skipping: intermediate_ca_key.pem not found");
+            return;
+        };
+        // Use a freshness policy anchored so "now" sits inside the 2026 window.
+        // (CrlClient uses wall-clock now; today is within 2026-01-01..2027-01-01.)
+        let client = CrlClient::new();
+        let url = "http://crl.invalid.example/fresh.crl";
+        client.cache.lock().unwrap().insert(
+            url.to_string(),
+            CrlCacheEntry {
+                der: der.clone(),
+                fetched_at: Instant::now(),
+            },
+        );
+
+        let got = client
+            .fetch_crl(url)
+            .await
+            .expect("fresh cached CRL should be served");
+        assert_eq!(got, der, "served bytes should be the cached CRL");
+    }
+
+    #[tokio::test]
+    async fn test_fetch_crl_skips_stale_cache_entry() {
+        // A cached CRL that has crossed its nextUpdate must NOT be served even
+        // though it is within the grace period; the client falls through to a
+        // network fetch (which here fails against an unreachable host), proving it
+        // did not return the stale cached object.
+        let Some(stale) = build_crl_or_skip("200101000000Z", Some("210101000000Z")) else {
+            eprintln!("skipping: intermediate_ca_key.pem not found");
+            return;
+        };
+        let client = CrlClient::new().timeout(Duration::from_millis(200));
+        let url = "http://crl.invalid.example/stale.crl";
+        client.cache.lock().unwrap().insert(
+            url.to_string(),
+            CrlCacheEntry {
+                der: stale,
+                fetched_at: Instant::now(), // within grace period
+            },
+        );
+
+        let res = client.fetch_crl(url).await;
+        assert!(
+            res.is_err(),
+            "stale cache entry must not be served; expected a (failed) re-fetch"
         );
     }
 
