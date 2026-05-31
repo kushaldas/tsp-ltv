@@ -182,43 +182,18 @@ pub fn check_basic_constraints(cert: &Certificate) -> Result<(bool, Option<u32>)
         None => return Ok((false, None)),
     };
 
-    // Parse SEQUENCE
-    let (tag, seq_body) = der_utils::parse_tlv(ext_value)
-        .map_err(|e| LtvError::X509Extension(format!("basicConstraints: {e}")))?;
-    if tag != 0x30 {
-        return Err(LtvError::X509Extension(format!(
-            "basicConstraints: expected SEQUENCE (0x30), got 0x{tag:02x}"
-        )));
-    }
-
-    // Empty SEQUENCE → CA:FALSE, no pathlen
-    if seq_body.is_empty() {
-        return Ok((false, None));
-    }
-
-    let mut is_ca = false;
-    let mut path_len: Option<u32> = None;
-    let mut pos = &seq_body[..];
-
-    // First element: BOOLEAN (tag 0x01) — optional, defaults to FALSE
-    if let Ok((tag, value, rest)) = der_utils::parse_tlv_with_rest(pos) {
-        if tag == 0x01 {
-            // BOOLEAN: 0x00 = FALSE, anything else = TRUE
-            is_ca = !value.is_empty() && value[0] != 0x00;
-            pos = rest;
-        }
-        // If not BOOLEAN, it might be INTEGER (pathlen without cA)
-    }
-
-    // Second element: INTEGER (tag 0x02) — pathLenConstraint
-    if !pos.is_empty() {
-        if let Ok((tag, value, _rest)) = der_utils::parse_tlv_with_rest(pos) {
-            if tag == 0x02 {
-                path_len = Some(der_utils::decode_integer_u64(value) as u32);
-            }
-        }
-    }
-
+    // Delegate to the shared, feature-independent byte parser so trust-chain
+    // pathLen enforcement and ltv extension validation share one implementation.
+    let (is_ca, path_len) =
+        der_utils::parse_basic_constraints(ext_value).map_err(LtvError::X509Extension)?;
+    // This helper's public API is `u32`; reject (rather than silently truncate)
+    // a pathLenConstraint that does not fit.
+    let path_len = match path_len {
+        Some(p) => Some(u32::try_from(p).map_err(|_| {
+            LtvError::X509Extension(format!("pathLenConstraint {p} exceeds u32 range"))
+        })?),
+        None => None,
+    };
     Ok((is_ca, path_len))
 }
 

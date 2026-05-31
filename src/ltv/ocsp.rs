@@ -373,10 +373,10 @@ fn parse_aia_extension(
         if ad_tag == 0x30 {
             // AccessDescription SEQUENCE
             // First: accessMethod OID
-            let (oid_tag, oid_body, ad_rest) = der_utils::parse_tlv_with_rest(&ad_body)
+            let (oid_tag, oid_body, ad_rest) = der_utils::parse_tlv_with_rest(ad_body)
                 .map_err(|e| LtvError::Ocsp(format!("AIA parse error: {e}")))?;
             if oid_tag == 0x06 {
-                let oid_tlv = der_utils::encode_tlv(0x06, &oid_body);
+                let oid_tlv = der_utils::encode_tlv(0x06, oid_body);
                 if oid_tlv == target_oid_der {
                     // Match — extract accessLocation GeneralName
                     // Look for uniformResourceIdentifier [6]
@@ -385,7 +385,7 @@ fn parse_aia_extension(
                             .map_err(|e| LtvError::Ocsp(format!("AIA parse error: {e}")))?;
                         if gn_tag == 0x86 {
                             // [6] IMPLICIT IA5String — URI
-                            if let Ok(uri) = std::str::from_utf8(&gn_body) {
+                            if let Ok(uri) = std::str::from_utf8(gn_body) {
                                 urls.push(uri.to_string());
                             }
                         }
@@ -525,26 +525,10 @@ fn build_cert_id(cert: &Certificate, issuer: &Certificate) -> Result<Vec<u8>, Lt
     ]))
 }
 
-/// Generate a random nonce of NONCE_SIZE bytes.
+/// Generate a cryptographically random nonce of NONCE_SIZE bytes.
 fn generate_nonce() -> Vec<u8> {
-    // Use a combination of timestamp + random-ish data for nonce generation
-    // without pulling in a full CSPRNG crate. For production, this should
-    // use OsRng, but for our library the nonce just needs to be unique per-request.
-    use std::time::SystemTime;
-
-    let now = SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .unwrap_or_default();
-
-    let mut nonce = Vec::with_capacity(NONCE_SIZE);
-    // Seed from timestamp
-    let seed = now.as_nanos();
-    for i in 0..NONCE_SIZE {
-        // Simple PRNG mixing — not cryptographic, but nonces only need uniqueness,
-        // not unpredictability (they prevent replay, not prediction).
-        let byte = ((seed >> ((i * 7) % 64)) ^ (seed >> ((i * 3) % 64))) as u8;
-        nonce.push(byte.wrapping_add(i as u8));
-    }
+    let mut nonce = vec![0u8; NONCE_SIZE];
+    getrandom::getrandom(&mut nonce).expect("OS random number generator");
     nonce
 }
 
@@ -662,7 +646,7 @@ pub fn parse_ocsp_response(response_der: &[u8]) -> Result<ParsedBasicOcspRespons
     }
 
     // ResponseBytes SEQUENCE { responseType OID, response OCTET STRING }
-    let (rb_seq_tag, rb_seq_body) = der_utils::parse_tlv(&rb_body)
+    let (rb_seq_tag, rb_seq_body) = der_utils::parse_tlv(rb_body)
         .map_err(|e| LtvError::Ocsp(format!("ResponseBytes SEQUENCE: {e}")))?;
     if rb_seq_tag != 0x30 {
         return Err(LtvError::Ocsp(format!(
@@ -690,7 +674,7 @@ pub fn parse_ocsp_response(response_der: &[u8]) -> Result<ParsedBasicOcspRespons
     }
 
     // Parse BasicOCSPResponse
-    parse_basic_ocsp_response(&oct_body)
+    parse_basic_ocsp_response(oct_body)
 }
 
 /// Parse a DER-encoded BasicOCSPResponse.
@@ -755,7 +739,7 @@ fn parse_basic_ocsp_response(der: &[u8]) -> Result<ParsedBasicOcspResponse, LtvE
             .map_err(|e| LtvError::Ocsp(format!("certs [0]: {e}")))?;
         if certs_tag == 0xA0 {
             // SEQUENCE OF Certificate
-            let (seq_tag, seq_body) = der_utils::parse_tlv(&certs_body)
+            let (seq_tag, seq_body) = der_utils::parse_tlv(certs_body)
                 .map_err(|e| LtvError::Ocsp(format!("certs SEQUENCE: {e}")))?;
             if seq_tag == 0x30 {
                 // Walk through certificates
@@ -775,7 +759,7 @@ fn parse_basic_ocsp_response(der: &[u8]) -> Result<ParsedBasicOcspResponse, LtvE
     }
 
     // Parse tbsResponseData body
-    let mut tbs_pos = &tbs_value[..];
+    let mut tbs_pos = tbs_value;
 
     // version [0] EXPLICIT INTEGER — optional, default v1
     if !tbs_pos.is_empty() && tbs_pos[0] == 0xA0 {
@@ -835,7 +819,7 @@ fn parse_basic_ocsp_response(der: &[u8]) -> Result<ParsedBasicOcspResponse, LtvE
     }
 
     let mut responses = Vec::new();
-    let mut sr_pos = &resp_seq_body[..];
+    let mut sr_pos = resp_seq_body;
     while !sr_pos.is_empty() {
         let (sr_tag, sr_body, sr_rest) = der_utils::parse_tlv_with_rest(sr_pos)
             .map_err(|e| LtvError::Ocsp(format!("SingleResponse: {e}")))?;
@@ -852,7 +836,7 @@ fn parse_basic_ocsp_response(der: &[u8]) -> Result<ParsedBasicOcspResponse, LtvE
     if !tbs_pos.is_empty() && tbs_pos[0] == 0xA1 {
         let (_, ext_wrapper, _) = der_utils::parse_tlv_with_rest(tbs_pos)
             .map_err(|e| LtvError::Ocsp(format!("responseExtensions: {e}")))?;
-        nonce = extract_nonce_from_extensions(&ext_wrapper);
+        nonce = extract_nonce_from_extensions(ext_wrapper);
     }
 
     Ok(ParsedBasicOcspResponse {
@@ -888,7 +872,7 @@ fn parse_single_response(body: &[u8]) -> Result<SingleResponse, LtvError> {
         return Err(LtvError::Ocsp("expected hashAlgorithm SEQUENCE".into()));
     }
     // Extract OID from AlgorithmIdentifier
-    let (oid_tag, oid_body, _) = der_utils::parse_tlv_with_rest(&alg_body)
+    let (oid_tag, oid_body, _) = der_utils::parse_tlv_with_rest(alg_body)
         .map_err(|e| LtvError::Ocsp(format!("hashAlgorithm OID: {e}")))?;
     if oid_tag != 0x06 {
         return Err(LtvError::Ocsp("expected OID in hashAlgorithm".into()));
@@ -1124,13 +1108,55 @@ fn verify_ocsp_response_signature(
 /// 2. A responder whose certificate is issued by the CA and has the
 ///    id-kp-OCSPSigning extended key usage
 ///
+/// The responder certificate's own validity period is checked against `now`.
 /// Additionally, if the responder certificate has the id-pkix-ocsp-nocheck
-/// extension, we skip revocation checking for the responder itself.
+/// extension, the responder's own revocation status need not be checked
+/// (not implemented here — both cases just return Ok).
 fn validate_responder_trust(
     responder_cert: &Certificate,
     issuer: &Certificate,
     policy: &crate::crypto::verify::SignaturePolicy,
+    now: chrono::DateTime<chrono::Utc>,
 ) -> Result<(), LtvError> {
+    // Check the responder certificate's own validity period (M-6).
+    let validity = &responder_cert.tbs_certificate.validity;
+    let not_before = validity.not_before.to_date_time();
+    let not_after = validity.not_after.to_date_time();
+    // Convert der::DateTime to chrono for comparison
+    let nb = chrono::DateTime::parse_from_rfc3339(&format!(
+        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
+        not_before.year(),
+        { not_before.month() },
+        { not_before.day() },
+        { not_before.hour() },
+        { not_before.minutes() },
+        { not_before.seconds() }
+    ))
+    .map_err(|e| LtvError::Ocsp(format!("invalid responder notBefore: {e}")))?
+    .with_timezone(&chrono::Utc);
+    let na = chrono::DateTime::parse_from_rfc3339(&format!(
+        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
+        not_after.year(),
+        { not_after.month() },
+        { not_after.day() },
+        { not_after.hour() },
+        { not_after.minutes() },
+        { not_after.seconds() }
+    ))
+    .map_err(|e| LtvError::Ocsp(format!("invalid responder notAfter: {e}")))?
+    .with_timezone(&chrono::Utc);
+
+    if now < nb {
+        return Err(LtvError::Ocsp(format!(
+            "OCSP responder certificate is not yet valid (notBefore: {nb})"
+        )));
+    }
+    if now > na {
+        return Err(LtvError::Ocsp(format!(
+            "OCSP responder certificate is expired (notAfter: {na})"
+        )));
+    }
+
     // Case 1: responder IS the issuer
     if certs_have_same_subject(responder_cert, issuer) {
         return Ok(());
@@ -1438,8 +1464,8 @@ pub fn check_revocation_with_options(
     // 2. Verify signature — returns the responder certificate
     let responder_cert = verify_ocsp_response_signature(&parsed, issuer, policy)?;
 
-    // 3. Validate responder trust
-    validate_responder_trust(&responder_cert, issuer, policy)?;
+    // 3. Validate responder trust (including cert validity vs. now)
+    validate_responder_trust(&responder_cert, issuer, policy, now)?;
 
     // 4. Validate nonce (if provided)
     if let Some(request_nonce) = nonce {

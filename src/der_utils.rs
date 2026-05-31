@@ -138,13 +138,39 @@ pub fn encode_integer_u64(val: u64) -> Vec<u8> {
 
 /// Decode a DER INTEGER body (no tag/length) to `u64`.
 ///
-/// Handles leading zero padding. Truncates values > 64 bits.
-pub fn decode_integer_u64(bytes: &[u8]) -> u64 {
+/// Handles leading zero padding. Returns an error if the integer is negative
+/// (high bit of the first significant byte set) or exceeds 64 bits (> 8 bytes
+/// of significant data after stripping leading-zero padding).
+pub fn decode_integer_u64(bytes: &[u8]) -> Result<u64, String> {
+    if bytes.is_empty() {
+        return Err("empty INTEGER body".into());
+    }
+    // Check for negative: MSB of first byte set.
+    // But the first byte may be a leading 0x00 pad for positive sign; skip it.
+    // A negative INTEGER has MSB=1 in its actual value byte, without a leading pad.
+    let (significant, _overflow) = if bytes.len() > 1 && bytes[0] == 0x00 {
+        (&bytes[1..], false)
+    } else if bytes[0] & 0x80 != 0 {
+        return Err(format!(
+            "negative INTEGER body not representable as u64: 0x{:02x}...",
+            bytes[0]
+        ));
+    } else {
+        (bytes, false)
+    };
+
+    if significant.len() > 8 {
+        return Err(format!(
+            "INTEGER body too large for u64: {} significant bytes",
+            significant.len()
+        ));
+    }
+
     let mut val: u64 = 0;
-    for &b in bytes {
+    for &b in significant {
         val = (val << 8) | (b as u64);
     }
-    val
+    Ok(val)
 }
 
 /// Encode a DER BOOLEAN value.
@@ -165,11 +191,83 @@ pub fn parse_integer_body(body: &[u8]) -> Vec<u8> {
     }
 }
 
+/// Parse a DER-encoded `BasicConstraints` extension value.
+///
+/// Returns `(is_ca, path_len_constraint)`. An empty SEQUENCE body yields
+/// `(false, None)`. This is a pure byte-level parser (no `x509-cert` or feature
+/// dependency) so trust-chain code can enforce `pathLenConstraint` in every
+/// build configuration, not only when the `ltv` feature is enabled.
+///
+/// ```text
+/// BasicConstraints ::= SEQUENCE {
+///     cA                      BOOLEAN DEFAULT FALSE,
+///     pathLenConstraint       INTEGER (0..MAX) OPTIONAL
+/// }
+/// ```
+pub fn parse_basic_constraints(ext_value: &[u8]) -> Result<(bool, Option<u64>), String> {
+    let (tag, seq_body) = parse_tlv(ext_value)?;
+    if tag != 0x30 {
+        return Err(format!(
+            "basicConstraints: expected SEQUENCE (0x30), got 0x{tag:02x}"
+        ));
+    }
+    let mut is_ca = false;
+    let mut path_len: Option<u64> = None;
+    let mut pos = &seq_body[..];
+
+    // cA BOOLEAN (optional, DEFAULT FALSE). A malformed TLV here is a hard
+    // error, not a silently-skipped field — otherwise a truncated cA/pathLen
+    // could bypass pathLen enforcement.
+    if !pos.is_empty() {
+        let (t, value, rest) =
+            parse_tlv_with_rest(pos).map_err(|e| format!("basicConstraints cA: {e}"))?;
+        if t == 0x01 {
+            // A BOOLEAN's contents are exactly one byte; zero or multiple bytes
+            // is malformed and must fail closed (else a CA flag could be
+            // mis-counted by the trust-chain pathLen logic).
+            if value.len() != 1 {
+                return Err(format!(
+                    "basicConstraints cA: BOOLEAN must be 1 byte, got {}",
+                    value.len()
+                ));
+            }
+            is_ca = value[0] != 0x00;
+            pos = rest;
+        }
+    }
+
+    // pathLenConstraint INTEGER (optional). Any remaining child here MUST be the
+    // pathLenConstraint INTEGER — a different tag (or trailing data) is malformed
+    // and must fail closed, not be silently ignored, otherwise a bogus
+    // BasicConstraints on a subordinate CA could be undercounted.
+    if !pos.is_empty() {
+        let (t, value, rest) = parse_tlv_with_rest(pos)
+            .map_err(|e| format!("basicConstraints pathLenConstraint: {e}"))?;
+        if t != 0x02 {
+            return Err(format!(
+                "basicConstraints: unexpected element 0x{t:02x} (expected pathLenConstraint INTEGER)"
+            ));
+        }
+        // RFC 5280 §4.2.1.9: pathLenConstraint is meaningful only when cA is
+        // asserted. Reject `pathLenConstraint` without `cA:TRUE` rather than
+        // returning a constraint for a non-CA certificate.
+        if !is_ca {
+            return Err("basicConstraints: pathLenConstraint present without cA:TRUE".to_string());
+        }
+        path_len = Some(decode_integer_u64(value).map_err(|e| format!("pathLenConstraint: {e}"))?);
+        if !rest.is_empty() {
+            return Err("basicConstraints: trailing data after pathLenConstraint".to_string());
+        }
+    }
+
+    Ok((is_ca, path_len))
+}
+
 /// Find the first child element with a specific tag inside a SEQUENCE body.
 ///
 /// Searches the immediate children (not recursive) of the given body bytes.
 /// Returns the value bytes of the first match, or `None`.
-pub fn find_tagged_value<'a>(body: &'a [u8], target_tag: u8) -> Option<&'a [u8]> {
+pub fn find_tagged_value(body: &[u8], target_tag: u8) -> Option<&[u8]> {
     let mut pos = body;
     while !pos.is_empty() {
         match parse_tlv_with_rest(pos) {
@@ -212,9 +310,18 @@ pub fn integer_bodies_equal(a: &[u8], b: &[u8]) -> bool {
 /// Parse a DER-encoded GeneralizedTime body (no tag/length) to a chrono DateTime.
 ///
 /// Format: `YYYYMMDDHHMMSSZ` or `YYYYMMDDHHMMSS.fracZ`
+///
+/// # Panic safety
+///
+/// The string is checked to be ASCII before any indexing on the `&str`, so a
+/// multi-byte UTF-8 character cannot cause a mid-character slice panic.
 pub fn parse_generalized_time(body: &[u8]) -> Result<chrono::DateTime<chrono::Utc>, String> {
     let s =
         std::str::from_utf8(body).map_err(|e| format!("GeneralizedTime: invalid UTF-8: {e}"))?;
+
+    if !s.is_ascii() {
+        return Err("GeneralizedTime: non-ASCII characters".to_string());
+    }
 
     // Strip trailing 'Z'
     let s = s.strip_suffix('Z').unwrap_or(s);
@@ -249,8 +356,17 @@ pub fn parse_generalized_time(body: &[u8]) -> Result<chrono::DateTime<chrono::Ut
 /// Parse a DER-encoded UTCTime body (no tag/length) to a chrono DateTime.
 ///
 /// Format: `YYMMDDHHMMSSZ`
+///
+/// # Panic safety
+///
+/// The string is checked to be ASCII before any indexing on the `&str`, so a
+/// multi-byte UTF-8 character cannot cause a mid-character slice panic.
 pub fn parse_utc_time(body: &[u8]) -> Result<chrono::DateTime<chrono::Utc>, String> {
     let s = std::str::from_utf8(body).map_err(|e| format!("UTCTime: invalid UTF-8: {e}"))?;
+
+    if !s.is_ascii() {
+        return Err("UTCTime: non-ASCII characters".to_string());
+    }
 
     let s = s.strip_suffix('Z').unwrap_or(s);
 
@@ -332,8 +448,93 @@ mod tests {
         assert_eq!(encode_integer_u64(128), vec![0x02, 0x02, 0x00, 0x80]);
 
         // Decode back
-        assert_eq!(decode_integer_u64(&[0x01]), 1);
-        assert_eq!(decode_integer_u64(&[0x00, 0x80]), 128);
+        assert_eq!(decode_integer_u64(&[0x01]).unwrap(), 1);
+        assert_eq!(decode_integer_u64(&[0x00, 0x80]).unwrap(), 128);
+        // Negative values rejected
+        assert!(decode_integer_u64(&[0x80]).is_err());
+        // Too large (>8 bytes of significant data)
+        assert!(
+            decode_integer_u64(&[0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09]).is_err()
+        );
+    }
+
+    #[test]
+    fn test_parse_basic_constraints_ok() {
+        // SEQUENCE { BOOLEAN TRUE, INTEGER 2 }
+        let bc = encode_sequence_from_parts(&[&encode_boolean(true), &encode_integer_u64(2)]);
+        assert_eq!(parse_basic_constraints(&bc).unwrap(), (true, Some(2)));
+        // Empty SEQUENCE → CA:FALSE, no pathlen.
+        assert_eq!(
+            parse_basic_constraints(&[0x30, 0x00]).unwrap(),
+            (false, None)
+        );
+        // cA only.
+        let bc = encode_sequence_from_parts(&[&encode_boolean(true)]);
+        assert_eq!(parse_basic_constraints(&bc).unwrap(), (true, None));
+    }
+
+    #[test]
+    fn test_parse_basic_constraints_rejects_malformed_child() {
+        // SEQUENCE (len 3) { BOOLEAN tag+len but value byte truncated }.
+        // A swallowed parse error here would let cA/pathLen bypass enforcement.
+        let malformed = [0x30, 0x02, 0x01, 0x01];
+        assert!(parse_basic_constraints(&malformed).is_err());
+        // Truncated pathLen INTEGER after a valid cA BOOLEAN.
+        let mut body = encode_boolean(true);
+        body.extend_from_slice(&[0x02, 0x04, 0x00]); // INTEGER len 4, only 1 byte
+        let seq = encode_sequence_raw(&body);
+        assert!(parse_basic_constraints(&seq).is_err());
+    }
+
+    #[test]
+    fn test_parse_basic_constraints_rejects_pathlen_without_ca() {
+        // RFC 5280: pathLenConstraint is only valid with cA:TRUE. A non-CA cert
+        // (cA absent/FALSE) carrying a pathLen is malformed and must be rejected.
+        let bc = encode_sequence_from_parts(&[&encode_integer_u64(0)]); // INTEGER only
+        assert!(parse_basic_constraints(&bc).is_err());
+        let bc = encode_sequence_from_parts(&[&encode_boolean(false), &encode_integer_u64(1)]);
+        assert!(parse_basic_constraints(&bc).is_err());
+    }
+
+    #[test]
+    fn test_parse_basic_constraints_rejects_unexpected_child() {
+        // A child after cA that is not a pathLenConstraint INTEGER is malformed
+        // and must fail closed (not be silently ignored, leaving path_len=None).
+        let bc = encode_sequence_from_parts(&[
+            &encode_boolean(true),
+            &encode_tlv(0x05, &[]), // NULL where pathLen INTEGER is expected
+        ]);
+        assert!(parse_basic_constraints(&bc).is_err());
+        // Trailing data after a valid pathLenConstraint is also rejected.
+        let bc = encode_sequence_from_parts(&[
+            &encode_boolean(true),
+            &encode_integer_u64(1),
+            &encode_tlv(0x05, &[]),
+        ]);
+        assert!(parse_basic_constraints(&bc).is_err());
+    }
+
+    #[test]
+    fn test_parse_basic_constraints_rejects_malformed_ca_boolean() {
+        // BOOLEAN contents must be exactly one byte.
+        let bc = encode_sequence_from_parts(&[&encode_tlv(0x01, &[])]); // zero-length
+        assert!(parse_basic_constraints(&bc).is_err());
+        let bc = encode_sequence_from_parts(&[&encode_tlv(0x01, &[0xFF, 0xFF])]); // two bytes
+        assert!(parse_basic_constraints(&bc).is_err());
+    }
+
+    #[test]
+    fn test_parse_basic_constraints_large_pathlen_not_truncated() {
+        // pathLenConstraint that exceeds u32 must survive as a full u64 (the
+        // u32 narrowing/rejection is the caller's concern, not this parser's).
+        let big = encode_sequence_from_parts(&[
+            &encode_boolean(true),
+            &encode_integer_u64(0x1_0000_0001),
+        ]);
+        assert_eq!(
+            parse_basic_constraints(&big).unwrap(),
+            (true, Some(0x1_0000_0001))
+        );
     }
 
     #[test]
