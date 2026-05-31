@@ -55,6 +55,19 @@ impl ChainBuilder {
     ///
     /// Returns the chain as a vector of DER-encoded certificates,
     /// starting with the leaf and ending with (but not including) the trust anchor.
+    ///
+    /// # Warning — ordering only, NOT a verified chain (L-2)
+    ///
+    /// This assembles certificates into issuer order by **name matching only**.
+    /// It performs **no signature verification** and applies **no trust
+    /// decision** — the returned chain is untrusted candidate material. You
+    /// **MUST** pass it to [`crate::trust::TrustStore::verify_chain`] (which
+    /// verifies every link's signature and the anchor) before relying on it.
+    ///
+    /// Additionally, this method fetches issuer certificates from the AIA
+    /// `caIssuers` URLs embedded in the (attacker-influenced) certificate, i.e.
+    /// it performs outbound requests to URLs taken from untrusted input (an SSRF
+    /// surface). Only call it with a hardened HTTP client / network policy.
     pub async fn build_chain(
         &self,
         leaf: &Certificate,
@@ -119,6 +132,14 @@ impl ChainBuilder {
     ///
     /// This is used when certificates are already embedded in the CMS
     /// SignedData. It orders them into a proper chain.
+    ///
+    /// # Warning — ordering only, NOT a verified chain (L-2)
+    ///
+    /// Certificates are ordered by **issuer/subject name matching only**, with
+    /// **no signature verification** and **no trust decision**. The result is
+    /// untrusted candidate material that you **MUST** hand to
+    /// [`crate::trust::TrustStore::verify_chain`] (which checks every link's
+    /// signature and the trust anchor) before relying on it.
     pub fn build_chain_from_certs(
         leaf: &Certificate,
         available_certs: &[Certificate],
@@ -128,10 +149,12 @@ impl ChainBuilder {
         let mut current = leaf.clone();
 
         for _ in 0..MAX_CHAIN_DEPTH {
-            let current_der = current.to_der().unwrap_or_default();
-            if current_der.is_empty() {
+            // A re-encode failure on an already-parsed certificate is not
+            // expected; stop extending the chain rather than emitting an empty
+            // DER entry (which verify_chain would reject anyway).
+            let Ok(current_der) = current.to_der() else {
                 break;
-            }
+            };
             chain.push(current_der);
 
             // Check if we reached a trust anchor

@@ -48,6 +48,109 @@ use crate::error::TrustError;
 const OID_MGF1: const_oid::ObjectIdentifier =
     const_oid::ObjectIdentifier::new_unwrap("1.2.840.113549.1.1.8");
 
+/// id-ecPublicKey (1.2.840.10045.2.1) — the SPKI algorithm OID for EC keys.
+const OID_EC_PUBLIC_KEY: const_oid::ObjectIdentifier =
+    const_oid::ObjectIdentifier::new_unwrap("1.2.840.10045.2.1");
+
+/// secp256r1 / P-256 named-curve OID (1.2.840.10045.3.1.7).
+const OID_CURVE_P256: const_oid::ObjectIdentifier =
+    const_oid::ObjectIdentifier::new_unwrap("1.2.840.10045.3.1.7");
+
+/// secp384r1 / P-384 named-curve OID (1.3.132.0.34).
+const OID_CURVE_P384: const_oid::ObjectIdentifier =
+    const_oid::ObjectIdentifier::new_unwrap("1.3.132.0.34");
+
+/// secp521r1 / P-521 named-curve OID (1.3.132.0.35).
+const OID_CURVE_P521: const_oid::ObjectIdentifier =
+    const_oid::ObjectIdentifier::new_unwrap("1.3.132.0.35");
+
+/// The NIST prime curve a verifying key is defined over, read from its SPKI
+/// named-curve parameter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EcCurve {
+    P256,
+    P384,
+    P521,
+}
+
+/// The hash a declared ECDSA signature-algorithm OID selects.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EcdsaHash {
+    Sha1,
+    Sha256,
+    Sha384,
+    Sha512,
+}
+
+/// Determine the NIST curve a public key is defined over by decoding its SPKI
+/// `AlgorithmIdentifier`. Requires `id-ecPublicKey` with a recognized
+/// named-curve OID parameter; anything else is rejected.
+fn ec_named_curve(spki_der: &[u8]) -> Result<EcCurve, TrustError> {
+    use der::Decode;
+    use spki::SubjectPublicKeyInfoRef;
+
+    let spki = SubjectPublicKeyInfoRef::from_der(spki_der)
+        .map_err(|e| TrustError::SignatureVerification(format!("SPKI decode failed: {e}")))?;
+    if spki.algorithm.oid != OID_EC_PUBLIC_KEY {
+        return Err(TrustError::SignatureVerification(format!(
+            "ECDSA signature but SPKI algorithm is not id-ecPublicKey (got {})",
+            spki.algorithm.oid
+        )));
+    }
+    let params = spki.algorithm.parameters.ok_or_else(|| {
+        TrustError::SignatureVerification("EC SPKI is missing its namedCurve parameter".into())
+    })?;
+    let curve_oid: const_oid::ObjectIdentifier = params.decode_as().map_err(|e| {
+        TrustError::SignatureVerification(format!("EC namedCurve parameter is not an OID: {e}"))
+    })?;
+
+    if curve_oid == OID_CURVE_P256 {
+        Ok(EcCurve::P256)
+    } else if curve_oid == OID_CURVE_P384 {
+        Ok(EcCurve::P384)
+    } else if curve_oid == OID_CURVE_P521 {
+        Ok(EcCurve::P521)
+    } else {
+        Err(TrustError::SignatureVerification(format!(
+            "unsupported EC named curve OID: {curve_oid}"
+        )))
+    }
+}
+
+/// Verify an ECDSA signature, binding the verifying key's curve (read from the
+/// SPKI) to the hash the signature-algorithm OID declared (finding L-8).
+///
+/// Previously the dispatcher tried each curve in turn via `or_else`, so e.g. a
+/// P-521 key could satisfy an `ecdsa-with-SHA256` OID — a curve/hash strength
+/// mismatch. Here the curve is taken from the key and only the conformant
+/// (curve, hash) pairings are accepted; the unusual-but-real P-521-with-SHA-256
+/// and P-521-with-SHA-384 combinations seen on some self-signed certificates are
+/// kept, but cross-curve guesses are rejected.
+fn verify_ecdsa_bound(
+    tbs: &[u8],
+    sig: &[u8],
+    spki_der: &[u8],
+    hash: EcdsaHash,
+) -> Result<(), TrustError> {
+    let curve = ec_named_curve(spki_der)?;
+    match (curve, hash) {
+        (EcCurve::P256, EcdsaHash::Sha256) => verify_ecdsa_p256_signature(tbs, sig, spki_der),
+        (EcCurve::P384, EcdsaHash::Sha384) => verify_ecdsa_p384_signature(tbs, sig, spki_der),
+        (EcCurve::P521, EcdsaHash::Sha512) => verify_ecdsa_p521_signature(tbs, sig, spki_der),
+        (EcCurve::P521, EcdsaHash::Sha256) => {
+            verify_ecdsa_p521_sha256_signature(tbs, sig, spki_der)
+        }
+        (EcCurve::P521, EcdsaHash::Sha384) => {
+            verify_ecdsa_p521_sha384_signature(tbs, sig, spki_der)
+        }
+        (EcCurve::P256, EcdsaHash::Sha1) => verify_ecdsa_p256_sha1_signature(tbs, sig, spki_der),
+        (EcCurve::P384, EcdsaHash::Sha1) => verify_ecdsa_p384_sha1_signature(tbs, sig, spki_der),
+        (curve, hash) => Err(TrustError::SignatureVerification(format!(
+            "ECDSA curve {curve:?} is not a supported pairing with the declared {hash:?} hash"
+        ))),
+    }
+}
+
 /// Policy controlling whether signatures over weak/deprecated digests are
 /// accepted (finding H-1).
 ///
@@ -197,26 +300,15 @@ pub fn verify_signature_by_oid_with_policy(
     }
     // --- Legacy ECDSA (only reachable under allow_legacy) ---
     else if *sig_alg_oid == OID_ECDSA_WITH_SHA1 {
-        // ECDSA-SHA1: try P-256 first, then P-384
-        verify_ecdsa_p256_sha1_signature(tbs_bytes, signature_bytes, spki_der)
-            .or_else(|_| verify_ecdsa_p384_sha1_signature(tbs_bytes, signature_bytes, spki_der))
+        verify_ecdsa_bound(tbs_bytes, signature_bytes, spki_der, EcdsaHash::Sha1)
     }
-    // --- Modern ECDSA ---
+    // --- Modern ECDSA — the curve is taken from the key (L-8) ---
     else if *sig_alg_oid == db::rfc5912::ECDSA_WITH_SHA_256 {
-        // ECDSA-SHA256: try P-256 first, then P-384, then P-521
-        // P-521 with SHA-256 is unusual but occurs with self-signed certs
-        verify_ecdsa_p256_signature(tbs_bytes, signature_bytes, spki_der)
-            .or_else(|_| verify_ecdsa_p384_signature(tbs_bytes, signature_bytes, spki_der))
-            .or_else(|_| verify_ecdsa_p521_sha256_signature(tbs_bytes, signature_bytes, spki_der))
+        verify_ecdsa_bound(tbs_bytes, signature_bytes, spki_der, EcdsaHash::Sha256)
     } else if *sig_alg_oid == db::rfc5912::ECDSA_WITH_SHA_384 {
-        // ECDSA-SHA384: try P-384 first, then P-256, then P-521
-        verify_ecdsa_p384_signature(tbs_bytes, signature_bytes, spki_der)
-            .or_else(|_| verify_ecdsa_p256_signature(tbs_bytes, signature_bytes, spki_der))
-            .or_else(|_| verify_ecdsa_p521_sha384_signature(tbs_bytes, signature_bytes, spki_der))
+        verify_ecdsa_bound(tbs_bytes, signature_bytes, spki_der, EcdsaHash::Sha384)
     } else if *sig_alg_oid == db::rfc5912::ECDSA_WITH_SHA_512 {
-        // ECDSA-SHA512: try P-521 first, then P-384
-        verify_ecdsa_p521_signature(tbs_bytes, signature_bytes, spki_der)
-            .or_else(|_| verify_ecdsa_p384_signature(tbs_bytes, signature_bytes, spki_der))
+        verify_ecdsa_bound(tbs_bytes, signature_bytes, spki_der, EcdsaHash::Sha512)
     } else if *sig_alg_oid == OID_ED25519 {
         verify_ed25519_signature(tbs_bytes, signature_bytes, spki_der)
     } else {
@@ -381,6 +473,19 @@ pub fn verify_certificate_signature_with_policy(
     policy: &SignaturePolicy,
 ) -> Result<(), TrustError> {
     use der::Encode;
+
+    // RFC 5280 §4.1.1.2: the outer `signatureAlgorithm` field MUST contain the
+    // same algorithm identifier as the `signature` field inside the (signed)
+    // `tbsCertificate`. Only the inner one is covered by the signature; a
+    // mismatch means the unauthenticated outer field was altered (e.g. an
+    // algorithm-substitution attempt), so reject before any crypto (L-5).
+    if cert.signature_algorithm != cert.tbs_certificate.signature {
+        return Err(TrustError::SignatureVerification(format!(
+            "certificate outer signatureAlgorithm ({}) does not match the signed \
+             tbsCertificate.signature ({})",
+            cert.signature_algorithm.oid, cert.tbs_certificate.signature.oid
+        )));
+    }
 
     let issuer_spki = &issuer.tbs_certificate.subject_public_key_info;
 
@@ -891,6 +996,89 @@ mod tests {
         assert!(
             !err_msg.contains("unsupported"),
             "Ed25519 should be dispatched, not unsupported: {err_msg}"
+        );
+    }
+
+    #[test]
+    fn test_outer_inner_signature_algorithm_mismatch_rejected() {
+        // L-5: a certificate whose outer signatureAlgorithm differs from the
+        // signed tbsCertificate.signature must be rejected (RFC 5280 §4.1.1.2)
+        // before any signature math.
+        let ca_pem = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/ca_cert.pem"
+        ));
+        let ca = load_test_cert(ca_pem);
+
+        // Sanity: untampered self-signed CA verifies.
+        verify_certificate_signature(&ca, &ca).expect("untampered CA must verify");
+
+        // Tamper only the (unauthenticated) outer signatureAlgorithm.
+        let mut tampered = ca.clone();
+        tampered.signature_algorithm = spki::AlgorithmIdentifierOwned {
+            oid: const_oid::db::rfc5912::SHA_384_WITH_RSA_ENCRYPTION,
+            parameters: None,
+        };
+        let err = verify_certificate_signature(&tampered, &ca).unwrap_err();
+        assert!(
+            matches!(err, TrustError::SignatureVerification(ref m) if m.contains("does not match")),
+            "outer/inner signatureAlgorithm mismatch must be rejected, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn test_ecdsa_curve_is_bound_to_declared_hash() {
+        // L-8: ECDSA verification dispatches on the SPKI named curve. A P-256
+        // key + ecdsa-with-SHA256 verifies; the same key under a SHA-512-declared
+        // OID is rejected as an unsupported curve/hash pairing (no cross-curve
+        // trial-and-error).
+        use const_oid::db;
+        use p256::ecdsa::{signature::Signer, Signature, SigningKey};
+        use rsa::pkcs8::EncodePublicKey;
+
+        let sk = SigningKey::random(&mut rand::thread_rng());
+        let spki_der = sk
+            .verifying_key()
+            .to_public_key_der()
+            .unwrap()
+            .as_bytes()
+            .to_vec();
+
+        // ec_named_curve recognizes the P-256 SPKI.
+        assert_eq!(ec_named_curve(&spki_der).unwrap(), EcCurve::P256);
+
+        let msg = b"message bound to a P-256 ECDSA signature";
+        let sig: Signature = sk.sign(msg);
+        let sig_der = sig.to_der().as_bytes().to_vec();
+
+        // Correct pairing verifies.
+        verify_signature_by_oid(msg, &sig_der, &spki_der, &db::rfc5912::ECDSA_WITH_SHA_256)
+            .expect("P-256 + ecdsa-with-SHA256 must verify");
+
+        // Mismatched declared hash for a P-256 key is rejected (not silently
+        // retried against another curve).
+        let err =
+            verify_signature_by_oid(msg, &sig_der, &spki_der, &db::rfc5912::ECDSA_WITH_SHA_512)
+                .unwrap_err();
+        assert!(
+            matches!(err, TrustError::SignatureVerification(_)),
+            "P-256 key under a SHA-512 ECDSA OID must be rejected, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn test_ec_named_curve_rejects_non_ec_key() {
+        // An RSA SPKI under the ECDSA path must be rejected, not misdispatched.
+        let ca_pem = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/ca_cert.pem"
+        ));
+        let ca = load_test_cert(ca_pem);
+        let spki_der = der::Encode::to_der(&ca.tbs_certificate.subject_public_key_info).unwrap();
+        let err = ec_named_curve(&spki_der).unwrap_err();
+        assert!(
+            matches!(err, TrustError::SignatureVerification(ref m) if m.contains("id-ecPublicKey")),
+            "RSA SPKI must be rejected by ec_named_curve, got {err:?}"
         );
     }
 }

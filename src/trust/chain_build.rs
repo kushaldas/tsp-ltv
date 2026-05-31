@@ -209,17 +209,24 @@ mod tests {
         .build()
         .unwrap();
 
-        let tbs_der = base.tbs_certificate.to_der().unwrap();
+        // Set the inner tbsCertificate.signature to SHA-1 as well, so the
+        // certificate is well-formed (outer == inner per RFC 5280 §4.1.1.2) and
+        // genuinely SHA-1-signed — exercising the weak-digest gate, not the
+        // signatureAlgorithm-mismatch check (L-5).
+        let sha1_algid = AlgorithmIdentifierOwned {
+            oid: crate::crypto::algorithm::OID_SHA1_WITH_RSA,
+            parameters: Some(Any::from_der(&[0x05, 0x00]).unwrap()),
+        };
+        let mut tbs = base.tbs_certificate.clone();
+        tbs.signature = sha1_algid.clone();
+        let tbs_der = tbs.to_der().unwrap();
         let hash = Sha1::digest(&tbs_der);
         let sig = issuer_key
             .sign(Pkcs1v15Sign::new::<Sha1>(), &hash)
             .expect("SHA-1 RSA sign");
         let leaf = Certificate {
-            tbs_certificate: base.tbs_certificate.clone(),
-            signature_algorithm: AlgorithmIdentifierOwned {
-                oid: crate::crypto::algorithm::OID_SHA1_WITH_RSA,
-                parameters: Some(Any::from_der(&[0x05, 0x00]).unwrap()),
-            },
+            tbs_certificate: tbs,
+            signature_algorithm: sha1_algid,
             signature: BitString::from_bytes(&sig).unwrap(),
         };
 

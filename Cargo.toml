@@ -1,6 +1,6 @@
 [package]
 name = "tsp-ltv"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 rust-version = "1.75"
 description = "Shared timestamping (RFC 3161) and long-term validation (OCSP, CRL, trust stores) infrastructure for AdES signatures"
@@ -71,6 +71,7 @@ reqwest = { version = "0.12", default-features = false, features = [
   "rustls-tls",
 ], optional = true }
 tokio = { version = "1", features = ["rt", "macros", "time"], optional = true }
+subtle = "2"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }

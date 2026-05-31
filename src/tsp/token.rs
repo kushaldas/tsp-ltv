@@ -241,39 +241,56 @@ pub fn parse_timestamp_response(der_bytes: &[u8]) -> Result<TimeStampResp, TspEr
     let mut failure_info = None;
     let mut remaining = status_rest;
 
+    // Each remaining element of PKIStatusInfo is a well-formed TLV. A structural
+    // parse failure here means the response is malformed, so fail hard rather
+    // than silently truncating the optional statusString/failureInfo (L-6).
     while !remaining.is_empty() {
-        if let Ok((stag, sbody, srest)) = der_utils::parse_tlv_with_rest(remaining) {
-            match stag {
-                // SEQUENCE OF UTF8String (statusString)
-                0x30 => {
-                    // Try to extract the first UTF8String
-                    if let Ok((_inner_tag, inner_body, _)) = der_utils::parse_tlv_with_rest(sbody) {
-                        status_string = Some(String::from_utf8_lossy(inner_body).to_string());
-                    }
+        let (stag, sbody, srest) = der_utils::parse_tlv_with_rest(remaining).map_err(|e| {
+            TspError::InvalidResponse(format!("malformed PKIStatusInfo field: {e}"))
+        })?;
+        match stag {
+            // statusString PKIFreeText ::= SEQUENCE SIZE (1..MAX) OF UTF8String
+            0x30 => {
+                // The first element MUST be a UTF8String (tag 0x0C) carrying
+                // valid UTF-8. Reject any other ASN.1 type and reject invalid
+                // UTF-8 rather than lossily normalizing it (L-6).
+                let (inner_tag, inner_body, _) =
+                    der_utils::parse_tlv_with_rest(sbody).map_err(|e| {
+                        TspError::InvalidResponse(format!("malformed statusString: {e}"))
+                    })?;
+                if inner_tag != 0x0C {
+                    return Err(TspError::InvalidResponse(format!(
+                        "statusString element is not a UTF8String (tag 0x0c), got 0x{inner_tag:02x}"
+                    )));
                 }
-                // BIT STRING (failureInfo)
-                0x03 => {
-                    failure_info = Some(sbody.to_vec());
-                }
-                _ => {}
+                let text = std::str::from_utf8(inner_body).map_err(|e| {
+                    TspError::InvalidResponse(format!("statusString is not valid UTF-8: {e}"))
+                })?;
+                status_string = Some(text.to_string());
             }
-            remaining = srest;
-        } else {
-            break;
+            // BIT STRING (failureInfo)
+            0x03 => {
+                failure_info = Some(sbody.to_vec());
+            }
+            _ => {}
         }
+        remaining = srest;
     }
 
     // Second element: TimeStampToken OPTIONAL
     let token_der = if !rest.is_empty() {
-        // The token is a ContentInfo (SEQUENCE)
+        // The token is a ContentInfo (SEQUENCE). If something is present here it
+        // must be a structurally valid SEQUENCE; anything else is malformed and
+        // is rejected rather than silently dropped (L-6).
         let (token_tag, _, _) = der_utils::parse_tlv_with_rest(rest)
             .map_err(|e| TspError::InvalidResponse(format!("failed to parse token TLV: {e}")))?;
-        if token_tag == 0x30 {
-            // Re-encode the entire TLV (tag + length + value) as the token DER
-            Some(rest.to_vec())
-        } else {
-            None
+        if token_tag != 0x30 {
+            return Err(TspError::InvalidResponse(format!(
+                "expected TimeStampToken SEQUENCE (0x30), got 0x{token_tag:02x}"
+            )));
         }
+        // Re-encode the entire TLV (tag + length + value) as the token DER
+        Some(rest.to_vec())
     } else {
         None
     };
@@ -601,7 +618,14 @@ fn check_tst_info_matches(
     expected_nonce: Option<u64>,
     digest_algorithm: DigestAlgorithm,
 ) -> Result<(), TspError> {
-    if tst_info.message_hash != expected_hash {
+    use subtle::ConstantTimeEq;
+
+    // Compare the messageImprint hash in constant time (L-7). These are public,
+    // locally-derived values so the risk is low, but a constant-time compare is
+    // cheap defense-in-depth and avoids leaking a match-prefix length.
+    let hash_matches = tst_info.message_hash.len() == expected_hash.len()
+        && bool::from(tst_info.message_hash.ct_eq(expected_hash));
+    if !hash_matches {
         return Err(TspError::InvalidResponse(
             "TSTInfo messageImprint hash does not match request".into(),
         ));
@@ -616,7 +640,8 @@ fn check_tst_info_matches(
 
     if let Some(expected) = expected_nonce {
         match tst_info.nonce {
-            Some(actual) if actual == expected => {}
+            // Constant-time nonce comparison (L-7).
+            Some(actual) if bool::from(actual.ct_eq(&expected)) => {}
             Some(actual) => {
                 return Err(TspError::InvalidResponse(format!(
                     "nonce mismatch: expected {expected}, got {actual}"
@@ -1311,6 +1336,90 @@ mod tests {
         let resp = parse_timestamp_response(&resp_der).unwrap();
         assert_eq!(resp.status, PkiStatus::Rejection);
         assert!(resp.token_der.is_none());
+    }
+
+    #[test]
+    fn test_parse_timestamp_response_rejects_malformed_status_field() {
+        // L-6: a structurally malformed element inside PKIStatusInfo must be a
+        // hard error, not silently dropped. Status INTEGER 0 (granted) followed
+        // by a SEQUENCE whose declared length overruns the buffer.
+        let mut status_body = der_utils::encode_integer_u64(0);
+        status_body.extend_from_slice(&[0x30, 0x05, 0x01]); // truncated SEQUENCE
+        let status_info = der_utils::encode_sequence_raw(&status_body);
+        let resp_der = der_utils::encode_sequence_raw(&status_info);
+
+        let err = parse_timestamp_response(&resp_der)
+            .expect_err("malformed PKIStatusInfo field must be rejected");
+        assert!(
+            matches!(err, TspError::InvalidResponse(_)),
+            "expected InvalidResponse, got {err:?}"
+        );
+    }
+
+    /// Build a `TimeStampResp` whose PKIStatusInfo carries a rejection status
+    /// and a `statusString` SEQUENCE wrapping a single element with `inner_tag`
+    /// / `inner_body`, so tests can supply a non-UTF8String or invalid UTF-8.
+    fn resp_with_status_string(inner_tag: u8, inner_body: &[u8]) -> Vec<u8> {
+        let status_int = der_utils::encode_integer_u64(2); // rejection
+        let free_text =
+            der_utils::encode_sequence_raw(&der_utils::encode_tlv(inner_tag, inner_body));
+        let mut status_body = status_int;
+        status_body.extend_from_slice(&free_text);
+        let status_info = der_utils::encode_sequence_raw(&status_body);
+        der_utils::encode_sequence_raw(&status_info)
+    }
+
+    #[test]
+    fn test_parse_timestamp_response_accepts_valid_status_string() {
+        // A well-formed UTF8String statusString is decoded.
+        let resp_der = resp_with_status_string(0x0C, "rejected: bad request".as_bytes());
+        let resp = parse_timestamp_response(&resp_der).unwrap();
+        assert_eq!(resp.status, PkiStatus::Rejection);
+        assert_eq!(resp.status_string.as_deref(), Some("rejected: bad request"));
+    }
+
+    #[test]
+    fn test_parse_timestamp_response_rejects_non_utf8string_status() {
+        // L-6: PKIFreeText elements are UTF8String; an OCTET STRING (or any other
+        // type) inside statusString must be rejected, not accepted blindly.
+        let resp_der = resp_with_status_string(0x04, b"not a utf8string"); // OCTET STRING
+        let err = parse_timestamp_response(&resp_der)
+            .expect_err("non-UTF8String statusString must be rejected");
+        assert!(
+            matches!(err, TspError::InvalidResponse(ref m) if m.contains("UTF8String")),
+            "expected UTF8String tag rejection, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn test_parse_timestamp_response_rejects_invalid_utf8_status() {
+        // L-6: invalid UTF-8 inside a UTF8String must be rejected, not lossily
+        // normalized.
+        let resp_der = resp_with_status_string(0x0C, &[0xFF, 0xFE, 0xFD]);
+        let err = parse_timestamp_response(&resp_der)
+            .expect_err("invalid UTF-8 statusString must be rejected");
+        assert!(
+            matches!(err, TspError::InvalidResponse(ref m) if m.contains("UTF-8")),
+            "expected invalid-UTF-8 rejection, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn test_parse_timestamp_response_rejects_non_sequence_token() {
+        // L-6: a non-SEQUENCE where the optional TimeStampToken is expected is
+        // malformed and must be rejected rather than yielding token_der = None.
+        let status_info = der_utils::encode_sequence_raw(&der_utils::encode_integer_u64(0));
+        let mut body = status_info;
+        // Append a bogus token: an INTEGER instead of a ContentInfo SEQUENCE.
+        body.extend_from_slice(&der_utils::encode_integer_u64(7));
+        let resp_der = der_utils::encode_sequence_raw(&body);
+
+        let err = parse_timestamp_response(&resp_der)
+            .expect_err("non-SEQUENCE TimeStampToken must be rejected");
+        assert!(
+            matches!(err, TspError::InvalidResponse(_)),
+            "expected InvalidResponse, got {err:?}"
+        );
     }
 
     #[test]
@@ -2153,17 +2262,24 @@ mod tests {
         .unwrap()
         .build()
         .unwrap();
-        let tbs_der = base.tbs_certificate.to_der().unwrap();
+        // Set the inner tbsCertificate.signature to SHA-1 too, so the leaf is
+        // well-formed (outer == inner per RFC 5280 §4.1.1.2) and genuinely
+        // SHA-1-signed — otherwise verify (under allow_legacy) would reject it on
+        // the signatureAlgorithm-mismatch check (L-5) before reaching the curve.
+        let sha1_algid = AlgorithmIdentifierOwned {
+            oid: crate::crypto::algorithm::OID_SHA1_WITH_RSA,
+            parameters: Some(Any::from_der(&[0x05, 0x00]).unwrap()),
+        };
+        let mut tbs = base.tbs_certificate.clone();
+        tbs.signature = sha1_algid.clone();
+        let tbs_der = tbs.to_der().unwrap();
         let hash = Sha1::digest(&tbs_der);
         let sig = real_key
             .sign(Pkcs1v15Sign::new::<Sha1>(), &hash)
             .expect("SHA-1 RSA sign");
         let leaf = Certificate {
-            tbs_certificate: base.tbs_certificate.clone(),
-            signature_algorithm: AlgorithmIdentifierOwned {
-                oid: crate::crypto::algorithm::OID_SHA1_WITH_RSA,
-                parameters: Some(Any::from_der(&[0x05, 0x00]).unwrap()),
-            },
+            tbs_certificate: tbs,
+            signature_algorithm: sha1_algid,
             signature: BitString::from_bytes(&sig).unwrap(),
         };
 
