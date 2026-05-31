@@ -1,0 +1,55 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.toml', '**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Build (all features)
+        run: cargo build --all-features
+
+      - name: Clippy (all features)
+        run: cargo clippy --all-features --tests -- -D warnings
+
+      - name: Run tests (all features)
+        run: cargo test --all-features
+
+      - name: Build (no default features)
+        run: cargo build --no-default-features
+
+      - name: Clippy (no default features)
+        run: cargo clippy --no-default-features --tests -- -D warnings
+
+      - name: Run tests (no default features)
+        run: cargo test --no-default-features
