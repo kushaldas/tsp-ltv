@@ -53,7 +53,23 @@ use crate::ltv::status::{resolve_priority, ValidationStatus};
 /// - 3 second OCSP timeout, 7 second CRL timeout
 /// - Nonces enabled for replay protection
 /// - Revocation checking required (Unknown → error)
+///
+/// # Construction
+///
+/// This struct is `#[non_exhaustive]`: construct it from [`RevocationConfig::default`]
+/// (or [`disabled`](RevocationConfig::disabled) / [`strict`](RevocationConfig::strict))
+/// and adjust fields or use the builder methods, e.g.
+///
+/// ```rust
+/// # use tsp_ltv::ltv::revocation::RevocationConfig;
+/// let mut config = RevocationConfig::default();
+/// config.require_revocation_check = false;
+/// ```
+///
+/// New fields are therefore added without breaking downstream callers — they
+/// never need an exhaustive struct literal.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct RevocationConfig {
     /// Prefer OCSP over CRL when both are available.
     ///
@@ -166,6 +182,20 @@ impl RevocationConfig {
     /// whose risk you have accepted; never for fresh trust decisions.
     pub fn allow_legacy_signatures(mut self) -> Self {
         self.signature_policy = crate::crypto::verify::SignaturePolicy::allow_legacy();
+        self
+    }
+
+    /// Set the OCSP response freshness policy (see
+    /// [`OcspFreshness`](crate::ltv::ocsp::OcspFreshness)).
+    pub fn with_ocsp_freshness(mut self, freshness: crate::ltv::ocsp::OcspFreshness) -> Self {
+        self.ocsp_freshness = freshness;
+        self
+    }
+
+    /// Set the CRL freshness policy (see
+    /// [`CrlFreshness`](crate::ltv::crl::CrlFreshness)).
+    pub fn with_crl_freshness(mut self, freshness: crate::ltv::crl::CrlFreshness) -> Self {
+        self.crl_freshness = freshness;
         self
     }
 }

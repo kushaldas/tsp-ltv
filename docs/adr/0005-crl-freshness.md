@@ -103,7 +103,19 @@ non-determinative) and is unaffected.
   freshness-enforcing with no edits.
 - `RevocationConfig` gains a `crl_freshness` field (default
   `CrlFreshness::default()`), threaded through `run_crl_check`, mirroring how
-  `ocsp_freshness` (ADR 0004) and `signature_policy` (ADR 0003) are threaded.
+  `ocsp_freshness` (ADR 0004) and `signature_policy` (ADR 0003) are threaded. A
+  `with_crl_freshness()` builder (and `with_ocsp_freshness()`) is added.
+  `RevocationConfig` is marked `#[non_exhaustive]` so this field — and future
+  ones — are added without breaking downstream callers, which construct it via
+  `default()`/builders rather than exhaustive struct literals.
+- `CrlClient` gains a fetch-time `freshness` policy (with a `freshness()`
+  builder, default `CrlFreshness::default()`). `fetch_crl` does not serve a
+  cached CRL that has crossed its own `nextUpdate` (it re-fetches), and
+  `fetch_crls_for_cert` returns the first distribution point that both downloads
+  *and* is current — so a stale cache entry or a lagging endpoint cannot force a
+  fail-closed `Invalid` while a fresh CRL is obtainable. This fetch/cache
+  currentness check (`crl_is_current`) is wall-clock based and distinct from the
+  orchestrator's authoritative `validation_time` check.
 
 ## Consequences
 

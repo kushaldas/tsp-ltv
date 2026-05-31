@@ -649,9 +649,18 @@ pub fn verify_crl_signature_with_policy(
 /// failure. This mirrors [`OcspFreshness`](crate::ltv::ocsp::OcspFreshness).
 #[derive(Debug, Clone)]
 pub struct CrlFreshness {
-    /// Clock skew tolerance applied to every time comparison, in both
-    /// directions. Accommodates small differences between the issuer's and the
-    /// validator's clocks. Default: 5 minutes.
+    /// Clock skew tolerance, to accommodate small differences between the
+    /// issuer's and the validator's clocks. Default: 5 minutes.
+    ///
+    /// It widens the **staleness** bound: the authoritative check
+    /// ([`validate_crl_freshness`]) tolerates `now` being up to `clock_skew`
+    /// past `nextUpdate` (or, lacking `nextUpdate`, past the max-age bound). It
+    /// is deliberately *not* applied as a lower bound there — a CRL whose window
+    /// lies at or after the validation instant (later-collected archival
+    /// evidence) is accepted outright, not merely within skew. The fetch/cache
+    /// currentness check ([`crl_is_current`]) additionally uses it as a
+    /// not-yet-valid tolerance, since for caching a CRL whose window is still in
+    /// the future is not yet the issuer's live list.
     pub clock_skew: chrono::Duration,
 
     /// Maximum age (measured from `thisUpdate`) tolerated for a CRL that omits
@@ -1395,6 +1404,16 @@ mod tests {
         ))
     }
 
+    /// A UTCTime string (`"YYMMDDHHMMSSZ"`) `days_offset` days from *now*. Used by
+    /// the wall-clock-driven fetch/cache tests so they never time-bomb when the
+    /// real date moves past a hard-coded window (`fetch_crl` compares against
+    /// `Utc::now()` internally, so the window must track the wall clock).
+    fn utctime_from_now(days_offset: i64) -> String {
+        (chrono::Utc::now() + chrono::Duration::days(days_offset))
+            .format("%y%m%d%H%M%SZ")
+            .to_string()
+    }
+
     #[test]
     fn test_crl_is_current_within_window() {
         let Some(der) = build_crl_or_skip("260101000000Z", Some("270101000000Z")) else {
@@ -1452,13 +1471,14 @@ mod tests {
     #[tokio::test]
     async fn test_fetch_crl_serves_fresh_cache_entry() {
         // A cached CRL that is within both the grace period and its own validity
-        // window is served without touching the network.
-        let Some(der) = build_crl_or_skip("260101000000Z", Some("270101000000Z")) else {
+        // window is served without touching the network. The window is built
+        // relative to `Utc::now()` so the test is wall-clock-independent.
+        let this_update = utctime_from_now(-1);
+        let next_update = utctime_from_now(365);
+        let Some(der) = build_crl_or_skip(&this_update, Some(&next_update)) else {
             eprintln!("skipping: intermediate_ca_key.pem not found");
             return;
         };
-        // Use a freshness policy anchored so "now" sits inside the 2026 window.
-        // (CrlClient uses wall-clock now; today is within 2026-01-01..2027-01-01.)
         let client = CrlClient::new();
         let url = "http://crl.invalid.example/fresh.crl";
         client.cache.lock().unwrap().insert(
@@ -1481,8 +1501,11 @@ mod tests {
         // A cached CRL that has crossed its nextUpdate must NOT be served even
         // though it is within the grace period; the client falls through to a
         // network fetch (which here fails against an unreachable host), proving it
-        // did not return the stale cached object.
-        let Some(stale) = build_crl_or_skip("200101000000Z", Some("210101000000Z")) else {
+        // did not return the stale cached object. The window is built relative to
+        // `Utc::now()` (a year-old, year-expired CRL) so the test never time-bombs.
+        let this_update = utctime_from_now(-730);
+        let next_update = utctime_from_now(-365);
+        let Some(stale) = build_crl_or_skip(&this_update, Some(&next_update)) else {
             eprintln!("skipping: intermediate_ca_key.pem not found");
             return;
         };
