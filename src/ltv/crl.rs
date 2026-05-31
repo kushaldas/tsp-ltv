@@ -114,11 +114,26 @@ impl CrlClient {
     ///
     /// A cached entry is only served while it is both within the local cache
     /// grace period *and* still inside its own `thisUpdate`/`nextUpdate` validity
-    /// window (as of the wall clock). A cached CRL that has crossed its
-    /// `nextUpdate` is treated as a cache miss and re-fetched, so the freshness
-    /// enforcement in [`check_revocation`] never hard-fails on a superseded CRL
-    /// that the issuer has already replaced.
+    /// window (as of the wall clock), per this client's [`freshness`](Self::freshness)
+    /// policy. A cached CRL that has crossed its `nextUpdate` is treated as a cache
+    /// miss and re-fetched, so the freshness enforcement in [`check_revocation`]
+    /// never hard-fails on a superseded CRL that the issuer has already replaced.
     pub async fn fetch_crl(&self, url: &str) -> Result<Vec<u8>, LtvError> {
+        self.fetch_crl_with_freshness(url, &self.freshness).await
+    }
+
+    /// Like [`fetch_crl`](Self::fetch_crl) but uses an explicit [`CrlFreshness`]
+    /// for the cache-currentness decision instead of this client's default.
+    ///
+    /// The revocation orchestrator uses this so the *same* freshness policy
+    /// (`RevocationConfig::crl_freshness`) governs the cache/fetch selection and
+    /// the authoritative [`check_revocation`] check — a caller who widens the
+    /// policy is never blocked by a stricter default at the fetch layer.
+    pub async fn fetch_crl_with_freshness(
+        &self,
+        url: &str,
+        freshness: &CrlFreshness,
+    ) -> Result<Vec<u8>, LtvError> {
         // Check cache first
         {
             let cache = self
@@ -127,7 +142,7 @@ impl CrlClient {
                 .map_err(|e| LtvError::Crl(format!("cache lock poisoned: {e}")))?;
             if let Some(entry) = cache.get(url) {
                 if entry.fetched_at.elapsed() < self.grace_period
-                    && crl_is_current(&entry.der, chrono::Utc::now(), &self.freshness)
+                    && crl_is_current(&entry.der, chrono::Utc::now(), freshness)
                 {
                     log::debug!("CRL cache hit for {url}");
                     return Ok(entry.der.clone());
@@ -199,19 +214,39 @@ impl CrlClient {
     /// fail-closed (`Invalid`) decision — rather than the caller silently seeing
     /// "no CRL" (`Unknown`). When nothing downloads at all, an empty vec is
     /// returned (→ `Unknown`), unchanged from before.
+    ///
+    /// Currentness is judged by this client's [`freshness`](Self::freshness)
+    /// policy; use [`fetch_crls_for_cert_with_freshness`](Self::fetch_crls_for_cert_with_freshness)
+    /// to supply an explicit one.
     pub async fn fetch_crls_for_cert(&self, cert: &Certificate) -> Result<Vec<Vec<u8>>, LtvError> {
+        self.fetch_crls_for_cert_with_freshness(cert, &self.freshness)
+            .await
+    }
+
+    /// Like [`fetch_crls_for_cert`](Self::fetch_crls_for_cert) but uses an
+    /// explicit [`CrlFreshness`] for distribution-point selection and the
+    /// cache-currentness decision.
+    ///
+    /// The revocation orchestrator passes `RevocationConfig::crl_freshness` here
+    /// so a single policy governs both the fetch/cache selection and the
+    /// authoritative [`check_revocation`] check.
+    pub async fn fetch_crls_for_cert_with_freshness(
+        &self,
+        cert: &Certificate,
+        freshness: &CrlFreshness,
+    ) -> Result<Vec<Vec<u8>>, LtvError> {
         let urls = Self::extract_crl_urls(cert);
         let mut stale_fallback: Option<Vec<u8>> = None;
 
         for url in &urls {
-            match self.fetch_crl(url).await {
+            match self.fetch_crl_with_freshness(url, freshness).await {
                 Ok(crl) => {
                     // Evaluate currentness at the moment this CRL is checked, not
                     // at a timestamp captured before the (possibly slow) fetches —
                     // otherwise an endpoint that crosses nextUpdate while earlier
                     // fetches run could still be returned and then rejected
                     // downstream, shadowing a later fresh distribution point.
-                    if crl_is_current(&crl, chrono::Utc::now(), &self.freshness) {
+                    if crl_is_current(&crl, chrono::Utc::now(), freshness) {
                         // Current CRL at this distribution point — authoritative.
                         return Ok(vec![crl]);
                     }

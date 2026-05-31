@@ -466,8 +466,15 @@ async fn run_crl_check(
 
     // Apply CRL-specific timeout
     let result = tokio::time::timeout(config.crl_timeout, async {
-        // Fetch CRL(s) for this certificate
-        match crl_client.fetch_crls_for_cert(cert).await {
+        // Fetch CRL(s) for this certificate. Thread the *configured* CRL
+        // freshness into the fetch/cache selection so a single policy governs
+        // both which CRL is chosen and the authoritative freshness check below —
+        // a caller who widens `crl_freshness` is never blocked by a stricter
+        // default at the fetch layer.
+        match crl_client
+            .fetch_crls_for_cert_with_freshness(cert, &config.crl_freshness)
+            .await
+        {
             Ok(crls) => {
                 if crls.is_empty() {
                     return ValidationStatus::Unknown {

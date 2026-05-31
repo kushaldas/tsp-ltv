@@ -118,6 +118,15 @@ non-determinative) and is unaffected.
   fail-closed `Invalid` while a fresh CRL is obtainable. This fetch/cache
   currentness check (`crl_is_current`) is wall-clock based and distinct from the
   orchestrator's authoritative `validation_time` check.
+- **Single policy source in the orchestrator path.** To avoid the fetch/cache
+  layer applying a *different* (e.g. stricter default) freshness than the
+  configured one, `fetch_crl`/`fetch_crls_for_cert` have `_with_freshness`
+  variants, and `run_crl_check` threads `RevocationConfig::crl_freshness` through
+  the selection *and* the authoritative check. A caller who widens
+  `crl_freshness` (e.g. to accept `nextUpdate`-less CRLs older than 24h) is then
+  never blocked at the fetch layer by a default `CrlClient`. The bare
+  `CrlClient::freshness` field only governs direct, non-orchestrated
+  `fetch_crl`/`fetch_crls_for_cert` calls.
 
 ## Consequences
 
