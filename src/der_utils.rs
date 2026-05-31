@@ -236,22 +236,27 @@ pub fn parse_basic_constraints(ext_value: &[u8]) -> Result<(bool, Option<u64>), 
         }
     }
 
-    // pathLenConstraint INTEGER (optional). Likewise fail closed on a malformed
-    // INTEGER rather than treating it as "no constraint".
+    // pathLenConstraint INTEGER (optional). Any remaining child here MUST be the
+    // pathLenConstraint INTEGER — a different tag (or trailing data) is malformed
+    // and must fail closed, not be silently ignored, otherwise a bogus
+    // BasicConstraints on a subordinate CA could be undercounted.
     if !pos.is_empty() {
-        let (t, value, _rest) = parse_tlv_with_rest(pos)
+        let (t, value, rest) = parse_tlv_with_rest(pos)
             .map_err(|e| format!("basicConstraints pathLenConstraint: {e}"))?;
-        if t == 0x02 {
-            // RFC 5280 §4.2.1.9: pathLenConstraint is meaningful only when cA is
-            // asserted. Reject `pathLenConstraint` without `cA:TRUE` rather than
-            // returning a constraint for a non-CA certificate.
-            if !is_ca {
-                return Err(
-                    "basicConstraints: pathLenConstraint present without cA:TRUE".to_string(),
-                );
-            }
-            path_len =
-                Some(decode_integer_u64(value).map_err(|e| format!("pathLenConstraint: {e}"))?);
+        if t != 0x02 {
+            return Err(format!(
+                "basicConstraints: unexpected element 0x{t:02x} (expected pathLenConstraint INTEGER)"
+            ));
+        }
+        // RFC 5280 §4.2.1.9: pathLenConstraint is meaningful only when cA is
+        // asserted. Reject `pathLenConstraint` without `cA:TRUE` rather than
+        // returning a constraint for a non-CA certificate.
+        if !is_ca {
+            return Err("basicConstraints: pathLenConstraint present without cA:TRUE".to_string());
+        }
+        path_len = Some(decode_integer_u64(value).map_err(|e| format!("pathLenConstraint: {e}"))?);
+        if !rest.is_empty() {
+            return Err("basicConstraints: trailing data after pathLenConstraint".to_string());
         }
     }
 
@@ -488,6 +493,24 @@ mod tests {
         let bc = encode_sequence_from_parts(&[&encode_integer_u64(0)]); // INTEGER only
         assert!(parse_basic_constraints(&bc).is_err());
         let bc = encode_sequence_from_parts(&[&encode_boolean(false), &encode_integer_u64(1)]);
+        assert!(parse_basic_constraints(&bc).is_err());
+    }
+
+    #[test]
+    fn test_parse_basic_constraints_rejects_unexpected_child() {
+        // A child after cA that is not a pathLenConstraint INTEGER is malformed
+        // and must fail closed (not be silently ignored, leaving path_len=None).
+        let bc = encode_sequence_from_parts(&[
+            &encode_boolean(true),
+            &encode_tlv(0x05, &[]), // NULL where pathLen INTEGER is expected
+        ]);
+        assert!(parse_basic_constraints(&bc).is_err());
+        // Trailing data after a valid pathLenConstraint is also rejected.
+        let bc = encode_sequence_from_parts(&[
+            &encode_boolean(true),
+            &encode_integer_u64(1),
+            &encode_tlv(0x05, &[]),
+        ]);
         assert!(parse_basic_constraints(&bc).is_err());
     }
 

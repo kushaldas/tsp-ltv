@@ -582,18 +582,18 @@ const DELTA_CRL_INDICATOR_OID: &[u8] = &[0x55, 0x1D, 0x1B];
 /// OID for Issuing Distribution Point (2.5.29.28).
 const ISSUING_DIST_POINT_OID: &[u8] = &[0x55, 0x1D, 0x1C];
 
-/// Helper: search for a specific OID in an Extensions SEQUENCE body.
+/// Helper: report whether an Extensions SEQUENCE body contains an extension
+/// with the given OID.
 ///
-/// Returns `Ok(Some(extnValue))` when found, `Ok(None)` when the OID is absent
-/// from a well-formed list, and `Err` when an extension is malformed. A parse
-/// error must **not** be conflated with "not found": a malformed extension
-/// appearing before a `deltaCRLIndicator` / `IssuingDistributionPoint` would
-/// otherwise abort the scan and let a delta/partitioned CRL be accepted as a
-/// full CRL.
-fn find_extn_by_oid<'a>(
-    extensions_body: &'a [u8],
-    target_oid: &[u8],
-) -> Result<Option<&'a [u8]>, String> {
+/// Returns `Ok(true)` when the OID is present, `Ok(false)` when it is absent
+/// from a well-formed list, and `Err` when an extension is malformed. Two
+/// fail-closed properties matter for delta/partitioned-CRL detection:
+/// - a parse error is **not** conflated with "absent" (a malformed extension
+///   ahead of the marker must not abort the scan and let the CRL through), and
+/// - presence is decided by the OID match alone; a matched marker whose
+///   `extnValue` is missing/malformed still counts as present (reject), rather
+///   than being treated as absent.
+fn extensions_contain_oid(extensions_body: &[u8], target_oid: &[u8]) -> Result<bool, String> {
     // Extensions SEQUENCE body: iterate over Extension SEQUENCEs.
     let mut pos = extensions_body;
     while !pos.is_empty() {
@@ -604,13 +604,13 @@ fn find_extn_by_oid<'a>(
             ));
         }
         // Extension ::= SEQUENCE { extnID OID, ... extnValue OCTET STRING }
-        let (oid_tag, oid_body, ext_rest) = parse_tlv_with_rest(ext_value)?;
+        let (oid_tag, oid_body, _ext_rest) = parse_tlv_with_rest(ext_value)?;
         if oid_tag == 0x06 && oid_body == target_oid {
-            return Ok(find_tagged_value(ext_rest, 0x04));
+            return Ok(true);
         }
         pos = rest;
     }
-    Ok(None)
+    Ok(false)
 }
 
 /// Parse a DER-encoded CRL into its structural components.
@@ -778,9 +778,8 @@ pub fn parse_crl(crl_der: &[u8]) -> Result<ParsedCrl, LtvError> {
         // Check for delta CRL indicator (2.5.29.27) — reject if present. Delta
         // CRLs only contain changes since a base CRL; using one as a complete
         // revocation source would miss entries from the base CRL.
-        let has_delta = find_extn_by_oid(extensions_body, DELTA_CRL_INDICATOR_OID)
-            .map_err(|e| LtvError::Crl(format!("crlExtensions scan: {e}")))?
-            .is_some();
+        let has_delta = extensions_contain_oid(extensions_body, DELTA_CRL_INDICATOR_OID)
+            .map_err(|e| LtvError::Crl(format!("crlExtensions scan: {e}")))?;
         if has_delta {
             return Err(LtvError::Crl(
                 "delta CRL (2.5.29.27) not supported; only full CRLs are accepted".into(),
@@ -789,9 +788,8 @@ pub fn parse_crl(crl_der: &[u8]) -> Result<ParsedCrl, LtvError> {
         // Check for IssuingDistributionPoint (2.5.29.28). A partitioned CRL
         // cannot serve as a complete revocation source for all certs under the
         // issuer, so we reject it.
-        let has_idp = find_extn_by_oid(extensions_body, ISSUING_DIST_POINT_OID)
-            .map_err(|e| LtvError::Crl(format!("crlExtensions scan: {e}")))?
-            .is_some();
+        let has_idp = extensions_contain_oid(extensions_body, ISSUING_DIST_POINT_OID)
+            .map_err(|e| LtvError::Crl(format!("crlExtensions scan: {e}")))?;
         if has_idp {
             return Err(LtvError::Crl(
                 "partitioned CRL (IssuingDistributionPoint) not supported; only full CRLs are accepted".into(),
@@ -1504,6 +1502,20 @@ mod tests {
         let parsed = parse_crl(&crl_der).expect("benign extension must parse");
         assert!(parsed.revoked_entries.is_empty());
         assert!(parsed.next_update.is_some());
+    }
+
+    #[test]
+    fn test_parse_crl_rejects_delta_with_missing_extnvalue() {
+        // A deltaCRLIndicator extension whose extnValue OCTET STRING is absent
+        // must still be detected as present and rejected (fail closed), not
+        // treated as "extension absent" just because the value is unparseable.
+        let ext = encode_sequence_from_parts(&[&encode_tlv(0x06, &[0x55, 0x1D, 0x1B])]); // OID only
+        let crl_der = build_crl_with_extensions_body(&ext);
+        let err = parse_crl(&crl_der).expect_err("delta marker w/o extnValue must be rejected");
+        assert!(
+            format!("{err}").contains("delta CRL"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]
