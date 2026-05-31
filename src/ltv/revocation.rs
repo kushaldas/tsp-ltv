@@ -53,6 +53,24 @@ use crate::ltv::status::{resolve_priority, ValidationStatus};
 /// - 3 second OCSP timeout, 7 second CRL timeout
 /// - Nonces enabled for replay protection
 /// - Revocation checking required (Unknown → error)
+///
+/// # Construction
+///
+/// Build from [`RevocationConfig::default`] (or
+/// [`disabled`](RevocationConfig::disabled) / [`strict`](RevocationConfig::strict))
+/// and override individual fields with struct-update syntax or the builder
+/// methods, e.g.
+///
+/// ```rust
+/// # use tsp_ltv::ltv::revocation::RevocationConfig;
+/// let config = RevocationConfig {
+///     require_revocation_check: false,
+///     ..RevocationConfig::default()
+/// };
+/// ```
+///
+/// Using `..Default::default()` (rather than an exhaustive struct literal) keeps
+/// your code compiling when new fields are added in a later version.
 #[derive(Debug, Clone)]
 pub struct RevocationConfig {
     /// Prefer OCSP over CRL when both are available.
@@ -107,6 +125,16 @@ pub struct RevocationConfig {
     /// (→ `Invalid`), so a legitimate "good" response cannot be replayed after
     /// the certificate is later revoked.
     pub ocsp_freshness: crate::ltv::ocsp::OcspFreshness,
+
+    /// Freshness policy applied to CRLs (RFC 5280 §6.3.3).
+    ///
+    /// Bounds the `thisUpdate`/`nextUpdate` window a CRL may be relied upon for,
+    /// relative to the validation time. A stale CRL (validation instant past
+    /// `nextUpdate`, or — lacking `nextUpdate` — older than the configured
+    /// maximum age) fails validation (→ `Invalid`), so a superseded CRL cannot be
+    /// replayed to hide a serial that a fresher CRL revokes. Default:
+    /// [`CrlFreshness::default`](crate::ltv::crl::CrlFreshness::default).
+    pub crl_freshness: crate::ltv::crl::CrlFreshness,
 }
 
 impl Default for RevocationConfig {
@@ -121,6 +149,7 @@ impl Default for RevocationConfig {
             per_cert_timeout: Duration::from_secs(10),
             signature_policy: crate::crypto::verify::SignaturePolicy::default(),
             ocsp_freshness: crate::ltv::ocsp::OcspFreshness::default(),
+            crl_freshness: crate::ltv::crl::CrlFreshness::default(),
         }
     }
 }
@@ -155,6 +184,20 @@ impl RevocationConfig {
     /// whose risk you have accepted; never for fresh trust decisions.
     pub fn allow_legacy_signatures(mut self) -> Self {
         self.signature_policy = crate::crypto::verify::SignaturePolicy::allow_legacy();
+        self
+    }
+
+    /// Set the OCSP response freshness policy (see
+    /// [`OcspFreshness`](crate::ltv::ocsp::OcspFreshness)).
+    pub fn with_ocsp_freshness(mut self, freshness: crate::ltv::ocsp::OcspFreshness) -> Self {
+        self.ocsp_freshness = freshness;
+        self
+    }
+
+    /// Set the CRL freshness policy (see
+    /// [`CrlFreshness`](crate::ltv::crl::CrlFreshness)).
+    pub fn with_crl_freshness(mut self, freshness: crate::ltv::crl::CrlFreshness) -> Self {
+        self.crl_freshness = freshness;
         self
     }
 }
@@ -423,8 +466,15 @@ async fn run_crl_check(
 
     // Apply CRL-specific timeout
     let result = tokio::time::timeout(config.crl_timeout, async {
-        // Fetch CRL(s) for this certificate
-        match crl_client.fetch_crls_for_cert(cert).await {
+        // Fetch CRL(s) for this certificate. Thread the *configured* CRL
+        // freshness into the fetch/cache selection so a single policy governs
+        // both which CRL is chosen and the authoritative freshness check below —
+        // a caller who widens `crl_freshness` is never blocked by a stricter
+        // default at the fetch layer.
+        match crl_client
+            .fetch_crls_for_cert_with_freshness(cert, &config.crl_freshness)
+            .await
+        {
             Ok(crls) => {
                 if crls.is_empty() {
                     return ValidationStatus::Unknown {
@@ -432,18 +482,21 @@ async fn run_crl_check(
                     };
                 }
 
-                // Check the first successfully fetched CRL
-                // (fetch_crls_for_cert already stops after the first success).
+                // Check the CRL that `fetch_crls_for_cert` selected: the first
+                // distribution point that downloaded and was current, or — if
+                // none were current — a stale CRL as a fail-closed fallback.
                 // A validation failure on a CRL we actually received (bad
-                // signature, malformed structure) is a definitive negative
-                // result → Invalid, not Unknown, so a forged CRL cannot fail
-                // open by masquerading as "status undetermined".
-                match crl::check_revocation_with_policy(
+                // signature, malformed structure, stale/expired window) is a
+                // definitive negative result → Invalid, not Unknown, so a forged
+                // or superseded CRL cannot fail open by masquerading as "status
+                // undetermined".
+                match crl::check_revocation_with_options(
                     &crls[0],
                     cert,
                     issuer,
                     validation_time,
                     &config.signature_policy,
+                    &config.crl_freshness,
                 ) {
                     Ok(status) => status,
                     Err(e) => {
@@ -820,6 +873,7 @@ mod tests {
             per_cert_timeout: Duration::from_secs(2),
             signature_policy: crate::crypto::verify::SignaturePolicy::default(),
             ocsp_freshness: crate::ltv::ocsp::OcspFreshness::default(),
+            crl_freshness: crate::ltv::crl::CrlFreshness::default(),
         };
         assert!(!config.prefer_ocsp);
         assert!(!config.require_revocation_check);
