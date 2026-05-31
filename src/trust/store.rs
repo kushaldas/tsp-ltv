@@ -497,7 +497,7 @@ impl TrustStore {
             // must not be gated behind it.
             validate_intermediate_ca_extensions(
                 issuer_cert,
-                &format!("intermediate at index {}", i + 1),
+                &format!("issuer at index {}", i + 1),
             )?;
 
             // Enforce pathLenConstraint (M-5), in every build configuration —
