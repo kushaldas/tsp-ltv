@@ -1,6 +1,6 @@
 [package]
 name = "tsp-ltv"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 rust-version = "1.75"
 description = "Shared timestamping (RFC 3161) and long-term validation (OCSP, CRL, trust stores) infrastructure for AdES signatures"
@@ -12,7 +12,7 @@ categories = ["cryptography"]
 default = ["tsp", "ltv", "blocking"]
 
 # RFC 3161 timestamping (TSA client)
-tsp = ["dep:reqwest", "dep:tokio"]
+tsp = ["dep:reqwest", "dep:tokio", "dep:subtle"]
 
 # Long-term validation (OCSP/CRL/chain fetching) — requires TSP for network deps
 ltv = ["tsp"]
@@ -71,6 +71,8 @@ reqwest = { version = "0.12", default-features = false, features = [
   "rustls-tls",
 ], optional = true }
 tokio = { version = "1", features = ["rt", "macros", "time"], optional = true }
+# Constant-time comparisons — only used by the `tsp` module (token.rs).
+subtle = { version = "2", optional = true }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }

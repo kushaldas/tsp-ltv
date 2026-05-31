@@ -139,6 +139,17 @@ pub fn build_chain_from_pool_with_policy(
     Ok(chain)
 }
 
+/// Convenience: extract the DER-encoded subject names from a [`TrustStore`](super::TrustStore).
+///
+/// This is useful for passing to [`build_chain_from_pool`] as the
+/// `trust_anchor_subjects` argument.
+pub fn trust_anchor_subjects(store: &super::TrustStore) -> Vec<Vec<u8>> {
+    store
+        .certificates()
+        .filter_map(|cert| cert.tbs_certificate.subject.to_der().ok())
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -209,17 +220,24 @@ mod tests {
         .build()
         .unwrap();
 
-        let tbs_der = base.tbs_certificate.to_der().unwrap();
+        // Set the inner tbsCertificate.signature to SHA-1 as well, so the
+        // certificate is well-formed (outer == inner per RFC 5280 §4.1.1.2) and
+        // genuinely SHA-1-signed — exercising the weak-digest gate, not the
+        // signatureAlgorithm-mismatch check (L-5).
+        let sha1_algid = AlgorithmIdentifierOwned {
+            oid: crate::crypto::algorithm::OID_SHA1_WITH_RSA,
+            parameters: Some(Any::from_der(&[0x05, 0x00]).unwrap()),
+        };
+        let mut tbs = base.tbs_certificate.clone();
+        tbs.signature = sha1_algid.clone();
+        let tbs_der = tbs.to_der().unwrap();
         let hash = Sha1::digest(&tbs_der);
         let sig = issuer_key
             .sign(Pkcs1v15Sign::new::<Sha1>(), &hash)
             .expect("SHA-1 RSA sign");
         let leaf = Certificate {
-            tbs_certificate: base.tbs_certificate.clone(),
-            signature_algorithm: AlgorithmIdentifierOwned {
-                oid: crate::crypto::algorithm::OID_SHA1_WITH_RSA,
-                parameters: Some(Any::from_der(&[0x05, 0x00]).unwrap()),
-            },
+            tbs_certificate: tbs,
+            signature_algorithm: sha1_algid,
             signature: BitString::from_bytes(&sig).unwrap(),
         };
 
@@ -252,15 +270,4 @@ mod tests {
         .expect("legacy build must succeed on a SHA-1 link");
         assert_eq!(chain.len(), 2, "chain should be [leaf, issuer]");
     }
-}
-
-/// Convenience: extract the DER-encoded subject names from a [`TrustStore`](super::TrustStore).
-///
-/// This is useful for passing to [`build_chain_from_pool`] as the
-/// `trust_anchor_subjects` argument.
-pub fn trust_anchor_subjects(store: &super::TrustStore) -> Vec<Vec<u8>> {
-    store
-        .certificates()
-        .filter_map(|cert| cert.tbs_certificate.subject.to_der().ok())
-        .collect()
 }

@@ -41,8 +41,9 @@ finding H-1).
 2. **`AlgorithmRegistry` is the wrong enforcement tool for the PKI path.** The
    PDF-signing-oriented `SignatureAlgorithm`/`DigestAlgorithm` enums cannot
    represent the weak OIDs at all, do not encode the ECDSA curve independently
-   of the hash (so `ecdsa-with-SHA256` cannot map to a single curve, while the
-   verifier legitimately trial-verifies P-256/384/521), and cannot express the
+   of the hash (so `ecdsa-with-SHA256` cannot map to a single curve; at the time
+   of this ADR the verifier trial-verified P-256/384/521 — later replaced by
+   curve-from-SPKI dispatch in ADR 0013), and cannot express the
    strong-but-non-`standard()` algorithms the crate supports (P-521, Ed25519,
    SHA-3). Routing verification through `AlgorithmRegistry::validate()` would
    reject valid signatures. A flip of its `Default` to `standard()` was also
@@ -132,6 +133,28 @@ stateful public configuration types.
 - Revisit whether `AlgorithmRegistry` should remain in this crate at all, or be
   superseded by `SignaturePolicy` for verification-side concerns.
 
+## bergshamra usage
+
+How the reachable opt-in is actually consumed (the concrete realization of the
+"a real consumer needs the legacy path" constraint above):
+
+- `bergshamra` depends on this crate with `default-features = false` (only
+  `crypto` / `der_utils` / `error` / `trust` compile) and, pending publication,
+  on **tsp-ltv 0.2.0** via a temporary `[patch.crates-io]` path entry.
+- It gates the opt-in behind its own existing **`legacy-algorithms` cargo
+  feature** (default-on for the binary), mirroring how it already gates legacy
+  digests/signatures. `bergshamra-keys::x509::cert_signature_policy()` returns
+  `SignaturePolicy::allow_legacy()` under that feature and
+  `SignaturePolicy::strict()` (this crate's default) otherwise.
+- `validate_cert_chain` then threads that policy through the public,
+  policy-aware entry points described above:
+  `TrustStore::with_signature_policy`, `verify_certificate_signature_with_policy`
+  (self-signed-anchor path), and `build_chain_from_pool_with_policy`.
+- Result: a default `bergshamra` build validates the SHA-1/MD5-era W3C/Apache
+  interop certificates (merlin/phaos/aleksey/xmldsig11), while a
+  `--no-default-features` build stays strict and fail-closed. Verified by the
+  XML-DSig interop suite (447 OK / 0 FAIL).
+
 ## References
 
 - RFC 5280 — Internet X.509 PKI Certificate and CRL Profile
@@ -139,3 +162,8 @@ stateful public configuration types.
 - "SHAttered" — first practical SHA-1 collision (2017)
 - `SECURITY_AUDIT_REPORT.md` — finding H-1
 - ADR 0002 — fail-closed revocation policy (Invalid > Unknown classification)
+- ADR 0012 — intermediate CA extension validation (the other `verify_chain`
+  policy surface; same `bergshamra` consumer)
+- ADR 0013 — algorithm-identifier binding (refines the ECDSA trial-verification
+  rationale noted above; provides the curve binding the legacy SHA-1 ECDSA
+  pairings depend on)

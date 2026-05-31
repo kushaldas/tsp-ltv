@@ -28,6 +28,114 @@ fn is_self_issued(cert: &Certificate) -> bool {
     cert.tbs_certificate.subject == cert.tbs_certificate.issuer
 }
 
+/// Read the `keyCertSign` bit (bit 5) from a certificate's `keyUsage`
+/// extension (2.5.29.15). Returns `Ok(None)` when the extension is absent and
+/// `Ok(Some(bool))` otherwise. Available in all build configurations so
+/// `verify_chain` can enforce CA key-usage even without the `ltv` feature
+/// (finding L-3).
+fn key_cert_sign(cert: &Certificate) -> Result<Option<bool>, TrustError> {
+    let ku_oid = const_oid::ObjectIdentifier::new_unwrap("2.5.29.15");
+    let Some(extensions) = &cert.tbs_certificate.extensions else {
+        return Ok(None);
+    };
+    let Some(ext) = extensions.iter().find(|e| e.extn_id == ku_oid) else {
+        return Ok(None);
+    };
+    parse_key_cert_sign_bit(ext.extn_value.as_bytes()).map(Some)
+}
+
+/// Parse a `keyUsage` extension value (a DER BIT STRING) and return whether the
+/// `keyCertSign` bit (bit 5) is set.
+///
+/// The parse is strict — a malformed encoding is a hard error, kept distinct
+/// from the semantic "keyCertSign not set" (`Ok(false)`): the value must be a
+/// single BIT STRING with no trailing bytes, a valid unused-bits count (0..=7),
+/// all unused bits in the final octet set to 0 (DER, X.690 §11.2.1), and at
+/// least one content octet (RFC 5280 §4.2.1.3 requires keyUsage to assert at
+/// least one bit, so a content-less BIT STRING is rejected).
+fn parse_key_cert_sign_bit(extn_value: &[u8]) -> Result<bool, TrustError> {
+    // keyUsage is a BIT STRING: first content byte is the unused-bit count,
+    // followed by the bit bytes (MSB-first). keyCertSign is bit 5.
+    let (tag, body, rest) = crate::der_utils::parse_tlv_with_rest(extn_value)
+        .map_err(|e| TrustError::CertificateParse(format!("keyUsage: {e}")))?;
+    if !rest.is_empty() {
+        return Err(TrustError::CertificateParse(
+            "keyUsage: trailing data after BIT STRING".into(),
+        ));
+    }
+    if tag != 0x03 {
+        return Err(TrustError::CertificateParse(format!(
+            "keyUsage: expected BIT STRING (0x03), got 0x{tag:02x}"
+        )));
+    }
+    if body.is_empty() {
+        return Err(TrustError::CertificateParse(
+            "keyUsage: BIT STRING missing the unused-bits octet".into(),
+        ));
+    }
+    let unused_bits = body[0];
+    if unused_bits > 7 {
+        return Err(TrustError::CertificateParse(format!(
+            "keyUsage: invalid unused-bits count {unused_bits} (must be 0..=7)"
+        )));
+    }
+    let bit_bytes = &body[1..];
+    if bit_bytes.is_empty() {
+        return Err(TrustError::CertificateParse(
+            "keyUsage: BIT STRING has no content octets (no key-usage bits set)".into(),
+        ));
+    }
+    // DER (X.690 §11.2.1): every unused bit in the final octet MUST be 0.
+    // A non-zero pad is a malformed encoding and is rejected rather than
+    // silently masked, keeping encoding errors distinct from the semantic
+    // "keyCertSign not set" case.
+    if unused_bits > 0 {
+        let last = bit_bytes[bit_bytes.len() - 1];
+        let pad_mask = (1u8 << unused_bits) - 1;
+        if last & pad_mask != 0 {
+            return Err(TrustError::CertificateParse(format!(
+                "keyUsage: BIT STRING has {unused_bits} non-zero unused bit(s) (not valid DER)"
+            )));
+        }
+    }
+    // bit 5 → byte 0, mask 0b0000_0100 (7 - 5 = 2).
+    Ok((bit_bytes[0] >> 2) & 1 == 1)
+}
+
+/// Validate that an intermediate (issuer) certificate is permitted to sign
+/// certificates: it must assert `basicConstraints` `cA:TRUE`, and — *if* it
+/// carries a `keyUsage` extension — that extension must assert `keyCertSign`.
+///
+/// Per RFC 5280 §4.2.1.3 the `keyUsage` extension is **optional**: when absent
+/// there is no key-usage restriction and `cA:TRUE` alone authorizes certificate
+/// signing, so a missing `keyUsage` is accepted. Only a `keyUsage` that is
+/// present *without* `keyCertSign` is rejected (the key must not then be used to
+/// verify certificate signatures).
+///
+/// This is enforced in **every** build configuration (finding L-3): the
+/// previous CA-extension check lived in the `ltv`-gated extension module, so a
+/// `tsp`-only build skipped intermediate CA validation entirely. `verify_chain`
+/// is reached by the RFC 3161 token path even without `ltv`, so the check must
+/// not be feature-gated.
+fn validate_intermediate_ca_extensions(cert: &Certificate, label: &str) -> Result<(), TrustError> {
+    let (is_ca, _) = basic_constraints(cert)?;
+    if !is_ca {
+        return Err(TrustError::SignatureVerification(format!(
+            "{label} is not a CA (basicConstraints cA is not TRUE)"
+        )));
+    }
+    match key_cert_sign(cert)? {
+        // keyUsage present and asserts keyCertSign, or keyUsage absent (no
+        // restriction — RFC 5280 permits a CA certificate without keyUsage).
+        Some(true) | None => Ok(()),
+        // keyUsage present but does NOT assert keyCertSign — the key must not be
+        // used to verify certificate signatures.
+        Some(false) => Err(TrustError::SignatureVerification(format!(
+            "{label} keyUsage is present but does not assert keyCertSign"
+        ))),
+    }
+}
+
 /// Enforce `issuer`'s `pathLenConstraint` against the CA certificates in
 /// `below` (the certificates subordinate to it in the chain). `label`
 /// identifies the issuer in error messages. A parse failure of any
@@ -384,19 +492,13 @@ impl TrustStore {
             )?;
 
             // Validate extensions: intermediates must have CA:TRUE + keyCertSign.
-            // This deeper role validation lives in the `ltv` extension module.
-            #[cfg(feature = "ltv")]
-            {
-                use crate::ltv::x509_ext::{validate_extensions_for_role, CertRole};
-                validate_extensions_for_role(issuer_cert, CertRole::IntermediateCa).map_err(
-                    |e| {
-                        TrustError::SignatureVerification(format!(
-                            "intermediate at index {} failed extension validation: {e}",
-                            i + 1
-                        ))
-                    },
-                )?;
-            }
+            // Enforced in every build configuration (L-3) — the RFC 3161 token
+            // path reaches verify_chain even without the `ltv` feature, so this
+            // must not be gated behind it.
+            validate_intermediate_ca_extensions(
+                issuer_cert,
+                &format!("issuer at index {}", i + 1),
+            )?;
 
             // Enforce pathLenConstraint (M-5), in every build configuration —
             // TSP-only token verification reaches `verify_chain` too, so this
@@ -543,19 +645,25 @@ mod tests {
             .build()
             .expect("build base root");
 
-        // Re-sign the TBS with SHA-1 and relabel the outer algorithm.
-        let tbs_der = base.tbs_certificate.to_der().unwrap();
+        // Set the inner tbsCertificate.signature to SHA-1 too, then re-sign that
+        // TBS with SHA-1. The result is well-formed (outer == inner per RFC 5280
+        // §4.1.1.2) and genuinely SHA-1-signed, so it exercises the weak-digest
+        // gate rather than the signatureAlgorithm-mismatch check (L-5).
+        let sha1_algid = AlgorithmIdentifierOwned {
+            oid: crate::crypto::algorithm::OID_SHA1_WITH_RSA,
+            // sha1WithRSAEncryption carries an explicit NULL parameter.
+            parameters: Some(Any::from_der(&[0x05, 0x00]).unwrap()),
+        };
+        let mut tbs = base.tbs_certificate.clone();
+        tbs.signature = sha1_algid.clone();
+        let tbs_der = tbs.to_der().unwrap();
         let hash = Sha1::digest(&tbs_der);
         let sig = key
             .sign(Pkcs1v15Sign::new::<Sha1>(), &hash)
             .expect("SHA-1 RSA sign");
         Certificate {
-            tbs_certificate: base.tbs_certificate.clone(),
-            signature_algorithm: AlgorithmIdentifierOwned {
-                oid: crate::crypto::algorithm::OID_SHA1_WITH_RSA,
-                // sha1WithRSAEncryption carries an explicit NULL parameter.
-                parameters: Some(Any::from_der(&[0x05, 0x00]).unwrap()),
-            },
+            tbs_certificate: tbs,
+            signature_algorithm: sha1_algid,
             signature: BitString::from_bytes(&sig).unwrap(),
         }
     }
@@ -838,5 +946,95 @@ mod tests {
         store
             .verify_chain(&chain, None)
             .expect("self-issued CA below anchor must not consume pathLenConstraint");
+    }
+
+    #[test]
+    fn test_parse_key_cert_sign_bit() {
+        use crate::der_utils::encode_tlv;
+
+        // BIT STRING { unused=1, 0x04 } -> keyCertSign (bit 5) set.
+        assert!(parse_key_cert_sign_bit(&encode_tlv(0x03, &[0x01, 0x04])).unwrap());
+        // BIT STRING { unused=7, 0x80 } -> digitalSignature only; keyCertSign not set.
+        assert!(!parse_key_cert_sign_bit(&encode_tlv(0x03, &[0x07, 0x80])).unwrap());
+
+        // Not a BIT STRING.
+        assert!(parse_key_cert_sign_bit(&encode_tlv(0x04, &[0x01, 0x04])).is_err());
+        // Trailing data after the BIT STRING is rejected (parse_tlv would ignore it).
+        let mut trailing = encode_tlv(0x03, &[0x01, 0x04]);
+        trailing.extend_from_slice(&[0x05, 0x00]); // a stray NULL
+        assert!(parse_key_cert_sign_bit(&trailing).is_err());
+        // Empty value (no unused-bits octet) is rejected.
+        assert!(parse_key_cert_sign_bit(&encode_tlv(0x03, &[])).is_err());
+        // Only the unused-bits octet, no content octets -> rejected (not Some(false)).
+        assert!(parse_key_cert_sign_bit(&encode_tlv(0x03, &[0x00])).is_err());
+        // Invalid unused-bits count (>7) is rejected.
+        assert!(parse_key_cert_sign_bit(&encode_tlv(0x03, &[0x08, 0x04])).is_err());
+        // Non-zero unused bits in the final octet are invalid DER (X.690
+        // §11.2.1) and rejected: unused=1 but the low bit of 0x05 is set.
+        assert!(parse_key_cert_sign_bit(&encode_tlv(0x03, &[0x01, 0x05])).is_err());
+        // keyCertSign bit set *and* a clean (zero) unused-bit pad still parses.
+        assert!(parse_key_cert_sign_bit(&encode_tlv(0x03, &[0x01, 0x06])).unwrap());
+    }
+
+    #[test]
+    fn test_verify_chain_rejects_non_ca_intermediate() {
+        // L-3: an intermediate that is not a CA (basicConstraints CA:FALSE) must
+        // be rejected by verify_chain in every build configuration, even when its
+        // signature over the leaf is valid. This check used to be gated behind
+        // the `ltv` feature.
+        use rsa::pkcs1v15::SigningKey;
+        use rsa::RsaPrivateKey;
+        use sha2::Sha256;
+        use x509_cert::builder::Profile;
+        use x509_cert::name::Name;
+
+        let mut rng = rand::thread_rng();
+        let root_key = RsaPrivateKey::new(&mut rng, 2048).expect("root key");
+        let mid_key = RsaPrivateKey::new(&mut rng, 2048).expect("mid key");
+        let leaf_key = RsaPrivateKey::new(&mut rng, 2048).expect("leaf key");
+
+        let root_signer = SigningKey::<Sha256>::new(root_key.clone());
+        let mid_signer = SigningKey::<Sha256>::new(mid_key.clone());
+
+        let root_name = "CN=NonCA Root,O=tsp-ltv tests";
+        let mid_name = "CN=NonCA Mid,O=tsp-ltv tests";
+        let leaf_name = "CN=NonCA Leaf,O=tsp-ltv tests";
+        let root_issuer: Name = root_name.parse().unwrap();
+        let mid_issuer: Name = mid_name.parse().unwrap();
+
+        let root = issue_cert(Profile::Root, root_name, &root_key, &root_signer);
+        // mid is an end-entity profile (CA:FALSE) but is (mis)used as an issuer.
+        let mid = issue_cert(
+            Profile::Leaf {
+                issuer: root_issuer,
+                enable_key_agreement: false,
+                enable_key_encipherment: false,
+            },
+            mid_name,
+            &mid_key,
+            &root_signer,
+        );
+        let leaf = issue_cert(
+            Profile::Leaf {
+                issuer: mid_issuer,
+                enable_key_agreement: false,
+                enable_key_encipherment: false,
+            },
+            leaf_name,
+            &leaf_key,
+            &mid_signer,
+        );
+
+        let mut store = TrustStore::new();
+        store.add_certificate(root.clone()).unwrap();
+        let chain = vec![leaf, mid, root];
+
+        let err = store
+            .verify_chain(&chain, None)
+            .expect_err("a non-CA intermediate must be rejected");
+        assert!(
+            matches!(err, TrustError::SignatureVerification(ref m) if m.contains("not a CA")),
+            "expected non-CA intermediate rejection, got: {err:?}"
+        );
     }
 }

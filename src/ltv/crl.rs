@@ -510,20 +510,20 @@ fn parse_crl_dp_extension(der_bytes: &[u8]) -> Result<Vec<String>, String> {
             // DistributionPoint SEQUENCE
             // Look for distributionPoint [0]
             if !dp_body.is_empty() {
-                if let Ok((inner_tag, inner_body, _)) = parse_tlv_with_rest(&dp_body) {
+                if let Ok((inner_tag, inner_body, _)) = parse_tlv_with_rest(dp_body) {
                     if inner_tag == 0xA0 {
                         // DistributionPointName — look for fullName [0]
-                        if let Ok((fn_tag, fn_body, _)) = parse_tlv_with_rest(&inner_body) {
+                        if let Ok((fn_tag, fn_body, _)) = parse_tlv_with_rest(inner_body) {
                             if fn_tag == 0xA0 {
                                 // GeneralNames — look for URI [6]
-                                let mut gn_pos = &fn_body[..];
+                                let mut gn_pos = fn_body;
                                 while !gn_pos.is_empty() {
                                     if let Ok((gn_tag, gn_body, gn_rest)) =
                                         parse_tlv_with_rest(gn_pos)
                                     {
                                         if gn_tag == 0x86 {
                                             // uniformResourceIdentifier [6] IMPLICIT IA5String
-                                            if let Ok(uri) = std::str::from_utf8(&gn_body) {
+                                            if let Ok(uri) = std::str::from_utf8(gn_body) {
                                                 urls.push(uri.to_string());
                                             }
                                         }
@@ -686,7 +686,7 @@ pub fn parse_crl(crl_der: &[u8]) -> Result<ParsedCrl, LtvError> {
     let signature_bytes = sig_val_body[1..].to_vec();
 
     // Parse TBSCertList body
-    let mut tbs_pos = &tbs_value[..];
+    let mut tbs_pos = tbs_value;
 
     // Optional: version [0] EXPLICIT INTEGER (v2 = 1)
     if !tbs_pos.is_empty() && tbs_pos[0] == 0x02 {
@@ -881,7 +881,7 @@ fn parse_revocation_reason(extensions_area: &[u8]) -> RevocationReason {
     let reason_oid_bytes: &[u8] = &[0x55, 0x1D, 0x15]; // 2.5.29.21
 
     // Walk through extensions
-    let mut pos = &ext_body[..];
+    let mut pos = ext_body;
     while !pos.is_empty() {
         let Ok((ext_tag, ext_value, rest)) = parse_tlv_with_rest(pos) else {
             break;
@@ -1359,8 +1359,7 @@ mod tests {
         bit_string_value.extend_from_slice(&sig_bytes);
         let sig_bit_string = encode_tlv(0x03, &bit_string_value);
 
-        let cert_list = encode_sequence_from_parts(&[&tbs_der, &outer_alg_id, &sig_bit_string]);
-        cert_list
+        encode_sequence_from_parts(&[&tbs_der, &outer_alg_id, &sig_bit_string])
     }
 
     fn load_test_cert(pem_str: &str) -> Certificate {
