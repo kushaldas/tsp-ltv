@@ -47,8 +47,17 @@ Move the intermediate CA extension check into the always-compiled trust layer
 and align it with RFC 5280.
 
 - Add feature-independent helpers in `trust/store.rs`:
-  - `key_cert_sign(cert) -> Result<Option<bool>, TrustError>` — reads the
-    `keyUsage` BIT STRING (bit 5); `Ok(None)` when the extension is absent.
+  - `key_cert_sign(cert) -> Result<Option<bool>, TrustError>` — `Ok(None)` when
+    the `keyUsage` extension is absent, otherwise delegates to
+    `parse_key_cert_sign_bit`.
+  - `parse_key_cert_sign_bit(extn_value)` — parses the `keyUsage` BIT STRING
+    strictly and returns whether bit 5 (keyCertSign) is set. Encoding errors are
+    kept distinct from the semantic "keyCertSign not set" (`Ok(false)`): the
+    value must be a single BIT STRING with **no trailing bytes**, a valid
+    unused-bits count (`0..=7`), and **at least one content octet** (a
+    content-less BIT STRING is rejected, since RFC 5280 §4.2.1.3 requires
+    keyUsage to assert at least one bit). *(This strict parser replaced an
+    earlier lenient `parse_tlv`-based read in response to PR #7 review.)*
   - `validate_intermediate_ca_extensions(cert, label)` — the unconditional
     check `verify_chain` now calls for every issuer in the walk.
 

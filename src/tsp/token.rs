@@ -251,22 +251,29 @@ pub fn parse_timestamp_response(der_bytes: &[u8]) -> Result<TimeStampResp, TspEr
         match stag {
             // statusString PKIFreeText ::= SEQUENCE SIZE (1..MAX) OF UTF8String
             0x30 => {
-                // The first element MUST be a UTF8String (tag 0x0C) carrying
-                // valid UTF-8. Reject any other ASN.1 type and reject invalid
-                // UTF-8 rather than lossily normalizing it (L-6).
-                let (inner_tag, inner_body, _) =
-                    der_utils::parse_tlv_with_rest(sbody).map_err(|e| {
-                        TspError::InvalidResponse(format!("malformed statusString: {e}"))
+                // EVERY element MUST be a UTF8String (tag 0x0C) carrying valid
+                // UTF-8 — not only the first. Reject any other ASN.1 type and
+                // reject invalid UTF-8 rather than lossily normalizing it (L-6).
+                // The first element is surfaced as `status_string`.
+                let mut elems = sbody;
+                while !elems.is_empty() {
+                    let (inner_tag, inner_body, inner_rest) = der_utils::parse_tlv_with_rest(elems)
+                        .map_err(|e| {
+                            TspError::InvalidResponse(format!("malformed statusString: {e}"))
+                        })?;
+                    if inner_tag != 0x0C {
+                        return Err(TspError::InvalidResponse(format!(
+                            "statusString element is not a UTF8String (tag 0x0c), got 0x{inner_tag:02x}"
+                        )));
+                    }
+                    let text = std::str::from_utf8(inner_body).map_err(|e| {
+                        TspError::InvalidResponse(format!("statusString is not valid UTF-8: {e}"))
                     })?;
-                if inner_tag != 0x0C {
-                    return Err(TspError::InvalidResponse(format!(
-                        "statusString element is not a UTF8String (tag 0x0c), got 0x{inner_tag:02x}"
-                    )));
+                    if status_string.is_none() {
+                        status_string = Some(text.to_string());
+                    }
+                    elems = inner_rest;
                 }
-                let text = std::str::from_utf8(inner_body).map_err(|e| {
-                    TspError::InvalidResponse(format!("statusString is not valid UTF-8: {e}"))
-                })?;
-                status_string = Some(text.to_string());
             }
             // BIT STRING (failureInfo)
             0x03 => {
@@ -279,17 +286,23 @@ pub fn parse_timestamp_response(der_bytes: &[u8]) -> Result<TimeStampResp, TspEr
 
     // Second element: TimeStampToken OPTIONAL
     let token_der = if !rest.is_empty() {
-        // The token is a ContentInfo (SEQUENCE). If something is present here it
-        // must be a structurally valid SEQUENCE; anything else is malformed and
-        // is rejected rather than silently dropped (L-6).
-        let (token_tag, _, _) = der_utils::parse_tlv_with_rest(rest)
+        // The token is a ContentInfo (SEQUENCE). It must be a structurally valid
+        // SEQUENCE that consumes ALL remaining bytes of the TimeStampResp — any
+        // trailing bytes after it are malformed and rejected rather than being
+        // folded into token_der or ignored (L-6).
+        let (token_tag, _, after) = der_utils::parse_tlv_with_rest(rest)
             .map_err(|e| TspError::InvalidResponse(format!("failed to parse token TLV: {e}")))?;
         if token_tag != 0x30 {
             return Err(TspError::InvalidResponse(format!(
                 "expected TimeStampToken SEQUENCE (0x30), got 0x{token_tag:02x}"
             )));
         }
-        // Re-encode the entire TLV (tag + length + value) as the token DER
+        if !after.is_empty() {
+            return Err(TspError::InvalidResponse(
+                "trailing data after TimeStampToken in TimeStampResp".into(),
+            ));
+        }
+        // `rest` is now exactly the token TLV (tag + length + value).
         Some(rest.to_vec())
     } else {
         None
@@ -1401,6 +1414,47 @@ mod tests {
         assert!(
             matches!(err, TspError::InvalidResponse(ref m) if m.contains("UTF-8")),
             "expected invalid-UTF-8 rejection, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn test_parse_timestamp_response_rejects_malformed_trailing_status_element() {
+        // L-6 (PR review): PKIFreeText is SEQUENCE OF UTF8String — EVERY element
+        // must be validated, not just the first. A valid first UTF8String
+        // followed by a non-UTF8String element must still be rejected.
+        let status_int = der_utils::encode_integer_u64(2); // rejection
+        let mut free_text_body = der_utils::encode_tlv(0x0C, b"ok");
+        free_text_body.extend_from_slice(&der_utils::encode_tlv(0x04, b"bad")); // OCTET STRING
+        let free_text = der_utils::encode_sequence_raw(&free_text_body);
+        let mut status_body = status_int;
+        status_body.extend_from_slice(&free_text);
+        let status_info = der_utils::encode_sequence_raw(&status_body);
+        let resp_der = der_utils::encode_sequence_raw(&status_info);
+
+        let err = parse_timestamp_response(&resp_der)
+            .expect_err("a trailing non-UTF8String statusString element must be rejected");
+        assert!(
+            matches!(err, TspError::InvalidResponse(ref m) if m.contains("UTF8String")),
+            "expected UTF8String rejection of the trailing element, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn test_parse_timestamp_response_rejects_trailing_bytes_after_token() {
+        // L-6 (PR review): the TimeStampToken must consume all remaining bytes of
+        // the TimeStampResp; trailing bytes after it are malformed.
+        let status_info = der_utils::encode_sequence_raw(&der_utils::encode_integer_u64(0));
+        let token = der_utils::encode_sequence_raw(&der_utils::encode_integer_u64(1)); // dummy SEQUENCE
+        let mut body = status_info;
+        body.extend_from_slice(&token);
+        body.extend_from_slice(&der_utils::encode_integer_u64(9)); // trailing junk
+        let resp_der = der_utils::encode_sequence_raw(&body);
+
+        let err = parse_timestamp_response(&resp_der)
+            .expect_err("trailing bytes after the TimeStampToken must be rejected");
+        assert!(
+            matches!(err, TspError::InvalidResponse(ref m) if m.contains("trailing")),
+            "expected trailing-data rejection, got {err:?}"
         );
     }
 

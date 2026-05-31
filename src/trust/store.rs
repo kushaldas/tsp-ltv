@@ -41,10 +41,27 @@ fn key_cert_sign(cert: &Certificate) -> Result<Option<bool>, TrustError> {
     let Some(ext) = extensions.iter().find(|e| e.extn_id == ku_oid) else {
         return Ok(None);
     };
+    parse_key_cert_sign_bit(ext.extn_value.as_bytes()).map(Some)
+}
+
+/// Parse a `keyUsage` extension value (a DER BIT STRING) and return whether the
+/// `keyCertSign` bit (bit 5) is set.
+///
+/// The parse is strict — a malformed encoding is a hard error, kept distinct
+/// from the semantic "keyCertSign not set" (`Ok(false)`): the value must be a
+/// single BIT STRING with no trailing bytes, a valid unused-bits count (0..=7),
+/// and at least one content octet (RFC 5280 §4.2.1.3 requires keyUsage to
+/// assert at least one bit, so a content-less BIT STRING is rejected).
+fn parse_key_cert_sign_bit(extn_value: &[u8]) -> Result<bool, TrustError> {
     // keyUsage is a BIT STRING: first content byte is the unused-bit count,
     // followed by the bit bytes (MSB-first). keyCertSign is bit 5.
-    let (tag, body) = crate::der_utils::parse_tlv(ext.extn_value.as_bytes())
+    let (tag, body, rest) = crate::der_utils::parse_tlv_with_rest(extn_value)
         .map_err(|e| TrustError::CertificateParse(format!("keyUsage: {e}")))?;
+    if !rest.is_empty() {
+        return Err(TrustError::CertificateParse(
+            "keyUsage: trailing data after BIT STRING".into(),
+        ));
+    }
     if tag != 0x03 {
         return Err(TrustError::CertificateParse(format!(
             "keyUsage: expected BIT STRING (0x03), got 0x{tag:02x}"
@@ -52,16 +69,23 @@ fn key_cert_sign(cert: &Certificate) -> Result<Option<bool>, TrustError> {
     }
     if body.is_empty() {
         return Err(TrustError::CertificateParse(
-            "keyUsage: empty BIT STRING".into(),
+            "keyUsage: BIT STRING missing the unused-bits octet".into(),
         ));
     }
+    let unused_bits = body[0];
+    if unused_bits > 7 {
+        return Err(TrustError::CertificateParse(format!(
+            "keyUsage: invalid unused-bits count {unused_bits} (must be 0..=7)"
+        )));
+    }
     let bit_bytes = &body[1..];
+    if bit_bytes.is_empty() {
+        return Err(TrustError::CertificateParse(
+            "keyUsage: BIT STRING has no content octets (no key-usage bits set)".into(),
+        ));
+    }
     // bit 5 → byte 0, mask 0b0000_0100 (7 - 5 = 2).
-    let key_cert_sign = bit_bytes
-        .first()
-        .map(|b| (b >> 2) & 1 == 1)
-        .unwrap_or(false);
-    Ok(Some(key_cert_sign))
+    Ok((bit_bytes[0] >> 2) & 1 == 1)
 }
 
 /// Validate that an intermediate (issuer) certificate is permitted to sign
@@ -908,6 +932,29 @@ mod tests {
         store
             .verify_chain(&chain, None)
             .expect("self-issued CA below anchor must not consume pathLenConstraint");
+    }
+
+    #[test]
+    fn test_parse_key_cert_sign_bit() {
+        use crate::der_utils::encode_tlv;
+
+        // BIT STRING { unused=1, 0x04 } -> keyCertSign (bit 5) set.
+        assert!(parse_key_cert_sign_bit(&encode_tlv(0x03, &[0x01, 0x04])).unwrap());
+        // BIT STRING { unused=7, 0x80 } -> digitalSignature only; keyCertSign not set.
+        assert!(!parse_key_cert_sign_bit(&encode_tlv(0x03, &[0x07, 0x80])).unwrap());
+
+        // Not a BIT STRING.
+        assert!(parse_key_cert_sign_bit(&encode_tlv(0x04, &[0x01, 0x04])).is_err());
+        // Trailing data after the BIT STRING is rejected (parse_tlv would ignore it).
+        let mut trailing = encode_tlv(0x03, &[0x01, 0x04]);
+        trailing.extend_from_slice(&[0x05, 0x00]); // a stray NULL
+        assert!(parse_key_cert_sign_bit(&trailing).is_err());
+        // Empty value (no unused-bits octet) is rejected.
+        assert!(parse_key_cert_sign_bit(&encode_tlv(0x03, &[])).is_err());
+        // Only the unused-bits octet, no content octets -> rejected (not Some(false)).
+        assert!(parse_key_cert_sign_bit(&encode_tlv(0x03, &[0x00])).is_err());
+        // Invalid unused-bits count (>7) is rejected.
+        assert!(parse_key_cert_sign_bit(&encode_tlv(0x03, &[0x08, 0x04])).is_err());
     }
 
     #[test]

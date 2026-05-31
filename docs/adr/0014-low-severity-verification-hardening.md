@@ -48,9 +48,14 @@ the downstream AdES crates remains out of scope.
 **L-6 — fail hard on malformed responses, parse `statusString` strictly.**
 A structural parse failure of any `PKIStatusInfo` element, or a non-SEQUENCE
 where the optional `TimeStampToken` is expected, is now a hard
-`TspError::InvalidResponse`. The `statusString` inner element must carry the
-UTF8String tag (`0x0c`) and is decoded with strict `std::str::from_utf8`; a
-non-UTF8String type or invalid UTF-8 is rejected rather than lossily normalized.
+`TspError::InvalidResponse`. `statusString` is `SEQUENCE OF UTF8String`, so
+**every** element (not only the first) is required to carry the UTF8String tag
+(`0x0c`) and is decoded with strict `std::str::from_utf8`; a non-UTF8String type
+or invalid UTF-8 in any element — including a trailing one — is rejected rather
+than lossily normalized. When a `TimeStampToken` is present it must consume
+**all** remaining bytes of the `TimeStampResp`; trailing bytes after it are
+rejected rather than folded into `token_der`. *(The all-elements and
+trailing-token checks were added in response to PR #7 review.)*
 
 **L-7 — constant-time comparison.** `check_tst_info_matches` compares the
 `messageImprint` hash and the nonce via `subtle::ConstantTimeEq` (a new
