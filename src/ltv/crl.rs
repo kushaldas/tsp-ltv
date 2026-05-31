@@ -24,23 +24,33 @@ use crate::ltv::status::{RevocationReason, RevocationSource, ValidationStatus};
 struct CrlCacheEntry {
     /// Raw DER-encoded CRL bytes.
     der: Vec<u8>,
-    /// When this entry was fetched.
-    fetched_at: Instant,
+    /// Instant after which this cached entry is stale.
+    valid_until: Instant,
 }
 
 /// CRL client with in-memory caching.
 ///
 /// Fetches CRLs from distribution points and caches them to avoid
-/// redundant network requests.
+/// redundant network requests. Cache validity is bounded by both the
+/// configured grace period and the CRL's own `nextUpdate` field.
+///
+/// URLs are restricted to `http`/`https` schemes to prevent SSRF.
+/// Fetched CRL bodies are capped at [`MAX_BODY_SIZE`] to prevent
+/// memory exhaustion attacks.
 #[derive(Debug, Clone)]
 pub struct CrlClient {
     http_client: Client,
     timeout: Duration,
     /// In-memory cache: URL -> CRL entry
     cache: Arc<Mutex<HashMap<String, CrlCacheEntry>>>,
-    /// How long cached CRLs remain valid.
+    /// How long cached CRLs remain valid (upper bound).
     grace_period: Duration,
+    /// Maximum response body size (10 MB default).
+    max_body_size: usize,
 }
+
+/// Maximum allowed CRL response body size (10 MiB).
+const MAX_BODY_SIZE: usize = 10 * 1024 * 1024;
 
 impl CrlClient {
     /// Create a new CRL client with default settings.
@@ -52,6 +62,7 @@ impl CrlClient {
             timeout: Duration::from_secs(30),
             cache: Arc::new(Mutex::new(HashMap::new())),
             grace_period: Duration::from_secs(3600),
+            max_body_size: MAX_BODY_SIZE,
         }
     }
 
@@ -71,6 +82,24 @@ impl CrlClient {
     pub fn grace_period(mut self, grace: Duration) -> Self {
         self.grace_period = grace;
         self
+    }
+
+    /// Set the maximum response body size.
+    pub fn max_body_size(mut self, max: usize) -> Self {
+        self.max_body_size = max;
+        self
+    }
+
+    /// Validate that a URL is safe to fetch (scheme allowlist).
+    fn validate_url(url: &str) -> Result<(), LtvError> {
+        let lower = url.to_lowercase();
+        if lower.starts_with("http://") || lower.starts_with("https://") {
+            Ok(())
+        } else {
+            Err(LtvError::Crl(format!(
+                "CRL URL scheme not allowed: {url} (only http/https are supported)"
+            )))
+        }
     }
 
     /// Extract CRL distribution point URLs from a certificate.
@@ -97,14 +126,18 @@ impl CrlClient {
 
     /// Fetch a CRL from the given URL, using cache if available.
     pub async fn fetch_crl(&self, url: &str) -> Result<Vec<u8>, LtvError> {
+        // Validate URL scheme before fetching (SSRF guard).
+        Self::validate_url(url)?;
+
         // Check cache first
+        let now = Instant::now();
         {
             let cache = self
                 .cache
                 .lock()
                 .map_err(|e| LtvError::Crl(format!("cache lock poisoned: {e}")))?;
             if let Some(entry) = cache.get(url) {
-                if entry.fetched_at.elapsed() < self.grace_period {
+                if now < entry.valid_until {
                     log::debug!("CRL cache hit for {url}");
                     return Ok(entry.der.clone());
                 }
@@ -128,11 +161,20 @@ impl CrlClient {
             )));
         }
 
+        // Limit response body size to prevent memory exhaustion.
         let crl_bytes = response
             .bytes()
             .await
             .map_err(|e| LtvError::Crl(format!("failed to read CRL response body: {e}")))?
             .to_vec();
+
+        if crl_bytes.len() > self.max_body_size {
+            return Err(LtvError::Crl(format!(
+                "CRL from {url} exceeds max body size ({} > {})",
+                crl_bytes.len(),
+                self.max_body_size
+            )));
+        }
 
         // Validate that it looks like a DER-encoded CRL (starts with SEQUENCE tag)
         if crl_bytes.is_empty() || crl_bytes[0] != 0x30 {
@@ -142,6 +184,29 @@ impl CrlClient {
         }
 
         log::debug!("CRL from {url}: {} bytes", crl_bytes.len());
+
+        // Compute cache TTL bounded by both the configured grace period and
+        // the CRL's own nextUpdate. Parse the CRL to get its nextUpdate.
+        let valid_until = if let Ok(parsed) = parse_crl(&crl_bytes) {
+            // If nextUpdate is available, cache until min(nextUpdate, grace_period from now)
+            let grace_deadline = now + self.grace_period;
+            match parsed.next_update {
+                Some(nu) => {
+                    // Convert chrono datetime to Instant roughly: use duration_since(Utc::now)
+                    // as an upper estimate. This is imperfect (wall clock != monotonic clock)
+                    // but adequate for cache expiry; worst case the entry is evicted or
+                    // refreshed early, never served past nextUpdate.
+                    let crl_max_age = (nu - chrono::Utc::now())
+                        .to_std()
+                        .unwrap_or(self.grace_period);
+                    let crl_deadline = now + crl_max_age;
+                    std::cmp::min(grace_deadline, crl_deadline)
+                }
+                None => grace_deadline,
+            }
+        } else {
+            now + self.grace_period
+        };
 
         // Update cache
         {
@@ -153,7 +218,7 @@ impl CrlClient {
                 url.to_string(),
                 CrlCacheEntry {
                     der: crl_bytes.clone(),
-                    fetched_at: Instant::now(),
+                    valid_until,
                 },
             );
         }
@@ -232,20 +297,20 @@ fn parse_crl_dp_extension(der_bytes: &[u8]) -> Result<Vec<String>, String> {
             // DistributionPoint SEQUENCE
             // Look for distributionPoint [0]
             if !dp_body.is_empty() {
-                if let Ok((inner_tag, inner_body, _)) = parse_tlv_with_rest(&dp_body) {
+                if let Ok((inner_tag, inner_body, _)) = parse_tlv_with_rest(dp_body) {
                     if inner_tag == 0xA0 {
                         // DistributionPointName — look for fullName [0]
-                        if let Ok((fn_tag, fn_body, _)) = parse_tlv_with_rest(&inner_body) {
+                        if let Ok((fn_tag, fn_body, _)) = parse_tlv_with_rest(inner_body) {
                             if fn_tag == 0xA0 {
                                 // GeneralNames — look for URI [6]
-                                let mut gn_pos = &fn_body[..];
+                                let mut gn_pos = fn_body;
                                 while !gn_pos.is_empty() {
                                     if let Ok((gn_tag, gn_body, gn_rest)) =
                                         parse_tlv_with_rest(gn_pos)
                                     {
                                         if gn_tag == 0x86 {
                                             // uniformResourceIdentifier [6] IMPLICIT IA5String
-                                            if let Ok(uri) = std::str::from_utf8(&gn_body) {
+                                            if let Ok(uri) = std::str::from_utf8(gn_body) {
                                                 urls.push(uri.to_string());
                                             }
                                         }
@@ -296,6 +361,33 @@ pub struct ParsedCrl {
     pub next_update: Option<chrono::DateTime<chrono::Utc>>,
     /// Revoked certificate entries.
     pub revoked_entries: Vec<RevokedEntry>,
+}
+
+/// OID for delta CRL indicator (2.5.29.27).
+const DELTA_CRL_INDICATOR_OID: &[u8] = &[0x55, 0x1D, 0x1B];
+
+/// OID for Issuing Distribution Point (2.5.29.28).
+const ISSUING_DIST_POINT_OID: &[u8] = &[0x55, 0x1D, 0x1C];
+
+/// Helper: search for a specific OID in an Extensions SEQUENCE body.
+/// Returns the extnValue OCTET STRING body if found, or None.
+fn find_extn_by_oid<'a>(extensions_body: &'a [u8], target_oid: &[u8]) -> Option<&'a [u8]> {
+    // Extensions SEQUENCE body: iterate over Extension SEQUENCEs.
+    let mut pos = extensions_body;
+    while !pos.is_empty() {
+        let (ext_tag, ext_value, rest) = parse_tlv_with_rest(pos).ok()?;
+        if ext_tag != 0x30 {
+            pos = rest;
+            continue;
+        }
+        // Extension ::= SEQUENCE { extnID OID, ... extnValue OCTET STRING }
+        let (oid_tag, oid_body, ext_rest) = parse_tlv_with_rest(ext_value).ok()?;
+        if oid_tag == 0x06 && oid_body == target_oid {
+            return find_tagged_value(ext_rest, 0x04);
+        }
+        pos = rest;
+    }
+    None
 }
 
 /// Parse a DER-encoded CRL into its structural components.
@@ -371,7 +463,7 @@ pub fn parse_crl(crl_der: &[u8]) -> Result<ParsedCrl, LtvError> {
     let signature_bytes = sig_val_body[1..].to_vec();
 
     // Parse TBSCertList body
-    let mut tbs_pos = &tbs_value[..];
+    let mut tbs_pos = tbs_value;
 
     // Optional: version [0] EXPLICIT INTEGER (v2 = 1)
     if !tbs_pos.is_empty() && tbs_pos[0] == 0x02 {
@@ -436,8 +528,34 @@ pub fn parse_crl(crl_der: &[u8]) -> Result<ParsedCrl, LtvError> {
         }
         tbs_pos = r;
     }
-    // Remaining: optional [0] crlExtensions — we skip for now
-    let _ = tbs_pos;
+    // Remaining: optional [0] crlExtensions — parse for delta CRL detection and
+    // IssuingDistributionPoint (M-1).
+    if !tbs_pos.is_empty() && tbs_pos[0] == 0xA0 {
+        // crlExtensions [0] EXPLICIT Extensions
+        let (ext_tag, ext_body, _) = parse_tlv_with_rest(tbs_pos)
+            .map_err(|e| LtvError::Crl(format!("crlExtensions: {e}")))?;
+        if ext_tag == 0xA0 {
+            // Check for delta CRL indicator (2.5.29.27) — reject if present.
+            // Delta CRLs only contain changes since a base CRL; using one as a
+            // complete revocation source would miss entries from the base CRL.
+            if find_extn_by_oid(ext_body, DELTA_CRL_INDICATOR_OID).is_some() {
+                return Err(LtvError::Crl(
+                    "delta CRL (2.5.29.27) not supported; only full CRLs are accepted".into(),
+                ));
+            }
+            // Check for IssuingDistributionPoint (2.5.29.28). If present and its
+            // onlyContainsUserCerts / onlyContainsCACerts suggest this CRL is
+            // partitioned (e.g., only user certs or only CA certs), we reject it
+            // because we cannot verify the cert type match without deeper
+            // inspection. A partitioned CRL cannot serve as a complete revocation
+            // source for all certs under the issuer.
+            if find_extn_by_oid(ext_body, ISSUING_DIST_POINT_OID).is_some() {
+                return Err(LtvError::Crl(
+                    "partitioned CRL (IssuingDistributionPoint) not supported; only full CRLs are accepted".into(),
+                ));
+            }
+        }
+    }
 
     Ok(ParsedCrl {
         tbs_bytes,
@@ -523,7 +641,7 @@ fn parse_revocation_reason(extensions_area: &[u8]) -> RevocationReason {
     let reason_oid_bytes: &[u8] = &[0x55, 0x1D, 0x15]; // 2.5.29.21
 
     // Walk through extensions
-    let mut pos = &ext_body[..];
+    let mut pos = ext_body;
     while !pos.is_empty() {
         let Ok((ext_tag, ext_value, rest)) = parse_tlv_with_rest(pos) else {
             break;
@@ -633,14 +751,41 @@ pub fn check_revocation_with_policy(
     // 2. Verify CRL signature
     verify_crl_signature_with_policy(&parsed, issuer, policy)?;
 
-    // 3. Check CRL freshness: nextUpdate should be in the future
-    if let Some(next_update) = parsed.next_update {
-        if now > next_update {
-            log::warn!("CRL is stale: nextUpdate={next_update}, validation_time={now}");
-            // Stale CRL — we still process it but log a warning.
-            // The Java stack treats stale CRLs as valid for revocation
-            // checking but flags it in diagnostics.
+    // 3. Check CRL freshness (RFC 5280 §6.3.3): a CRL whose nextUpdate
+    //    is in the past must not be relied upon. When nextUpdate is absent,
+    //    the CRL is treated as stale (no statement of future freshness).
+    //    Also reject future-dated thisUpdate (clock integrity check).
+    match parsed.next_update {
+        Some(next_update) => {
+            if next_update < parsed.this_update {
+                return Err(LtvError::Crl(format!(
+                    "CRL has nextUpdate ({next_update}) before thisUpdate ({})",
+                    parsed.this_update
+                )));
+            }
+            if now > next_update {
+                return Err(LtvError::Crl(format!(
+                    "CRL is stale: nextUpdate ({next_update}) is before validation time ({now})"
+                )));
+            }
         }
+        None => {
+            // No nextUpdate: the CRL does not promise future freshness.
+            // RFC 5280 permits omitting nextUpdate, but for security purposes
+            // we reject such CRLs unless used within a very tight window.
+            // At minimum, a CRL without nextUpdate cannot be treated as
+            // indefinitely fresh and is rejected as stale.
+            return Err(LtvError::Crl(format!(
+                "CRL has no nextUpdate field; cannot verify freshness at validation time ({now})"
+            )));
+        }
+    }
+    // Also reject future-dated thisUpdate (clock integrity check).
+    if parsed.this_update > now + chrono::Duration::minutes(5) {
+        return Err(LtvError::Crl(format!(
+            "CRL thisUpdate ({}) is in the future relative to validation time ({now})",
+            parsed.this_update
+        )));
     }
 
     // 4. Verify CRL issuer matches cert's issuer

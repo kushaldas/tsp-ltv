@@ -225,14 +225,15 @@ pub fn parse_timestamp_response(der_bytes: &[u8]) -> Result<TimeStampResp, TspEr
     }
 
     // PKIStatusInfo: first element is PKIStatus INTEGER
-    let (int_tag, int_body, status_rest) = der_utils::parse_tlv_with_rest(&status_body)
+    let (int_tag, int_body, status_rest) = der_utils::parse_tlv_with_rest(status_body)
         .map_err(|e| TspError::InvalidResponse(format!("failed to parse PKIStatus: {e}")))?;
     if int_tag != 0x02 {
         return Err(TspError::InvalidResponse(format!(
             "expected INTEGER tag 0x02 for PKIStatus, got 0x{int_tag:02x}"
         )));
     }
-    let status_val = der_utils::decode_integer_u64(&int_body);
+    let status_val = der_utils::decode_integer_u64(int_body)
+        .map_err(|e| TspError::InvalidResponse(format!("failed to decode PKIStatus: {e}")))?;
     let status = PkiStatus::from_u64(status_val);
 
     // Parse optional statusString and failureInfo from status_rest
@@ -246,9 +247,8 @@ pub fn parse_timestamp_response(der_bytes: &[u8]) -> Result<TimeStampResp, TspEr
                 // SEQUENCE OF UTF8String (statusString)
                 0x30 => {
                     // Try to extract the first UTF8String
-                    if let Ok((_inner_tag, inner_body, _)) = der_utils::parse_tlv_with_rest(&sbody)
-                    {
-                        status_string = Some(String::from_utf8_lossy(&inner_body).to_string());
+                    if let Ok((_inner_tag, inner_body, _)) = der_utils::parse_tlv_with_rest(sbody) {
+                        status_string = Some(String::from_utf8_lossy(inner_body).to_string());
                     }
                 }
                 // BIT STRING (failureInfo)
@@ -1016,7 +1016,7 @@ pub fn extract_tst_info(token_der: &[u8]) -> Result<TstInfo, TspError> {
     }
 
     // SignedData SEQUENCE
-    let (sd_tag, sd_body) = der_utils::parse_tlv(&sd_inner)
+    let (sd_tag, sd_body) = der_utils::parse_tlv(sd_inner)
         .map_err(|e| TspError::InvalidResponse(format!("failed to parse SignedData: {e}")))?;
     if sd_tag != 0x30 {
         return Err(TspError::InvalidResponse(
@@ -1037,7 +1037,7 @@ pub fn extract_tst_info(token_der: &[u8]) -> Result<TstInfo, TspError> {
         .map_err(|e| TspError::InvalidResponse(format!("failed to parse encapContentInfo: {e}")))?;
 
     // eContentType OID
-    let (_ect_tag, _ect_body, eci_rest) = der_utils::parse_tlv_with_rest(&eci_body)
+    let (_ect_tag, _ect_body, eci_rest) = der_utils::parse_tlv_with_rest(eci_body)
         .map_err(|e| TspError::InvalidResponse(format!("failed to parse eContentType: {e}")))?;
 
     // eContent [0] EXPLICIT
@@ -1050,7 +1050,7 @@ pub fn extract_tst_info(token_der: &[u8]) -> Result<TstInfo, TspError> {
     }
 
     // The eContent is an OCTET STRING containing TSTInfo
-    let (os_tag, tst_info_der, _) = der_utils::parse_tlv_with_rest(&ec_inner).map_err(|e| {
+    let (os_tag, tst_info_der, _) = der_utils::parse_tlv_with_rest(ec_inner).map_err(|e| {
         TspError::InvalidResponse(format!("failed to parse eContent OCTET STRING: {e}"))
     })?;
     if os_tag != 0x04 {
@@ -1060,7 +1060,7 @@ pub fn extract_tst_info(token_der: &[u8]) -> Result<TstInfo, TspError> {
     }
 
     // Now parse TSTInfo SEQUENCE
-    parse_tst_info_body(&tst_info_der)
+    parse_tst_info_body(tst_info_der)
 }
 
 /// Parse the inner TSTInfo SEQUENCE body.
@@ -1099,7 +1099,7 @@ fn parse_tst_info_body(der_bytes: &[u8]) -> Result<TstInfo, TspError> {
     // policy TSAPolicyId (OID)
     let (_ptag, pbody, rest) = der_utils::parse_tlv_with_rest(pos)
         .map_err(|e| TspError::InvalidResponse(format!("TSTInfo: failed to parse policy: {e}")))?;
-    let policy_oid = ObjectIdentifier::from_der(&der_utils::encode_tlv(0x06, &pbody))
+    let policy_oid = ObjectIdentifier::from_der(&der_utils::encode_tlv(0x06, pbody))
         .ok()
         .map(|oid| oid.to_string());
     pos = rest;
@@ -1110,7 +1110,7 @@ fn parse_tst_info_body(der_bytes: &[u8]) -> Result<TstInfo, TspError> {
     })?;
     pos = rest;
 
-    let (hash_algorithm, message_hash) = parse_message_imprint(&mi_body)?;
+    let (hash_algorithm, message_hash) = parse_message_imprint(mi_body)?;
 
     // serialNumber INTEGER
     let (_sn_tag, sn_body, rest) = der_utils::parse_tlv_with_rest(pos).map_err(|e| {
@@ -1141,7 +1141,10 @@ fn parse_tst_info_body(der_bytes: &[u8]) -> Result<TstInfo, TspError> {
                 }
                 // nonce INTEGER
                 0x02 => {
-                    nonce = Some(der_utils::decode_integer_u64(&fbody));
+                    nonce =
+                        Some(der_utils::decode_integer_u64(fbody).map_err(|e| {
+                            TspError::InvalidResponse(format!("TSTInfo nonce: {e}"))
+                        })?);
                 }
                 // tsa [0] GeneralName
                 0xA0 => {
@@ -1181,14 +1184,14 @@ fn parse_message_imprint(body: &[u8]) -> Result<(DigestAlgorithm, Vec<u8>), TspE
     })?;
 
     // First element of AlgorithmIdentifier is the OID
-    let (_oid_tag, oid_body, _) = der_utils::parse_tlv_with_rest(&alg_body).map_err(|e| {
+    let (_oid_tag, oid_body, _) = der_utils::parse_tlv_with_rest(alg_body).map_err(|e| {
         TspError::InvalidResponse(format!(
             "messageImprint: failed to parse algorithm OID: {e}"
         ))
     })?;
 
     let alg_oid =
-        ObjectIdentifier::from_der(&der_utils::encode_tlv(0x06, &oid_body)).map_err(|e| {
+        ObjectIdentifier::from_der(&der_utils::encode_tlv(0x06, oid_body)).map_err(|e| {
             TspError::InvalidResponse(format!("messageImprint: invalid algorithm OID: {e}"))
         })?;
 
@@ -1222,17 +1225,11 @@ fn digest_algorithm_identifier(alg: DigestAlgorithm) -> AlgorithmIdentifierOwned
 // Generate a nonce
 // ---------------------------------------------------------------------------
 
-/// Generate a random 64-bit nonce for timestamp requests.
+/// Generate a cryptographically random 64-bit nonce for timestamp requests.
 pub fn generate_nonce() -> u64 {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    // Simple nonce: combine time and a counter.
-    // For production, you'd want a CSPRNG, but this is sufficient for
-    // timestamp nonce replay protection.
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default();
-    // Mix nanoseconds and seconds for reasonable uniqueness
-    now.as_nanos() as u64 ^ (now.as_secs().wrapping_mul(0x517cc1b727220a95))
+    let mut buf = [0u8; 8];
+    getrandom::getrandom(&mut buf).expect("OS random number generator");
+    u64::from_ne_bytes(buf)
 }
 
 // ---------------------------------------------------------------------------

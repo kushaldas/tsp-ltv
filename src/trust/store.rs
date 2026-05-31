@@ -296,6 +296,10 @@ impl TrustStore {
         }
 
         // Walk the chain: each cert's issuer must match next cert's subject
+        // Track path length for pathLenConstraint enforcement (M-5).
+        // CA depth starts at 0 (the leaf at chain[0]) and increments for each
+        // intermediate. The anchor (last element) is a root that established
+        // the trust; pathLen constraints on it apply to the chain beneath it.
         for i in 0..chain.len().saturating_sub(1) {
             let cert = &chain[i];
             let issuer_cert = &chain[i + 1];
@@ -319,7 +323,9 @@ impl TrustStore {
             // Validate extensions: intermediates must have CA:TRUE + keyCertSign
             #[cfg(feature = "ltv")]
             {
-                use crate::ltv::x509_ext::{validate_extensions_for_role, CertRole};
+                use crate::ltv::x509_ext::{
+                    check_basic_constraints, validate_extensions_for_role, CertRole,
+                };
                 validate_extensions_for_role(issuer_cert, CertRole::IntermediateCa).map_err(
                     |e| {
                         TrustError::SignatureVerification(format!(
@@ -328,6 +334,52 @@ impl TrustStore {
                         ))
                     },
                 )?;
+
+                // Enforce pathLenConstraint (M-5). Each intermediate CA may limit
+                // how many subordinate CA certificates may follow it in the chain.
+                // depth_below counts the number of CA certs beneath this issuer.
+                // chain[i+1] issues chain[i]; chain.len()-2-i is the number of
+                // CA certificates that come after this issuer in the chain
+                // (descendants excluding the leaf and the issuer itself).
+                let (_is_ca, path_len) = check_basic_constraints(issuer_cert).map_err(|e| {
+                    TrustError::SignatureVerification(format!(
+                        "failed to parse basicConstraints at intermediate index {}: {e}",
+                        i + 1
+                    ))
+                })?;
+                if let Some(max_depth) = path_len {
+                    // The depth below this CA is: (chain length) - (issuer index + 1) - 1
+                    // = chain.len() - (i+1) - 1 - 1 = chain.len() - i - 3.
+                    // That counts intermediate certs beneath this one; the leaf
+                    // (chain[0]) is an end-entity so it doesn't count.
+                    // But we need: the number of *subordinate CA* certs beneath
+                    // this issuer. That's the number of certs between this issuer
+                    // and the leaf, excluding the leaf itself.
+                    // issuer at index i+1, leaf at 0, so intermediate certs
+                    // below: (i+1) - 1 = i.
+                    // Actually simpler: the number of CA-level certs beneath
+                    // this issuer that issue CA-level certs below them. That's
+                    // i (the number of issuers above the leaf, not counting this one).
+                    // Wait — let's think differently.
+                    // chain = [leaf, intermediate_0, ..., intermediate_n, root]
+                    // issuer_cert is chain[i+1]. The certs that are subordinate
+                    // to this issuer and are themselves CA certs are:
+                    // chain[1] .. chain[i] (if i >= 1) — these are intermediate
+                    // CAs that this issuer directly or transitively issued.
+                    // But we're processing cert -> issuer_cert. The certs below
+                    // issuer_cert are chain[0..=i]. Among those, the ones that
+                    // are intermediate CAs (not the leaf) are chain[1..=i].
+                    // So the count is i (when i >= 1). But pathLen counts
+                    // only *subordinate CA* certificates in the chain below
+                    // this CA, not end-entity certs. So it's i.
+                    let subordinate_ca_count = i; // chain[1..=i] are CA certs beneath issuer
+                    if subordinate_ca_count > max_depth as usize {
+                        return Err(TrustError::SignatureVerification(format!(
+                            "pathLenConstraint ({max_depth}) exceeded at intermediate index {}: {} subordinate CA certs below",
+                            i + 1, subordinate_ca_count
+                        )));
+                    }
+                }
             }
         }
 
@@ -337,13 +389,17 @@ impl TrustStore {
         // Check if the last cert is self-signed and directly in the store
         // (i.e., the chain includes the root itself)
         if last.tbs_certificate.issuer == last.tbs_certificate.subject {
-            if self.contains_der(&last.to_der().unwrap_or_default()) {
+            let last_der = last.to_der().map_err(|e| {
+                TrustError::CertificateParse(format!(
+                    "failed to encode certificate for anchor lookup: {e}"
+                ))
+            })?;
+            if let Some(anchor) = self.anchors.iter().find(|a| a.der == last_der) {
                 // Self-signed cert is directly trusted — verify its self-signature
                 crate::crypto::verify::verify_certificate_signature_with_policy(
                     last, last, policy,
                 )?;
-                let anchor = self.find_issuer(last).unwrap(); // must exist since contains_der passed
-                return Ok(anchor);
+                return Ok(&anchor.cert);
             }
         }
 

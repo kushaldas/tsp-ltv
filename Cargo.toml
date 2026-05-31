@@ -57,11 +57,19 @@ base64 = "0.22"
 # Logging
 log = "0.4"
 
+# CSPRNG for nonce generation
+getrandom = { version = "0.2", features = ["std"] }
+
 # Time
-chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
+chrono = { version = "0.4", default-features = false, features = [
+  "std",
+  "clock",
+] }
 
 # HTTP client — optional (TSA, OCSP, CRL fetching)
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"], optional = true }
+reqwest = { version = "0.12", default-features = false, features = [
+  "rustls-tls",
+], optional = true }
 tokio = { version = "1", features = ["rt", "macros", "time"], optional = true }
 
 [dev-dependencies]

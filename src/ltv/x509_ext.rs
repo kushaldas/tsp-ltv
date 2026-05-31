@@ -214,7 +214,11 @@ pub fn check_basic_constraints(cert: &Certificate) -> Result<(bool, Option<u32>)
     if !pos.is_empty() {
         if let Ok((tag, value, _rest)) = der_utils::parse_tlv_with_rest(pos) {
             if tag == 0x02 {
-                path_len = Some(der_utils::decode_integer_u64(value) as u32);
+                path_len = Some(
+                    der_utils::decode_integer_u64(value)
+                        .map_err(|e| LtvError::X509Extension(format!("pathLenConstraint: {e}")))?
+                        as u32,
+                );
             }
         }
     }
