@@ -5,6 +5,25 @@ use der::{Decode, Encode};
 use std::path::Path;
 use x509_cert::Certificate;
 
+/// Read `(is_ca, pathLenConstraint)` from a certificate's `BasicConstraints`
+/// extension. Available in all build configurations (independent of the `ltv`
+/// feature) so `verify_chain` can enforce `pathLenConstraint` on the TSP-only
+/// token-verification path as well as under `ltv`. A certificate without the
+/// extension yields `(false, None)`.
+fn basic_constraints(cert: &Certificate) -> Result<(bool, Option<u64>), TrustError> {
+    let bc_oid = const_oid::ObjectIdentifier::new_unwrap("2.5.29.19");
+    let Some(extensions) = &cert.tbs_certificate.extensions else {
+        return Ok((false, None));
+    };
+    for ext in extensions.iter() {
+        if ext.extn_id == bc_oid {
+            return crate::der_utils::parse_basic_constraints(ext.extn_value.as_bytes())
+                .map_err(TrustError::CertificateParse);
+        }
+    }
+    Ok((false, None))
+}
+
 /// A trust anchor: a parsed certificate paired with its DER encoding.
 #[derive(Clone)]
 struct TrustAnchor {
@@ -296,6 +315,10 @@ impl TrustStore {
         }
 
         // Walk the chain: each cert's issuer must match next cert's subject
+        // Track path length for pathLenConstraint enforcement (M-5).
+        // CA depth starts at 0 (the leaf at chain[0]) and increments for each
+        // intermediate. The anchor (last element) is a root that established
+        // the trust; pathLen constraints on it apply to the chain beneath it.
         for i in 0..chain.len().saturating_sub(1) {
             let cert = &chain[i];
             let issuer_cert = &chain[i + 1];
@@ -316,7 +339,8 @@ impl TrustStore {
                 policy,
             )?;
 
-            // Validate extensions: intermediates must have CA:TRUE + keyCertSign
+            // Validate extensions: intermediates must have CA:TRUE + keyCertSign.
+            // This deeper role validation lives in the `ltv` extension module.
             #[cfg(feature = "ltv")]
             {
                 use crate::ltv::x509_ext::{validate_extensions_for_role, CertRole};
@@ -329,6 +353,43 @@ impl TrustStore {
                     },
                 )?;
             }
+
+            // Enforce pathLenConstraint (M-5), in every build configuration —
+            // TSP-only token verification reaches `verify_chain` too, so this
+            // must not be gated behind `ltv`. Per RFC 5280 §4.2.1.9 the
+            // constraint bounds the number of CA certificates that may *follow*
+            // this CA toward the leaf in a valid path.
+            let (_is_ca, path_len) = basic_constraints(issuer_cert).map_err(|e| {
+                TrustError::SignatureVerification(format!(
+                    "failed to parse basicConstraints at intermediate index {}: {e}",
+                    i + 1
+                ))
+            })?;
+            if let Some(max_depth) = path_len {
+                // Count the CA certificates strictly below this issuer in the
+                // chain (`chain[0..=i]`). The leaf is included only when it is
+                // itself a CA — `verify_chain` is generic leaf-to-anchor, so
+                // `chain[0]` is not assumed to be an end-entity (e.g. a chain
+                // like [intermediate_ca, root]).
+                let mut subordinate_ca_count = 0usize;
+                for below in &chain[0..=i] {
+                    let (below_is_ca, _) = basic_constraints(below).map_err(|e| {
+                        TrustError::SignatureVerification(format!(
+                            "failed to parse basicConstraints below intermediate index {}: {e}",
+                            i + 1
+                        ))
+                    })?;
+                    if below_is_ca {
+                        subordinate_ca_count += 1;
+                    }
+                }
+                if subordinate_ca_count > max_depth as usize {
+                    return Err(TrustError::SignatureVerification(format!(
+                        "pathLenConstraint ({max_depth}) exceeded at intermediate index {}: {} subordinate CA certs below",
+                        i + 1, subordinate_ca_count
+                    )));
+                }
+            }
         }
 
         // The last cert in the chain must be issued by a trust anchor
@@ -337,13 +398,17 @@ impl TrustStore {
         // Check if the last cert is self-signed and directly in the store
         // (i.e., the chain includes the root itself)
         if last.tbs_certificate.issuer == last.tbs_certificate.subject {
-            if self.contains_der(&last.to_der().unwrap_or_default()) {
+            let last_der = last.to_der().map_err(|e| {
+                TrustError::CertificateParse(format!(
+                    "failed to encode certificate for anchor lookup: {e}"
+                ))
+            })?;
+            if let Some(anchor) = self.anchors.iter().find(|a| a.der == last_der) {
                 // Self-signed cert is directly trusted — verify its self-signature
                 crate::crypto::verify::verify_certificate_signature_with_policy(
                     last, last, policy,
                 )?;
-                let anchor = self.find_issuer(last).unwrap(); // must exist since contains_der passed
-                return Ok(anchor);
+                return Ok(&anchor.cert);
             }
         }
 
@@ -505,5 +570,111 @@ mod tests {
             SignaturePolicy::allow_legacy()
         );
         assert_eq!(store.signature_policy(), SignaturePolicy::strict());
+    }
+
+    /// Issue a certificate with the given builder `profile`, subject key, and
+    /// issuer signer (the parent CA's key; for a root, pass its own key). Built
+    /// at runtime so no fixtures are committed.
+    fn issue_cert(
+        profile: x509_cert::builder::Profile,
+        subject: &str,
+        subject_key: &rsa::RsaPrivateKey,
+        issuer_signer: &rsa::pkcs1v15::SigningKey<sha2::Sha256>,
+    ) -> Certificate {
+        use rsa::pkcs1v15::SigningKey;
+        use rsa::signature::Keypair;
+        use sha2::Sha256;
+        use x509_cert::builder::{Builder, CertificateBuilder};
+        use x509_cert::name::Name;
+        use x509_cert::serial_number::SerialNumber;
+        use x509_cert::spki::SubjectPublicKeyInfoOwned;
+        use x509_cert::time::Validity;
+
+        let subject_signer = SigningKey::<Sha256>::new(subject_key.clone());
+        let spki = SubjectPublicKeyInfoOwned::from_key(subject_signer.verifying_key())
+            .expect("SPKI from key");
+        let serial = SerialNumber::new(&[0x01]).unwrap();
+        let validity =
+            Validity::from_now(std::time::Duration::from_secs(3650 * 24 * 3600)).unwrap();
+        let subject: Name = subject.parse().unwrap();
+        CertificateBuilder::new(profile, serial, validity, subject, spki, issuer_signer)
+            .expect("cert builder")
+            .build()
+            .expect("build cert")
+    }
+
+    /// Build a `[leaf_subca, mid_subca, root]` chain where `mid_subca` carries
+    /// `pathLenConstraint = path_len`. `chain[0]` is itself a CA — the case the
+    /// old `subordinate_ca_count = i` shortcut undercounted (it never counted
+    /// the leaf). Returns `(store_with_root_anchor, chain)`.
+    fn ca_leaf_chain(path_len: Option<u8>) -> (TrustStore, Vec<Certificate>) {
+        use rsa::pkcs1v15::SigningKey;
+        use rsa::RsaPrivateKey;
+        use sha2::Sha256;
+        use x509_cert::builder::Profile;
+        use x509_cert::name::Name;
+
+        let mut rng = rand::thread_rng();
+        let root_key = RsaPrivateKey::new(&mut rng, 2048).expect("root key");
+        let mid_key = RsaPrivateKey::new(&mut rng, 2048).expect("mid key");
+        let leaf_key = RsaPrivateKey::new(&mut rng, 2048).expect("leaf key");
+
+        let root_signer = SigningKey::<Sha256>::new(root_key.clone());
+        let mid_signer = SigningKey::<Sha256>::new(mid_key.clone());
+
+        let root_name = "CN=PathLen Root,O=tsp-ltv tests";
+        let mid_name = "CN=PathLen Mid,O=tsp-ltv tests";
+        let leaf_name = "CN=PathLen Leaf CA,O=tsp-ltv tests";
+        let root_issuer: Name = root_name.parse().unwrap();
+        let mid_issuer: Name = mid_name.parse().unwrap();
+
+        let root = issue_cert(Profile::Root, root_name, &root_key, &root_signer);
+        let mid = issue_cert(
+            Profile::SubCA {
+                issuer: root_issuer,
+                path_len_constraint: path_len,
+            },
+            mid_name,
+            &mid_key,
+            &root_signer,
+        );
+        // leaf is itself a CA (SubCA), so chain[0] is a CA certificate.
+        let leaf = issue_cert(
+            Profile::SubCA {
+                issuer: mid_issuer,
+                path_len_constraint: None,
+            },
+            leaf_name,
+            &leaf_key,
+            &mid_signer,
+        );
+
+        let mut store = TrustStore::new();
+        store.add_certificate(root.clone()).unwrap();
+        (store, vec![leaf, mid, root])
+    }
+
+    #[test]
+    fn test_verify_chain_pathlen_rejects_ca_leaf_below_zero_constraint() {
+        // mid_subca has pathLenConstraint = 0, but a CA (leaf_subca) sits below
+        // it. The leaf must be counted, so the chain is rejected.
+        let (store, chain) = ca_leaf_chain(Some(0));
+        let err = store
+            .verify_chain(&chain, None)
+            .expect_err("pathLen=0 with a CA leaf below must be rejected");
+        assert!(
+            matches!(err, TrustError::SignatureVerification(ref m) if m.contains("pathLenConstraint")),
+            "expected pathLenConstraint rejection, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn test_verify_chain_pathlen_allows_ca_leaf_within_constraint() {
+        // Same chain but pathLenConstraint = 1 permits exactly one CA below the
+        // mid CA — the chain verifies (guards against over-rejection).
+        let (store, chain) = ca_leaf_chain(Some(1));
+        store
+            .verify_chain(&chain, None)
+            .expect("pathLen=1 with one CA leaf below must be accepted");
     }
 }

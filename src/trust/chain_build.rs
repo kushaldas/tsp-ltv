@@ -90,7 +90,7 @@ pub fn build_chain_from_pool_with_policy(
         }
 
         // If the issuer matches a trust anchor, we're done — the chain is complete
-        if trust_anchor_subjects.iter().any(|s| *s == issuer_name_der) {
+        if trust_anchor_subjects.contains(&issuer_name_der) {
             break;
         }
 

@@ -138,13 +138,39 @@ pub fn encode_integer_u64(val: u64) -> Vec<u8> {
 
 /// Decode a DER INTEGER body (no tag/length) to `u64`.
 ///
-/// Handles leading zero padding. Truncates values > 64 bits.
-pub fn decode_integer_u64(bytes: &[u8]) -> u64 {
+/// Handles leading zero padding. Returns an error if the integer is negative
+/// (high bit of the first significant byte set) or exceeds 64 bits (> 8 bytes
+/// of significant data after stripping leading-zero padding).
+pub fn decode_integer_u64(bytes: &[u8]) -> Result<u64, String> {
+    if bytes.is_empty() {
+        return Err("empty INTEGER body".into());
+    }
+    // Check for negative: MSB of first byte set.
+    // But the first byte may be a leading 0x00 pad for positive sign; skip it.
+    // A negative INTEGER has MSB=1 in its actual value byte, without a leading pad.
+    let (significant, _overflow) = if bytes.len() > 1 && bytes[0] == 0x00 {
+        (&bytes[1..], false)
+    } else if bytes[0] & 0x80 != 0 {
+        return Err(format!(
+            "negative INTEGER body not representable as u64: 0x{:02x}...",
+            bytes[0]
+        ));
+    } else {
+        (bytes, false)
+    };
+
+    if significant.len() > 8 {
+        return Err(format!(
+            "INTEGER body too large for u64: {} significant bytes",
+            significant.len()
+        ));
+    }
+
     let mut val: u64 = 0;
-    for &b in bytes {
+    for &b in significant {
         val = (val << 8) | (b as u64);
     }
-    val
+    Ok(val)
 }
 
 /// Encode a DER BOOLEAN value.
@@ -165,11 +191,62 @@ pub fn parse_integer_body(body: &[u8]) -> Vec<u8> {
     }
 }
 
+/// Parse a DER-encoded `BasicConstraints` extension value.
+///
+/// Returns `(is_ca, path_len_constraint)`. An empty SEQUENCE body yields
+/// `(false, None)`. This is a pure byte-level parser (no `x509-cert` or feature
+/// dependency) so trust-chain code can enforce `pathLenConstraint` in every
+/// build configuration, not only when the `ltv` feature is enabled.
+///
+/// ```text
+/// BasicConstraints ::= SEQUENCE {
+///     cA                      BOOLEAN DEFAULT FALSE,
+///     pathLenConstraint       INTEGER (0..MAX) OPTIONAL
+/// }
+/// ```
+pub fn parse_basic_constraints(ext_value: &[u8]) -> Result<(bool, Option<u64>), String> {
+    let (tag, seq_body) = parse_tlv(ext_value)?;
+    if tag != 0x30 {
+        return Err(format!(
+            "basicConstraints: expected SEQUENCE (0x30), got 0x{tag:02x}"
+        ));
+    }
+    if seq_body.is_empty() {
+        return Ok((false, None));
+    }
+
+    let mut is_ca = false;
+    let mut path_len: Option<u64> = None;
+    let mut pos = &seq_body[..];
+
+    // cA BOOLEAN (optional, DEFAULT FALSE)
+    if let Ok((t, value, rest)) = parse_tlv_with_rest(pos) {
+        if t == 0x01 {
+            is_ca = !value.is_empty() && value[0] != 0x00;
+            pos = rest;
+        }
+    }
+
+    // pathLenConstraint INTEGER (optional)
+    if !pos.is_empty() {
+        if let Ok((t, value, _rest)) = parse_tlv_with_rest(pos) {
+            if t == 0x02 {
+                path_len = Some(
+                    decode_integer_u64(value)
+                        .map_err(|e| format!("pathLenConstraint: {e}"))?,
+                );
+            }
+        }
+    }
+
+    Ok((is_ca, path_len))
+}
+
 /// Find the first child element with a specific tag inside a SEQUENCE body.
 ///
 /// Searches the immediate children (not recursive) of the given body bytes.
 /// Returns the value bytes of the first match, or `None`.
-pub fn find_tagged_value<'a>(body: &'a [u8], target_tag: u8) -> Option<&'a [u8]> {
+pub fn find_tagged_value(body: &[u8], target_tag: u8) -> Option<&[u8]> {
     let mut pos = body;
     while !pos.is_empty() {
         match parse_tlv_with_rest(pos) {
@@ -212,9 +289,18 @@ pub fn integer_bodies_equal(a: &[u8], b: &[u8]) -> bool {
 /// Parse a DER-encoded GeneralizedTime body (no tag/length) to a chrono DateTime.
 ///
 /// Format: `YYYYMMDDHHMMSSZ` or `YYYYMMDDHHMMSS.fracZ`
+///
+/// # Panic safety
+///
+/// The string is checked to be ASCII before any indexing on the `&str`, so a
+/// multi-byte UTF-8 character cannot cause a mid-character slice panic.
 pub fn parse_generalized_time(body: &[u8]) -> Result<chrono::DateTime<chrono::Utc>, String> {
     let s =
         std::str::from_utf8(body).map_err(|e| format!("GeneralizedTime: invalid UTF-8: {e}"))?;
+
+    if !s.is_ascii() {
+        return Err("GeneralizedTime: non-ASCII characters".to_string());
+    }
 
     // Strip trailing 'Z'
     let s = s.strip_suffix('Z').unwrap_or(s);
@@ -249,8 +335,17 @@ pub fn parse_generalized_time(body: &[u8]) -> Result<chrono::DateTime<chrono::Ut
 /// Parse a DER-encoded UTCTime body (no tag/length) to a chrono DateTime.
 ///
 /// Format: `YYMMDDHHMMSSZ`
+///
+/// # Panic safety
+///
+/// The string is checked to be ASCII before any indexing on the `&str`, so a
+/// multi-byte UTF-8 character cannot cause a mid-character slice panic.
 pub fn parse_utc_time(body: &[u8]) -> Result<chrono::DateTime<chrono::Utc>, String> {
     let s = std::str::from_utf8(body).map_err(|e| format!("UTCTime: invalid UTF-8: {e}"))?;
+
+    if !s.is_ascii() {
+        return Err("UTCTime: non-ASCII characters".to_string());
+    }
 
     let s = s.strip_suffix('Z').unwrap_or(s);
 
@@ -332,8 +427,14 @@ mod tests {
         assert_eq!(encode_integer_u64(128), vec![0x02, 0x02, 0x00, 0x80]);
 
         // Decode back
-        assert_eq!(decode_integer_u64(&[0x01]), 1);
-        assert_eq!(decode_integer_u64(&[0x00, 0x80]), 128);
+        assert_eq!(decode_integer_u64(&[0x01]).unwrap(), 1);
+        assert_eq!(decode_integer_u64(&[0x00, 0x80]).unwrap(), 128);
+        // Negative values rejected
+        assert!(decode_integer_u64(&[0x80]).is_err());
+        // Too large (>8 bytes of significant data)
+        assert!(
+            decode_integer_u64(&[0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09]).is_err()
+        );
     }
 
     #[test]

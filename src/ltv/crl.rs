@@ -32,6 +32,13 @@ struct CrlCacheEntry {
 ///
 /// Fetches CRLs from distribution points and caches them to avoid
 /// redundant network requests.
+///
+/// As an SSRF mitigation against attacker-controlled distribution-point URLs,
+/// fetches are restricted to `http`/`https` and the resolved host must be a
+/// public address — loopback, private, link-local, unique-local, and metadata
+/// ranges are refused (see [`CrlClient::validate_url`]), and the default client
+/// will not follow redirects to literal non-public addresses. Fetched CRL
+/// bodies are capped at [`MAX_BODY_SIZE`] to prevent memory exhaustion.
 #[derive(Debug, Clone)]
 pub struct CrlClient {
     http_client: Client,
@@ -40,6 +47,8 @@ pub struct CrlClient {
     cache: Arc<Mutex<HashMap<String, CrlCacheEntry>>>,
     /// How long cached CRLs remain valid.
     grace_period: Duration,
+    /// Maximum response body size (10 MiB default).
+    max_body_size: usize,
     /// Freshness policy used to decide whether a cached or just-fetched CRL is
     /// still current (within its own `thisUpdate`/`nextUpdate` window). This is a
     /// *fetch-time* check against the wall clock — distinct from the orchestrator's
@@ -50,16 +59,86 @@ pub struct CrlClient {
     freshness: CrlFreshness,
 }
 
+/// Maximum allowed CRL response body size (10 MiB).
+const MAX_BODY_SIZE: usize = 10 * 1024 * 1024;
+
+/// Maximum HTTP redirects followed when fetching a CRL.
+const MAX_REDIRECTS: usize = 5;
+
+/// Classify an IPv4 address as non-public (loopback, private, link-local,
+/// unspecified, broadcast, documentation, multicast, or RFC 6598 CGNAT shared
+/// space).
+fn is_disallowed_ipv4(v4: std::net::Ipv4Addr) -> bool {
+    let o = v4.octets();
+    v4.is_loopback()
+        || v4.is_private()
+        || v4.is_link_local()
+        || v4.is_unspecified()
+        || v4.is_broadcast()
+        || v4.is_documentation()
+        || v4.is_multicast()
+        // CGNAT shared address space 100.64.0.0/10 (RFC 6598)
+        || (o[0] == 100 && (o[1] & 0xc0) == 0x40)
+}
+
+/// Classify an IP address as non-public, so the CRL SSRF guard can refuse
+/// fetches whose host resolves to an internal or metadata address. IPv4-mapped
+/// IPv6 addresses are unwrapped and re-checked.
+fn is_disallowed_ip(ip: std::net::IpAddr) -> bool {
+    use std::net::IpAddr;
+    match ip {
+        IpAddr::V4(v4) => is_disallowed_ipv4(v4),
+        IpAddr::V6(v6) => {
+            if let Some(v4) = v6.to_ipv4_mapped() {
+                return is_disallowed_ipv4(v4);
+            }
+            let first = v6.segments()[0];
+            v6.is_loopback()
+                || v6.is_unspecified()
+                || v6.is_multicast()
+                // unique local fc00::/7
+                || (first & 0xfe00) == 0xfc00
+                // link-local unicast fe80::/10
+                || (first & 0xffc0) == 0xfe80
+        }
+    }
+}
+
+/// Build the default CRL HTTP client with a bounded redirect policy that
+/// refuses to follow redirects to literal non-public addresses — complementing
+/// the resolve-time SSRF check in [`CrlClient::validate_url`].
+fn default_http_client() -> Client {
+    let policy = reqwest::redirect::Policy::custom(|attempt| {
+        if attempt.previous().len() >= MAX_REDIRECTS {
+            return attempt.error("too many CRL redirects");
+        }
+        if let Some(host) = attempt.url().host_str() {
+            if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+                if is_disallowed_ip(ip) {
+                    // Stop following; the caller sees the 3xx and rejects it.
+                    return attempt.stop();
+                }
+            }
+        }
+        attempt.follow()
+    });
+    Client::builder()
+        .redirect(policy)
+        .build()
+        .unwrap_or_else(|_| Client::new())
+}
+
 impl CrlClient {
     /// Create a new CRL client with default settings.
     ///
     /// Default grace period: 1 hour.
     pub fn new() -> Self {
         Self {
-            http_client: Client::new(),
+            http_client: default_http_client(),
             timeout: Duration::from_secs(30),
             cache: Arc::new(Mutex::new(HashMap::new())),
             grace_period: Duration::from_secs(3600),
+            max_body_size: MAX_BODY_SIZE,
             freshness: CrlFreshness::default(),
         }
     }
@@ -86,6 +165,86 @@ impl CrlClient {
     pub fn freshness(mut self, freshness: CrlFreshness) -> Self {
         self.freshness = freshness;
         self
+    }
+
+    /// Set the maximum response body size.
+    pub fn max_body_size(mut self, max: usize) -> Self {
+        self.max_body_size = max;
+        self
+    }
+
+    /// Validate that a URL is safe to fetch before any network egress.
+    ///
+    /// Enforces an `http`/`https` scheme allowlist **and** resolves the host,
+    /// rejecting the fetch when any resolved address is loopback, private,
+    /// link-local, unique-local, multicast, or otherwise non-public. Scheme
+    /// filtering alone does not stop SSRF — a CRL distribution point URL is
+    /// attacker-controlled and can name `127.0.0.1`, `169.254.169.254`
+    /// (cloud metadata), or an RFC 1918 host directly or via DNS.
+    ///
+    /// Residual limitation: the host is resolved here while `reqwest` re-resolves
+    /// at connect time, so a DNS-rebinding attacker who flips the record between
+    /// the two lookups is not fully prevented. The default client's redirect
+    /// policy additionally refuses redirects to literal non-public addresses.
+    async fn validate_url(url: &str) -> Result<(), LtvError> {
+        let parsed = reqwest::Url::parse(url)
+            .map_err(|e| LtvError::Crl(format!("invalid CRL URL {url}: {e}")))?;
+        match parsed.scheme() {
+            "http" | "https" => {}
+            other => {
+                return Err(LtvError::Crl(format!(
+                    "CRL URL scheme not allowed: {other} (only http/https are supported)"
+                )))
+            }
+        }
+        let host = parsed
+            .host_str()
+            .ok_or_else(|| LtvError::Crl(format!("CRL URL has no host: {url}")))?;
+        // `host_str()` brackets IPv6 literals (`[::1]`); strip them for parsing.
+        let host_bare = host
+            .strip_prefix('[')
+            .and_then(|h| h.strip_suffix(']'))
+            .unwrap_or(host);
+
+        // A literal IP needs no DNS — check it directly.
+        if let Ok(ip) = host_bare.parse::<std::net::IpAddr>() {
+            if is_disallowed_ip(ip) {
+                return Err(LtvError::Crl(format!(
+                    "CRL host {host_bare} is a non-public address (SSRF guard)"
+                )));
+            }
+            return Ok(());
+        }
+
+        // Hostname: resolve off the async executor and reject any non-public
+        // destination among the resolved addresses.
+        let port = parsed.port_or_known_default().unwrap_or(0);
+        let host_owned = host_bare.to_string();
+        let host_for_lookup = host_owned.clone();
+        let addrs: Vec<std::net::SocketAddr> = tokio::task::spawn_blocking(move || {
+            use std::net::ToSocketAddrs;
+            (host_for_lookup.as_str(), port)
+                .to_socket_addrs()
+                .map(|it| it.collect::<Vec<_>>())
+        })
+        .await
+        .map_err(|e| LtvError::Crl(format!("DNS resolution task failed: {e}")))?
+        .map_err(|e| LtvError::Crl(format!("failed to resolve CRL host {host_owned}: {e}")))?;
+
+        if addrs.is_empty() {
+            return Err(LtvError::Crl(format!(
+                "CRL host {host_owned} resolved to no addresses"
+            )));
+        }
+        for addr in &addrs {
+            if is_disallowed_ip(addr.ip()) {
+                return Err(LtvError::Crl(format!(
+                    "CRL host {host_owned} resolves to non-public address {} (SSRF guard)",
+                    addr.ip()
+                )));
+            }
+        }
+        Ok(())
     }
 
     /// Extract CRL distribution point URLs from a certificate.
@@ -134,7 +293,8 @@ impl CrlClient {
         url: &str,
         freshness: &CrlFreshness,
     ) -> Result<Vec<u8>, LtvError> {
-        // Check cache first
+        // Check cache first. A cache hit performs no network egress, so the SSRF
+        // guard (which resolves DNS) only needs to run on the fetch path below.
         {
             let cache = self
                 .cache
@@ -150,6 +310,11 @@ impl CrlClient {
                 log::debug!("CRL cache entry for {url} is stale or expired; re-fetching");
             }
         }
+
+        // Validate scheme *and* that the host resolves to a public address
+        // before any network egress (SSRF guard). A certificate's CRL
+        // distribution point URL is attacker-controlled.
+        Self::validate_url(url).await?;
 
         log::debug!("Fetching CRL from {url}");
 
@@ -168,11 +333,35 @@ impl CrlClient {
             )));
         }
 
-        let crl_bytes = response
-            .bytes()
-            .await
-            .map_err(|e| LtvError::Crl(format!("failed to read CRL response body: {e}")))?
-            .to_vec();
+        // Reject up front if the advertised Content-Length already exceeds the
+        // cap, so an oversized body is never even streamed.
+        if let Some(len) = response.content_length() {
+            if len > self.max_body_size as u64 {
+                return Err(LtvError::Crl(format!(
+                    "CRL from {url} exceeds max body size ({len} > {})",
+                    self.max_body_size
+                )));
+            }
+        }
+
+        // Stream the body and abort as soon as the accumulated bytes exceed the
+        // cap, bounding peak memory even when Content-Length is absent or lies.
+        let mut crl_bytes: Vec<u8> = Vec::new();
+        let mut response = response;
+        loop {
+            let chunk = response
+                .chunk()
+                .await
+                .map_err(|e| LtvError::Crl(format!("failed to read CRL response body: {e}")))?;
+            let Some(chunk) = chunk else { break };
+            if crl_bytes.len() + chunk.len() > self.max_body_size {
+                return Err(LtvError::Crl(format!(
+                    "CRL from {url} exceeds max body size (> {})",
+                    self.max_body_size
+                )));
+            }
+            crl_bytes.extend_from_slice(&chunk);
+        }
 
         // Validate that it looks like a DER-encoded CRL (starts with SEQUENCE tag)
         if crl_bytes.is_empty() || crl_bytes[0] != 0x30 {
@@ -379,6 +568,33 @@ pub struct ParsedCrl {
     pub revoked_entries: Vec<RevokedEntry>,
 }
 
+/// OID for delta CRL indicator (2.5.29.27).
+const DELTA_CRL_INDICATOR_OID: &[u8] = &[0x55, 0x1D, 0x1B];
+
+/// OID for Issuing Distribution Point (2.5.29.28).
+const ISSUING_DIST_POINT_OID: &[u8] = &[0x55, 0x1D, 0x1C];
+
+/// Helper: search for a specific OID in an Extensions SEQUENCE body.
+/// Returns the extnValue OCTET STRING body if found, or None.
+fn find_extn_by_oid<'a>(extensions_body: &'a [u8], target_oid: &[u8]) -> Option<&'a [u8]> {
+    // Extensions SEQUENCE body: iterate over Extension SEQUENCEs.
+    let mut pos = extensions_body;
+    while !pos.is_empty() {
+        let (ext_tag, ext_value, rest) = parse_tlv_with_rest(pos).ok()?;
+        if ext_tag != 0x30 {
+            pos = rest;
+            continue;
+        }
+        // Extension ::= SEQUENCE { extnID OID, ... extnValue OCTET STRING }
+        let (oid_tag, oid_body, ext_rest) = parse_tlv_with_rest(ext_value).ok()?;
+        if oid_tag == 0x06 && oid_body == target_oid {
+            return find_tagged_value(ext_rest, 0x04);
+        }
+        pos = rest;
+    }
+    None
+}
+
 /// Parse a DER-encoded CRL into its structural components.
 ///
 /// ```text
@@ -517,8 +733,38 @@ pub fn parse_crl(crl_der: &[u8]) -> Result<ParsedCrl, LtvError> {
         }
         tbs_pos = r;
     }
-    // Remaining: optional [0] crlExtensions — we skip for now
-    let _ = tbs_pos;
+    // Remaining: optional [0] crlExtensions — parse for delta CRL detection and
+    // IssuingDistributionPoint (M-1).
+    if !tbs_pos.is_empty() && tbs_pos[0] == 0xA0 {
+        // crlExtensions [0] EXPLICIT Extensions. The [0] body is the inner
+        // `Extensions ::= SEQUENCE OF Extension` TLV; unwrap it so the OID scan
+        // iterates over the individual Extension entries rather than seeing the
+        // wrapping SEQUENCE as a single (OID-less) extension.
+        let (wrap_tag, wrap_body, _) = parse_tlv_with_rest(tbs_pos)
+            .map_err(|e| LtvError::Crl(format!("crlExtensions: {e}")))?;
+        if wrap_tag == 0xA0 {
+            let (seq_tag, extensions_body, _) = parse_tlv_with_rest(wrap_body)
+                .map_err(|e| LtvError::Crl(format!("crlExtensions SEQUENCE: {e}")))?;
+            if seq_tag == 0x30 {
+                // Check for delta CRL indicator (2.5.29.27) — reject if present.
+                // Delta CRLs only contain changes since a base CRL; using one as a
+                // complete revocation source would miss entries from the base CRL.
+                if find_extn_by_oid(extensions_body, DELTA_CRL_INDICATOR_OID).is_some() {
+                    return Err(LtvError::Crl(
+                        "delta CRL (2.5.29.27) not supported; only full CRLs are accepted".into(),
+                    ));
+                }
+                // Check for IssuingDistributionPoint (2.5.29.28). A partitioned CRL
+                // cannot serve as a complete revocation source for all certs under
+                // the issuer, so we reject it.
+                if find_extn_by_oid(extensions_body, ISSUING_DIST_POINT_OID).is_some() {
+                    return Err(LtvError::Crl(
+                        "partitioned CRL (IssuingDistributionPoint) not supported; only full CRLs are accepted".into(),
+                    ));
+                }
+            }
+        }
+    }
 
     Ok(ParsedCrl {
         tbs_bytes,
@@ -1158,6 +1404,72 @@ mod tests {
         assert_eq!(parsed.revoked_entries[1].serial_number, vec![0xFF]);
     }
 
+    /// Build a minimal, structurally-valid CRL carrying a single `crlExtension`
+    /// with the given OID (and an empty `extnValue`). The signature is a dummy
+    /// BIT STRING: `parse_crl` validates `crlExtensions` (delta / IDP rejection)
+    /// while parsing, *before* any signature verification, so these structural
+    /// tests need no real key. The `[0] EXPLICIT Extensions` wrapping mirrors a
+    /// real CRL, exercising the SEQUENCE-unwrap in the OID scan.
+    fn build_crl_with_extension(ext_oid: &[u8]) -> Vec<u8> {
+        let mut tbs_body = Vec::new();
+        // version INTEGER 1 (v2)
+        tbs_body.extend_from_slice(&encode_integer_u64(1));
+        // signature AlgorithmIdentifier: sha256WithRSAEncryption
+        let sha256_rsa_oid: &[u8] = &[
+            0x06, 0x09, 0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x01, 0x0B,
+        ];
+        let alg_id = encode_sequence_from_parts(&[sha256_rsa_oid, &[0x05, 0x00]]);
+        tbs_body.extend_from_slice(&alg_id);
+        // issuer Name — minimal empty RDNSequence SEQUENCE
+        tbs_body.extend_from_slice(&encode_sequence_raw(&[]));
+        // thisUpdate / nextUpdate UTCTime
+        tbs_body.extend_from_slice(&encode_tlv(0x17, b"260101000000Z"));
+        tbs_body.extend_from_slice(&encode_tlv(0x17, b"270101000000Z"));
+        // crlExtensions [0] EXPLICIT Extensions ::= SEQUENCE OF Extension
+        // Extension ::= SEQUENCE { extnID OID, extnValue OCTET STRING }
+        let oid_tlv = encode_tlv(0x06, ext_oid);
+        let value_tlv = encode_tlv(0x04, &[]); // empty extnValue OCTET STRING
+        let extension = encode_sequence_from_parts(&[&oid_tlv, &value_tlv]);
+        let extensions_seq = encode_sequence_raw(&extension);
+        tbs_body.extend_from_slice(&encode_tlv(0xA0, &extensions_seq));
+
+        let tbs_der = encode_sequence_raw(&tbs_body);
+        // Dummy signature BIT STRING (0 unused bits + arbitrary bytes).
+        let sig_bit_string = encode_tlv(0x03, &[0x00, 0xDE, 0xAD]);
+        encode_sequence_from_parts(&[&tbs_der, &alg_id, &sig_bit_string])
+    }
+
+    #[test]
+    fn test_parse_crl_rejects_delta_crl() {
+        // deltaCRLIndicator (2.5.29.27) → 0x55, 0x1D, 0x1B.
+        let crl_der = build_crl_with_extension(&[0x55, 0x1D, 0x1B]);
+        let err = parse_crl(&crl_der).expect_err("delta CRL must be rejected");
+        let msg = format!("{err}");
+        assert!(msg.contains("delta CRL"), "unexpected error: {msg}");
+    }
+
+    #[test]
+    fn test_parse_crl_rejects_partitioned_crl() {
+        // IssuingDistributionPoint (2.5.29.28) → 0x55, 0x1D, 0x1C.
+        let crl_der = build_crl_with_extension(&[0x55, 0x1D, 0x1C]);
+        let err = parse_crl(&crl_der).expect_err("partitioned CRL must be rejected");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("partitioned CRL"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_parse_crl_accepts_benign_extension() {
+        // cRLNumber (2.5.29.20) is a normal full-CRL extension and must parse:
+        // guards against the OID scan over-rejecting after the SEQUENCE unwrap.
+        let crl_der = build_crl_with_extension(&[0x55, 0x1D, 0x14]);
+        let parsed = parse_crl(&crl_der).expect("benign extension must parse");
+        assert!(parsed.revoked_entries.is_empty());
+        assert!(parsed.next_update.is_some());
+    }
+
     #[test]
     fn test_verify_crl_signature() {
         let key_path = intermediate_ca_key_pem();
@@ -1505,6 +1817,68 @@ mod tests {
             instant("2026-06-01T00:00:00Z"),
             &CrlFreshness::default()
         ));
+    }
+
+    #[test]
+    fn test_is_disallowed_ip_classification() {
+        use std::net::IpAddr;
+        let blocked = [
+            "127.0.0.1",
+            "169.254.169.254", // cloud metadata (link-local)
+            "10.0.0.1",
+            "172.16.5.5",
+            "192.168.1.1",
+            "0.0.0.0",
+            "100.64.0.1", // CGNAT
+            "::1",
+            "fc00::1",  // unique local
+            "fe80::1",  // link-local
+            "::ffff:127.0.0.1", // IPv4-mapped loopback
+        ];
+        for s in blocked {
+            let ip: IpAddr = s.parse().unwrap();
+            assert!(is_disallowed_ip(ip), "{s} should be disallowed");
+        }
+        let allowed = ["8.8.8.8", "1.1.1.1", "93.184.216.34", "2606:4700:4700::1111"];
+        for s in allowed {
+            let ip: IpAddr = s.parse().unwrap();
+            assert!(!is_disallowed_ip(ip), "{s} should be allowed");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_validate_url_rejects_non_http_scheme() {
+        let err = CrlClient::validate_url("ftp://example.com/x.crl")
+            .await
+            .expect_err("non-http scheme must be rejected");
+        assert!(format!("{err}").contains("scheme not allowed"));
+    }
+
+    #[tokio::test]
+    async fn test_validate_url_blocks_each_internal_target() {
+        for url in [
+            "http://127.0.0.1/x.crl",
+            "http://169.254.169.254/latest/meta-data/",
+            "http://10.0.0.1/x.crl",
+            "http://192.168.1.1/x.crl",
+            "http://[::1]/x.crl",
+        ] {
+            let err = CrlClient::validate_url(url)
+                .await
+                .expect_err("internal address must be refused");
+            assert!(
+                format!("{err}").contains("non-public"),
+                "unexpected error for {url}: {err}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_validate_url_allows_public_literal() {
+        // A public literal IP resolves without DNS and must pass (no fetch).
+        CrlClient::validate_url("http://1.1.1.1/x.crl")
+            .await
+            .expect("public address must be allowed");
     }
 
     #[tokio::test]
