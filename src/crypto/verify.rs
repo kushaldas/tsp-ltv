@@ -7,9 +7,9 @@
 //! - RSA PKCS#1 v1.5 with MD5 (legacy), SHA-1 (legacy), SHA-224 (legacy), SHA-256, SHA-384, SHA-512
 //! - RSA-PSS (RSASSA-PSS) with SHA-256, SHA-384, SHA-512
 //! - ECDSA P-256/P-384 with SHA-1 (legacy)
-//! - ECDSA P-256 with SHA-256
-//! - ECDSA P-384 with SHA-384
-//! - ECDSA P-521 with SHA-512
+//! - ECDSA P-256 with SHA-256, SHA-384, SHA-512
+//! - ECDSA P-384 with SHA-256, SHA-384, SHA-512
+//! - ECDSA P-521 with SHA-256, SHA-384, SHA-512
 //! - Ed25519
 //! - DSA (DSS) with SHA-1 (legacy) and SHA-256
 //!
@@ -126,6 +126,10 @@ fn ec_named_curve(spki: &spki::SubjectPublicKeyInfoRef<'_>) -> Result<EcCurve, T
 /// (curve, hash) pairings are accepted; the unusual-but-real P-521-with-SHA-256
 /// and P-521-with-SHA-384 combinations seen on some self-signed certificates are
 /// kept, but cross-curve guesses are rejected.
+///
+/// For a declared hash stronger than the curve (e.g. P-256 with ecdsa-with-SHA512)
+/// the digest is truncated to the curve order, so the strength is still that of
+/// the curve.
 fn verify_ecdsa_bound(
     tbs: &[u8],
     sig: &[u8],
@@ -143,7 +147,11 @@ fn verify_ecdsa_bound(
     let curve = ec_named_curve(&spki)?;
     match (curve, hash) {
         (EcCurve::P256, EcdsaHash::Sha256) => verify_ecdsa_p256_spki(spki, tbs, sig),
+        (EcCurve::P256, EcdsaHash::Sha384) => verify_ecdsa_p256_sha384_spki(spki, tbs, sig),
+        (EcCurve::P256, EcdsaHash::Sha512) => verify_ecdsa_p256_sha512_spki(spki, tbs, sig),
+        (EcCurve::P384, EcdsaHash::Sha256) => verify_ecdsa_p384_sha256_spki(spki, tbs, sig),
         (EcCurve::P384, EcdsaHash::Sha384) => verify_ecdsa_p384_spki(spki, tbs, sig),
+        (EcCurve::P384, EcdsaHash::Sha512) => verify_ecdsa_p384_sha512_spki(spki, tbs, sig),
         (EcCurve::P521, EcdsaHash::Sha512) => verify_ecdsa_p521_spki(spki, tbs, sig),
         (EcCurve::P521, EcdsaHash::Sha256) => verify_ecdsa_p521_sha256_spki(spki, tbs, sig),
         (EcCurve::P521, EcdsaHash::Sha384) => verify_ecdsa_p521_sha384_spki(spki, tbs, sig),
@@ -664,6 +672,82 @@ fn verify_ecdsa_p384_spki(
 
     vk.verify(tbs, &signature)
         .map_err(|e| TrustError::SignatureVerification(format!("ECDSA P-384 invalid: {e}")))
+}
+
+/// Verify an ECDSA P-256 signature where the *signing algorithm* specified SHA-384.
+fn verify_ecdsa_p256_sha384_spki(
+    spki: spki::SubjectPublicKeyInfoRef<'_>,
+    tbs: &[u8],
+    sig: &[u8],
+) -> Result<(), TrustError> {
+    use ecdsa::signature::hazmat::PrehashVerifier;
+    use sha2::Digest as _;
+
+    let vk = p256::ecdsa::VerifyingKey::try_from(spki)
+        .map_err(|e| TrustError::SignatureVerification(format!("P-256 key decode failed: {e}")))?;
+    let signature = p256::ecdsa::Signature::from_der(sig)
+        .map_err(|e| TrustError::SignatureVerification(format!("P-256 sig decode failed: {e}")))?;
+
+    let hash = sha2::Sha384::digest(tbs);
+    vk.verify_prehash(&hash, &signature)
+        .map_err(|e| TrustError::SignatureVerification(format!("ECDSA P-256/SHA-384 invalid: {e}")))
+}
+
+/// Verify an ECDSA P-256 signature where the *signing algorithm* specified SHA-512.
+fn verify_ecdsa_p256_sha512_spki(
+    spki: spki::SubjectPublicKeyInfoRef<'_>,
+    tbs: &[u8],
+    sig: &[u8],
+) -> Result<(), TrustError> {
+    use ecdsa::signature::hazmat::PrehashVerifier;
+    use sha2::Digest as _;
+
+    let vk = p256::ecdsa::VerifyingKey::try_from(spki)
+        .map_err(|e| TrustError::SignatureVerification(format!("P-256 key decode failed: {e}")))?;
+    let signature = p256::ecdsa::Signature::from_der(sig)
+        .map_err(|e| TrustError::SignatureVerification(format!("P-256 sig decode failed: {e}")))?;
+
+    let hash = sha2::Sha512::digest(tbs);
+    vk.verify_prehash(&hash, &signature)
+        .map_err(|e| TrustError::SignatureVerification(format!("ECDSA P-256/SHA-512 invalid: {e}")))
+}
+
+/// Verify an ECDSA P-384 signature where the *signing algorithm* specified SHA-256.
+fn verify_ecdsa_p384_sha256_spki(
+    spki: spki::SubjectPublicKeyInfoRef<'_>,
+    tbs: &[u8],
+    sig: &[u8],
+) -> Result<(), TrustError> {
+    use ecdsa::signature::hazmat::PrehashVerifier;
+    use sha2::Digest as _;
+
+    let vk = p384::ecdsa::VerifyingKey::try_from(spki)
+        .map_err(|e| TrustError::SignatureVerification(format!("P-384 key decode failed: {e}")))?;
+    let signature = p384::ecdsa::Signature::from_der(sig)
+        .map_err(|e| TrustError::SignatureVerification(format!("P-384 sig decode failed: {e}")))?;
+
+    let hash = sha2::Sha256::digest(tbs);
+    vk.verify_prehash(&hash, &signature)
+        .map_err(|e| TrustError::SignatureVerification(format!("ECDSA P-384/SHA-256 invalid: {e}")))
+}
+
+/// Verify an ECDSA P-384 signature where the *signing algorithm* specified SHA-512.
+fn verify_ecdsa_p384_sha512_spki(
+    spki: spki::SubjectPublicKeyInfoRef<'_>,
+    tbs: &[u8],
+    sig: &[u8],
+) -> Result<(), TrustError> {
+    use ecdsa::signature::hazmat::PrehashVerifier;
+    use sha2::Digest as _;
+
+    let vk = p384::ecdsa::VerifyingKey::try_from(spki)
+        .map_err(|e| TrustError::SignatureVerification(format!("P-384 key decode failed: {e}")))?;
+    let signature = p384::ecdsa::Signature::from_der(sig)
+        .map_err(|e| TrustError::SignatureVerification(format!("P-384 sig decode failed: {e}")))?;
+
+    let hash = sha2::Sha512::digest(tbs);
+    vk.verify_prehash(&hash, &signature)
+        .map_err(|e| TrustError::SignatureVerification(format!("ECDSA P-384/SHA-512 invalid: {e}")))
 }
 
 /// Verify an ECDSA P-521 (SHA-512) signature.
