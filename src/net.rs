@@ -35,6 +35,54 @@ use std::net::{IpAddr, Ipv4Addr};
 
 use reqwest::Client;
 
+/// Failure while constructing an attested HTTP/TLS client.
+#[derive(Debug, thiserror::Error)]
+pub enum HttpClientError {
+    #[error(transparent)]
+    Crypto(#[from] kryptering::Error),
+    #[error("failed to build hardened HTTP client: {0}")]
+    Build(#[from] reqwest::Error),
+}
+
+/// A reqwest client paired with compile-time provider attestation.
+///
+/// The inner client is intentionally not exposed publicly: callers can only
+/// inject another attested wrapper, preventing an accidental TLS-provider
+/// substitution at API boundaries.
+#[derive(Clone)]
+pub struct AttestedHttpClient {
+    inner: Client,
+    backend: kryptering::BackendInfo,
+    verified: bool,
+}
+
+impl std::fmt::Debug for AttestedHttpClient {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AttestedHttpClient")
+            .field("backend", &self.backend)
+            .field("verified", &self.verified)
+            .finish_non_exhaustive()
+    }
+}
+
+impl AttestedHttpClient {
+    /// Provider state attested when the client was constructed.
+    #[must_use]
+    pub fn backend_info(&self) -> &kryptering::BackendInfo {
+        &self.backend
+    }
+
+    /// Whether this client was constructed from Kryptering's selected TLS provider.
+    #[must_use]
+    pub const fn is_verified(&self) -> bool {
+        self.verified
+    }
+
+    pub(crate) fn client(&self) -> &Client {
+        &self.inner
+    }
+}
+
 /// Maximum HTTP redirects followed by a [`hardened_http_client`].
 pub const MAX_REDIRECTS: usize = 5;
 
@@ -100,10 +148,18 @@ fn unbracket(host: &str) -> &str {
 /// redirects to literal non-public addresses — complementing the resolve-time
 /// check in [`validate_fetch_url`].
 ///
-/// Fails closed: a build failure (system/TLS fault, on which
-/// `reqwest::Client::new()` would itself panic) panics rather than silently
-/// degrading to `reqwest`'s default (unhardened) redirect behaviour.
-pub fn hardened_http_client() -> Client {
+/// Fails closed: a build or provider-attestation failure is returned rather
+/// than degrading to reqwest's default TLS or redirect behavior.
+pub fn hardened_http_client() -> Result<AttestedHttpClient, HttpClientError> {
+    let roots = rustls::RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    let tls = kryptering::build_tls_client_config(roots)?;
+    attested_http_client(tls)
+}
+
+/// Build a hardened HTTP client from a Kryptering-attested TLS configuration.
+pub fn attested_http_client(
+    tls: kryptering::AttestedTlsConfig,
+) -> Result<AttestedHttpClient, HttpClientError> {
     let policy = reqwest::redirect::Policy::custom(|attempt| {
         if attempt.previous().len() >= MAX_REDIRECTS {
             return attempt.error("too many redirects");
@@ -118,10 +174,30 @@ pub fn hardened_http_client() -> Client {
         }
         attempt.follow()
     });
-    Client::builder()
+    let config = tls.config();
+    let inner = Client::builder()
         .redirect(policy)
+        .use_preconfigured_tls((*config).clone())
         .build()
-        .expect("failed to build hardened HTTP client")
+        .map_err(HttpClientError::Build)?;
+    Ok(AttestedHttpClient {
+        inner,
+        backend: kryptering::backend_info()?,
+        verified: true,
+    })
+}
+
+/// Explicit escape hatch for an externally-built, unattested reqwest client.
+///
+/// This API does not exist in FIPS builds, where every HTTPS operation must be
+/// tied to a provider configuration that has passed FIPS attestation.
+#[cfg(not(feature = "fips"))]
+pub fn unverified_http_client(client: Client) -> Result<AttestedHttpClient, HttpClientError> {
+    Ok(AttestedHttpClient {
+        inner: client,
+        backend: kryptering::backend_info()?,
+        verified: false,
+    })
 }
 
 /// An error from [`validate_fetch_url`], with a category so callers can wrap it
@@ -224,6 +300,62 @@ pub async fn validate_fetch_url(url: &str) -> Result<(), UrlGuardError> {
 mod tests {
     use super::*;
 
+    use std::sync::Arc;
+
+    use rcgen::{generate_simple_self_signed, CertifiedKey};
+    use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    fn https_fixture() -> (CertificateDer<'static>, PrivateKeyDer<'static>) {
+        let CertifiedKey { cert, key_pair } =
+            generate_simple_self_signed(vec!["localhost".to_owned()])
+                .expect("test certificate generation");
+        let private_key = PrivatePkcs8KeyDer::from(key_pair.serialize_der());
+        (cert.der().clone(), private_key.into())
+    }
+
+    async fn spawn_https_server(
+        certificate: CertificateDer<'static>,
+        private_key: PrivateKeyDer<'static>,
+    ) -> (u16, tokio::task::JoinHandle<()>) {
+        let provider = rustls::crypto::ring::default_provider();
+        let config = rustls::ServerConfig::builder_with_provider(Arc::new(provider))
+            .with_safe_default_protocol_versions()
+            .expect("test TLS versions")
+            .with_no_client_auth()
+            .with_single_cert(vec![certificate], private_key)
+            .expect("test TLS identity");
+        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(config));
+        let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("bind HTTPS fixture");
+        let port = listener.local_addr().expect("fixture address").port();
+        let task = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("fixture connection");
+            // Validation-failure tests intentionally abort during the handshake.
+            if let Ok(mut stream) = acceptor.accept(stream).await {
+                let mut request = [0_u8; 4096];
+                let _ = stream.read(&mut request).await;
+                let _ = stream
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\nconnection: close\r\n\r\nOK",
+                    )
+                    .await;
+                let _ = stream.shutdown().await;
+            }
+        });
+        (port, task)
+    }
+
+    fn attested_client_with_root(root: Option<CertificateDer<'static>>) -> AttestedHttpClient {
+        let mut roots = rustls::RootCertStore::empty();
+        if let Some(root) = root {
+            roots.add(root).expect("add test trust anchor");
+        }
+        let tls = kryptering::build_tls_client_config(roots).expect("attested test TLS config");
+        attested_http_client(tls).expect("attested test HTTP client")
+    }
+
     #[test]
     fn loopback_and_metadata_are_disallowed() {
         assert!(is_disallowed_ip("127.0.0.1".parse().unwrap()));
@@ -290,5 +422,54 @@ mod tests {
             1,
             "non-public wording should not be duplicated: {msg}"
         );
+    }
+
+    #[tokio::test]
+    async fn selected_tls_provider_connects_to_trusted_https_fixture() {
+        let (certificate, private_key) = https_fixture();
+        let (port, server) = spawn_https_server(certificate.clone(), private_key).await;
+        let client = attested_client_with_root(Some(certificate));
+
+        let response = client
+            .client()
+            .get(format!("https://localhost:{port}/"))
+            .send()
+            .await
+            .expect("trusted HTTPS request");
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        server.await.expect("HTTPS fixture task");
+    }
+
+    #[tokio::test]
+    async fn selected_tls_provider_rejects_wrong_hostname() {
+        let (certificate, private_key) = https_fixture();
+        let (port, server) = spawn_https_server(certificate.clone(), private_key).await;
+        let client = attested_client_with_root(Some(certificate));
+
+        let result = client
+            .client()
+            .get(format!("https://127.0.0.1:{port}/"))
+            .send()
+            .await;
+        assert!(result.is_err(), "hostname mismatch unexpectedly succeeded");
+        server.await.expect("HTTPS fixture task");
+    }
+
+    #[tokio::test]
+    async fn selected_tls_provider_rejects_untrusted_certificate() {
+        let (certificate, private_key) = https_fixture();
+        let (port, server) = spawn_https_server(certificate, private_key).await;
+        let client = attested_client_with_root(None);
+
+        let result = client
+            .client()
+            .get(format!("https://localhost:{port}/"))
+            .send()
+            .await;
+        assert!(
+            result.is_err(),
+            "untrusted certificate unexpectedly succeeded"
+        );
+        server.await.expect("HTTPS fixture task");
     }
 }

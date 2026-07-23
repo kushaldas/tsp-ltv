@@ -592,7 +592,7 @@ fn verify_token_cms(
                 "message-digest attribute is not an OCTET STRING: {e}"
             ))
         })?;
-    let computed_digest = digest_alg.digest(&tst_info_der);
+    let computed_digest = digest_alg.digest(&tst_info_der)?;
     if signed_digest.as_bytes() != computed_digest.as_slice() {
         return Err(TspError::VerificationFailed(
             "message-digest signed attribute does not match the TSTInfo content".into(),
@@ -1273,10 +1273,12 @@ fn digest_algorithm_identifier(alg: DigestAlgorithm) -> AlgorithmIdentifierOwned
 // ---------------------------------------------------------------------------
 
 /// Generate a cryptographically random 64-bit nonce for timestamp requests.
-pub fn generate_nonce() -> u64 {
-    let mut buf = [0u8; 8];
-    getrandom::getrandom(&mut buf).expect("OS random number generator");
-    u64::from_ne_bytes(buf)
+pub fn generate_nonce() -> kryptering::Result<u64> {
+    let buf = kryptering::random_bytes(8)?;
+    Ok(u64::from_ne_bytes(
+        buf.try_into()
+            .expect("requested exactly eight random bytes"),
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -1507,10 +1509,10 @@ mod tests {
 
     #[test]
     fn test_generate_nonce() {
-        let n1 = generate_nonce();
+        let n1 = generate_nonce().unwrap();
         // Brief pause to ensure different nonce
         std::thread::sleep(std::time::Duration::from_millis(1));
-        let n2 = generate_nonce();
+        let n2 = generate_nonce().unwrap();
         // They should differ (with extremely high probability)
         assert_ne!(n1, n2, "nonces should be unique");
     }
@@ -2155,8 +2157,14 @@ mod tests {
 
         // With the matching saltLength in the params, verification succeeds.
         let algid = pss_algid::<Sha256>(48);
-        verify_cms_signature(msg, &sig, &spki_der, &algid, DigestAlgorithm::Sha256)
-            .expect("PSS signature with non-default salt must verify when params declare it");
+        let matching = verify_cms_signature(msg, &sig, &spki_der, &algid, DigestAlgorithm::Sha256);
+        #[cfg(feature = "aws-lc")]
+        assert!(
+            matches!(matching, Err(TrustError::UnsupportedAlgorithm(ref message)) if message.contains("salt length 48")),
+            "AWS-LC must report non-digest-length PSS salt as unsupported: {matching:?}"
+        );
+        #[cfg(not(feature = "aws-lc"))]
+        matching.expect("PSS signature with non-default salt must verify when params declare it");
 
         // Declaring the wrong (default) salt length must fail: the parameters
         // are authoritative and PSS verification is salt-length sensitive.

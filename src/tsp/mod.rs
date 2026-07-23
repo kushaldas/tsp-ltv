@@ -17,7 +17,7 @@
 //!
 //! # async fn example() -> Result<(), tsp_ltv::error::TspError> {
 //! // Single TSA
-//! let client = TsaClient::new("http://timestamp.digicert.com");
+//! let client = TsaClient::new("http://timestamp.digicert.com")?;
 //! let hash = vec![0u8; 32]; // SHA-256 hash of signature value
 //! let token = client.timestamp(&hash).await?;
 //!
@@ -25,7 +25,7 @@
 //! let pool = TsaClientPool::from_urls(&[
 //!     "http://timestamp.digicert.com",
 //!     "http://timestamp.globalsign.com/tsa/r6advanced1",
-//! ]);
+//! ])?;
 //! let token = pool.timestamp(&hash).await?;
 //! # Ok(())
 //! # }

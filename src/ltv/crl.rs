@@ -9,7 +9,6 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use reqwest::Client;
 use x509_cert::Certificate;
 
 use crate::der_utils::{
@@ -18,6 +17,7 @@ use crate::der_utils::{
 };
 use crate::error::LtvError;
 use crate::ltv::status::{RevocationReason, RevocationSource, ValidationStatus};
+use crate::net::AttestedHttpClient;
 
 /// A cached CRL entry.
 #[derive(Debug, Clone)]
@@ -36,12 +36,12 @@ struct CrlCacheEntry {
 /// As an SSRF mitigation against attacker-controlled distribution-point URLs,
 /// fetches are restricted to `http`/`https` and the resolved host must be a
 /// public address — loopback, private, link-local, unique-local, and metadata
-/// ranges are refused (see [`CrlClient::validate_url`]), and the default client
+/// ranges are refused by URL validation, and the default client
 /// will not follow redirects to literal non-public addresses. Fetched CRL
-/// bodies are capped at [`MAX_BODY_SIZE`] to prevent memory exhaustion.
+/// bodies are capped at `MAX_BODY_SIZE` to prevent memory exhaustion.
 #[derive(Debug, Clone)]
 pub struct CrlClient {
-    http_client: Client,
+    http_client: AttestedHttpClient,
     timeout: Duration,
     /// In-memory cache: URL -> CRL entry
     cache: Arc<Mutex<HashMap<String, CrlCacheEntry>>>,
@@ -70,29 +70,36 @@ const MAX_BODY_SIZE: usize = 10 * 1024 * 1024;
 /// pre-egress URL validation) live in [`crate::net`] so the CRL fetch path and
 /// the AIA chain-builder ([`crate::ltv::chain`]) share one implementation
 /// rather than duplicating the logic (ADR-0010).
-fn default_http_client() -> Client {
-    crate::net::hardened_http_client()
+fn default_http_client() -> Result<AttestedHttpClient, LtvError> {
+    crate::net::hardened_http_client().map_err(LtvError::from)
 }
 
 impl CrlClient {
     /// Create a new CRL client with default settings.
     ///
     /// Default grace period: 1 hour.
-    pub fn new() -> Self {
-        Self {
-            http_client: default_http_client(),
+    pub fn new() -> Result<Self, LtvError> {
+        Ok(Self {
+            http_client: default_http_client()?,
             timeout: Duration::from_secs(30),
             cache: Arc::new(Mutex::new(HashMap::new())),
             grace_period: Duration::from_secs(3600),
             max_body_size: MAX_BODY_SIZE,
             freshness: CrlFreshness::default(),
-        }
+        })
     }
 
     /// Set the HTTP client.
-    pub fn http_client(mut self, client: Client) -> Self {
+    pub fn http_client(mut self, client: AttestedHttpClient) -> Self {
         self.http_client = client;
         self
+    }
+
+    /// Explicitly inject an unattested reqwest client outside FIPS mode.
+    #[cfg(not(feature = "fips"))]
+    pub fn unverified_http_client(mut self, client: reqwest::Client) -> Result<Self, LtvError> {
+        self.http_client = crate::net::unverified_http_client(client)?;
+        Ok(self)
     }
 
     /// Set the request timeout.
@@ -211,6 +218,7 @@ impl CrlClient {
 
         let response = self
             .http_client
+            .client()
             .get(url)
             .timeout(self.timeout)
             .send()
@@ -349,12 +357,6 @@ impl CrlClient {
         if let Ok(mut cache) = self.cache.lock() {
             cache.clear();
         }
-    }
-}
-
-impl Default for CrlClient {
-    fn default() -> Self {
-        Self::new()
     }
 }
 
@@ -852,12 +854,12 @@ pub struct CrlFreshness {
     /// issuer's and the validator's clocks. Default: 5 minutes.
     ///
     /// It widens the **staleness** bound: the authoritative check
-    /// ([`validate_crl_freshness`]) tolerates `now` being up to `clock_skew`
+    /// (`validate_crl_freshness`) tolerates `now` being up to `clock_skew`
     /// past `nextUpdate` (or, lacking `nextUpdate`, past the max-age bound). It
     /// is deliberately *not* applied as a lower bound there — a CRL whose window
     /// lies at or after the validation instant (later-collected archival
     /// evidence) is accepted outright, not merely within skew. The fetch/cache
-    /// currentness check ([`crl_is_current`]) additionally uses it as a
+    /// currentness check (`crl_is_current`) additionally uses it as a
     /// not-yet-valid tolerance, since for caching a CRL whose window is still in
     /// the future is not yet the issuer's live list.
     pub clock_skew: chrono::Duration,
@@ -1114,13 +1116,14 @@ mod tests {
 
     #[test]
     fn test_crl_client_default() {
-        let client = CrlClient::new();
+        let client = CrlClient::new().unwrap();
         assert_eq!(client.grace_period, Duration::from_secs(3600));
     }
 
     #[test]
     fn test_crl_client_builder() {
         let client = CrlClient::new()
+            .unwrap()
             .timeout(Duration::from_secs(10))
             .grace_period(Duration::from_secs(7200));
         assert_eq!(client.grace_period, Duration::from_secs(7200));
@@ -1874,7 +1877,7 @@ mod tests {
             eprintln!("skipping: intermediate_ca_key.pem not found");
             return;
         };
-        let client = CrlClient::new();
+        let client = CrlClient::new().unwrap();
         let url = "http://crl.invalid.example/fresh.crl";
         client.cache.lock().unwrap().insert(
             url.to_string(),
@@ -1904,7 +1907,9 @@ mod tests {
             eprintln!("skipping: intermediate_ca_key.pem not found");
             return;
         };
-        let client = CrlClient::new().timeout(Duration::from_millis(200));
+        let client = CrlClient::new()
+            .unwrap()
+            .timeout(Duration::from_millis(200));
         let url = "http://crl.invalid.example/stale.crl";
         client.cache.lock().unwrap().insert(
             url.to_string(),

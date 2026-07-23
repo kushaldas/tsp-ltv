@@ -554,13 +554,8 @@ impl TrustStore {
         // leading ASCII whitespace), not by a substring scan: a DER certificate
         // can legitimately contain the bytes "-----BEGIN" inside an ASN.1
         // string, and a substring match would misclassify it as PEM and then
-        // fail to parse a perfectly valid anchor. (Manual whitespace skip rather
-        // than `trim_ascii_start`, which would raise the crate MSRV to 1.80.)
-        let start = data
-            .iter()
-            .position(|b| !b.is_ascii_whitespace())
-            .unwrap_or(data.len());
-        if data[start..].starts_with(PEM_ARMOR) {
+        // fail to parse a perfectly valid anchor.
+        if data.trim_ascii_start().starts_with(PEM_ARMOR) {
             self.add_pem_data(data)
         } else {
             self.add_der_certificate(data)
@@ -723,7 +718,7 @@ impl TrustStore {
     ///
     /// This is [`verify_chain`](Self::verify_chain) plus a leaf
     /// extension-profile check: the leaf's `keyUsage`/`extendedKeyUsage` (etc.)
-    /// must match the supplied [`CertRole`] via
+    /// must match the supplied [`crate::ltv::CertRole`] via
     /// [`validate_extensions_for_role`](crate::ltv::validate_extensions_for_role).
     /// Plain `verify_chain` validates only the *intermediates'* CA profile and
     /// the trust anchor; without this, a certificate that legitimately chains to

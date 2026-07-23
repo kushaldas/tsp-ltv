@@ -186,9 +186,9 @@ rand     0.8.5  -> 0.8.6   (dev-dependency)
 ```
 
 After the update:
-- `cargo build --all-features` clean
-- `cargo test --all-features --lib` — 231 pass
-- `cargo clippy --all-features --all-targets` clean
+- the then-current complete feature set built cleanly
+- the library suite passed 231 tests
+- clippy with all targets was clean
 - `cargo audit` — exits non-zero on **RUSTSEC-2023-0071** (Marvin attack,
   `rsa 0.9.10`, "no fixed upgrade available"). Pre-existing and ecosystem-wide;
   resolved only when `rsa` ships a stable fix (tracked with the digest/signature

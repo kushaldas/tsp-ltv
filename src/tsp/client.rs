@@ -5,11 +5,10 @@
 
 use std::time::Duration;
 
-use reqwest::Client;
-
 use super::token;
 use crate::crypto::algorithm::DigestAlgorithm;
 use crate::error::TspError;
+use crate::net::AttestedHttpClient;
 
 /// HTTP Content-Type for RFC 3161 timestamp requests.
 const TSP_REQUEST_CONTENT_TYPE: &str = "application/timestamp-query";
@@ -29,11 +28,11 @@ const TSP_RESPONSE_CONTENT_TYPE: &str = "application/timestamp-reply";
 /// use tsp_ltv::crypto::algorithm::DigestAlgorithm;
 ///
 /// # async fn example() -> Result<(), tsp_ltv::error::TspError> {
-/// let client = TsaClient::new("http://timestamp.digicert.com")
+/// let client = TsaClient::new("http://timestamp.digicert.com")?
 ///     .digest_algorithm(DigestAlgorithm::Sha256)
 ///     .timeout(std::time::Duration::from_secs(10));
 ///
-/// let data_hash = DigestAlgorithm::Sha256.digest(b"hello");
+/// let data_hash = DigestAlgorithm::Sha256.digest(b"hello")?;
 /// let token = client.timestamp(&data_hash).await?;
 /// # Ok(())
 /// # }
@@ -43,7 +42,7 @@ pub struct TsaClient {
     /// TSA server URL.
     url: String,
     /// HTTP client (shared, connection-pooled).
-    http_client: Client,
+    http_client: AttestedHttpClient,
     /// Digest algorithm for the timestamp request.
     digest_algorithm: DigestAlgorithm,
     /// Optional TSA policy OID to include in the request.
@@ -67,16 +66,16 @@ impl TsaClient {
     /// - 30-second timeout
     /// - No policy OID
     /// - certReq = true (request TSA cert in response)
-    pub fn new(url: &str) -> Self {
-        Self {
+    pub fn new(url: &str) -> Result<Self, TspError> {
+        Ok(Self {
             url: url.to_string(),
-            http_client: crate::net::hardened_http_client(),
+            http_client: crate::net::hardened_http_client()?,
             digest_algorithm: DigestAlgorithm::Sha256,
             policy_oid: None,
             timeout: Duration::from_secs(30),
             cert_req: true,
             verification_certs: Vec::new(),
-        }
+        })
     }
 
     /// Set the digest algorithm.
@@ -117,10 +116,19 @@ impl TsaClient {
         self
     }
 
-    /// Set a custom reqwest HTTP client (e.g., for custom TLS config).
-    pub fn http_client(mut self, client: Client) -> Self {
+    /// Set a custom HTTP client carrying Kryptering provider attestation.
+    pub fn http_client(mut self, client: AttestedHttpClient) -> Self {
         self.http_client = client;
         self
+    }
+
+    /// Explicitly inject an unattested reqwest client.
+    ///
+    /// This escape hatch is unavailable when the crate is built with `fips`.
+    #[cfg(not(feature = "fips"))]
+    pub fn unverified_http_client(mut self, client: reqwest::Client) -> Result<Self, TspError> {
+        self.http_client = crate::net::unverified_http_client(client)?;
+        Ok(self)
     }
 
     /// Get the TSA URL.
@@ -157,7 +165,7 @@ impl TsaClient {
         }
 
         // Generate nonce for replay protection
-        let nonce = token::generate_nonce();
+        let nonce = token::generate_nonce()?;
 
         // Build the TimeStampReq
         let req_der = token::build_timestamp_request(
@@ -178,6 +186,7 @@ impl TsaClient {
         // HTTP POST to TSA
         let response = self
             .http_client
+            .client()
             .post(&self.url)
             .header("Content-Type", TSP_REQUEST_CONTENT_TYPE)
             .timeout(self.timeout)
@@ -259,9 +268,10 @@ impl TsaClient {
 /// use tsp_ltv::tsp::{TsaClient, TsaClientPool};
 ///
 /// let pool = TsaClientPool::new(vec![
-///     TsaClient::new("http://timestamp.digicert.com"),
-///     TsaClient::new("http://timestamp.globalsign.com/tsa/r6advanced1"),
+///     TsaClient::new("http://timestamp.digicert.com")?,
+///     TsaClient::new("http://timestamp.globalsign.com/tsa/r6advanced1")?,
 /// ]);
+/// # Ok::<(), tsp_ltv::error::TspError>(())
 /// ```
 #[derive(Debug, Clone)]
 pub struct TsaClientPool {
@@ -284,14 +294,17 @@ impl TsaClientPool {
     }
 
     /// Create a pool from a single URL with default settings.
-    pub fn from_url(url: &str) -> Self {
-        Self::new(vec![TsaClient::new(url)])
+    pub fn from_url(url: &str) -> Result<Self, TspError> {
+        Ok(Self::new(vec![TsaClient::new(url)?]))
     }
 
     /// Create a pool from multiple URLs with default settings.
-    pub fn from_urls(urls: &[&str]) -> Self {
-        let clients = urls.iter().map(|u| TsaClient::new(u)).collect();
-        Self::new(clients)
+    pub fn from_urls(urls: &[&str]) -> Result<Self, TspError> {
+        let clients = urls
+            .iter()
+            .map(|u| TsaClient::new(u))
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(Self::new(clients))
     }
 
     /// Request a timestamp token, trying each TSA in the pool.
@@ -343,7 +356,7 @@ mod tests {
 
     #[test]
     fn test_tsa_client_default() {
-        let client = TsaClient::new("http://timestamp.example.com");
+        let client = TsaClient::new("http://timestamp.example.com").unwrap();
         assert_eq!(client.url(), "http://timestamp.example.com");
         assert_eq!(client.timeout, Duration::from_secs(30));
         assert!(client.cert_req);
@@ -351,8 +364,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_timestamp_rejects_loopback_url() {
-        let client = TsaClient::new("http://127.0.0.1/tsa");
-        let data_hash = DigestAlgorithm::Sha256.digest(b"hello");
+        let client = TsaClient::new("http://127.0.0.1/tsa").unwrap();
+        let data_hash = DigestAlgorithm::Sha256.digest(b"hello").unwrap();
         let err = client
             .timestamp(&data_hash)
             .await

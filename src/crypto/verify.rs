@@ -141,17 +141,122 @@ fn verify_ecdsa_bound(
     let spki = SubjectPublicKeyInfoRef::from_der(spki_der)
         .map_err(|e| TrustError::SignatureVerification(format!("SPKI decode failed: {e}")))?;
     let curve = ec_named_curve(&spki)?;
-    match (curve, hash) {
-        (EcCurve::P256, EcdsaHash::Sha256) => verify_ecdsa_p256_spki(spki, tbs, sig),
-        (EcCurve::P384, EcdsaHash::Sha384) => verify_ecdsa_p384_spki(spki, tbs, sig),
-        (EcCurve::P521, EcdsaHash::Sha512) => verify_ecdsa_p521_spki(spki, tbs, sig),
-        (EcCurve::P521, EcdsaHash::Sha256) => verify_ecdsa_p521_sha256_spki(spki, tbs, sig),
-        (EcCurve::P521, EcdsaHash::Sha384) => verify_ecdsa_p521_sha384_spki(spki, tbs, sig),
-        (EcCurve::P256, EcdsaHash::Sha1) => verify_ecdsa_p256_sha1_spki(spki, tbs, sig),
-        (EcCurve::P384, EcdsaHash::Sha1) => verify_ecdsa_p384_sha1_spki(spki, tbs, sig),
-        (curve, hash) => Err(TrustError::SignatureVerification(format!(
-            "ECDSA curve {curve:?} is not a supported pairing with the declared {hash:?} hash"
-        ))),
+    let (curve, hash) = match (curve, hash) {
+        (EcCurve::P256, EcdsaHash::Sha256) => {
+            (kryptering::EcCurve::P256, kryptering::HashAlgorithm::Sha256)
+        }
+        (EcCurve::P384, EcdsaHash::Sha384) => {
+            (kryptering::EcCurve::P384, kryptering::HashAlgorithm::Sha384)
+        }
+        (EcCurve::P521, EcdsaHash::Sha512) => {
+            (kryptering::EcCurve::P521, kryptering::HashAlgorithm::Sha512)
+        }
+        (EcCurve::P521, EcdsaHash::Sha256) => {
+            (kryptering::EcCurve::P521, kryptering::HashAlgorithm::Sha256)
+        }
+        (EcCurve::P521, EcdsaHash::Sha384) => {
+            (kryptering::EcCurve::P521, kryptering::HashAlgorithm::Sha384)
+        }
+        (EcCurve::P256, EcdsaHash::Sha1) => {
+            (kryptering::EcCurve::P256, kryptering::HashAlgorithm::Sha1)
+        }
+        (EcCurve::P384, EcdsaHash::Sha1) => {
+            (kryptering::EcCurve::P384, kryptering::HashAlgorithm::Sha1)
+        }
+        (curve, hash) => {
+            return Err(TrustError::SignatureVerification(format!(
+                "ECDSA curve {curve:?} is not a supported pairing with the declared {hash:?} hash"
+            )))
+        }
+    };
+    verify_with_backend(
+        tbs,
+        sig,
+        spki_der,
+        kryptering::KeyAlgorithm::Ec(curve),
+        kryptering::SignatureAlgorithm::Ecdsa(curve, hash),
+        None,
+    )
+}
+
+fn map_backend_error(error: kryptering::Error) -> TrustError {
+    match error {
+        kryptering::Error::UnsupportedAlgorithm { .. } => {
+            TrustError::UnsupportedAlgorithm(error.to_string())
+        }
+        other => TrustError::SignatureVerification(other.to_string()),
+    }
+}
+
+fn verify_legacy_md5_rsa(tbs: &[u8], signature: &[u8], spki_der: &[u8]) -> Result<(), TrustError> {
+    #[cfg(feature = "legacy-algorithms")]
+    return verify_with_backend(
+        tbs,
+        signature,
+        spki_der,
+        kryptering::KeyAlgorithm::Rsa,
+        kryptering::SignatureAlgorithm::RsaPkcs1v15(kryptering::HashAlgorithm::Md5),
+        None,
+    );
+    #[cfg(not(feature = "legacy-algorithms"))]
+    {
+        let _ = (tbs, signature, spki_der);
+        Err(TrustError::UnsupportedAlgorithm(
+            "MD5 with RSA requires legacy-algorithms".into(),
+        ))
+    }
+}
+
+fn verify_dsa(
+    tbs: &[u8],
+    signature: &[u8],
+    spki_der: &[u8],
+    hash: kryptering::HashAlgorithm,
+) -> Result<(), TrustError> {
+    #[cfg(feature = "legacy-algorithms")]
+    return verify_with_backend(
+        tbs,
+        signature,
+        spki_der,
+        kryptering::KeyAlgorithm::Dsa,
+        kryptering::SignatureAlgorithm::Dsa(hash),
+        None,
+    );
+    #[cfg(not(feature = "legacy-algorithms"))]
+    {
+        let _ = (tbs, signature, spki_der, hash);
+        Err(TrustError::UnsupportedAlgorithm(
+            "DSA verification requires legacy-algorithms".into(),
+        ))
+    }
+}
+
+fn verify_with_backend(
+    tbs: &[u8],
+    signature: &[u8],
+    spki_der: &[u8],
+    key_algorithm: kryptering::KeyAlgorithm,
+    signature_algorithm: kryptering::SignatureAlgorithm,
+    rsa_pss_salt_len: Option<usize>,
+) -> Result<(), TrustError> {
+    let key = kryptering::SoftwareKey::from_spki_der(key_algorithm, spki_der)
+        .map_err(map_backend_error)?;
+    let verifier = match (signature_algorithm, rsa_pss_salt_len) {
+        (kryptering::SignatureAlgorithm::RsaPss(hash), Some(salt_len)) => {
+            kryptering::SoftwareVerifier::new_rsa_pss_with_salt(hash, salt_len, key)
+        }
+        _ => kryptering::SoftwareVerifier::new(signature_algorithm, key),
+    }
+    .map_err(map_backend_error)?;
+    if verifier
+        .verify_der_signature(tbs, signature)
+        .map_err(map_backend_error)?
+    {
+        Ok(())
+    } else {
+        Err(TrustError::SignatureVerification(format!(
+            "{signature_algorithm:?} signature is invalid"
+        )))
     }
 }
 
@@ -281,29 +386,79 @@ pub fn verify_signature_by_oid_with_policy(
 
     // --- Legacy RSA algorithms (only reachable under allow_legacy) ---
     if *sig_alg_oid == OID_MD5_WITH_RSA {
-        verify_rsa_signature::<md5::Md5>(tbs_bytes, signature_bytes, spki_der)
+        verify_legacy_md5_rsa(tbs_bytes, signature_bytes, spki_der)
     } else if *sig_alg_oid == OID_SHA1_WITH_RSA {
-        verify_rsa_signature::<sha1::Sha1>(tbs_bytes, signature_bytes, spki_der)
+        verify_with_backend(
+            tbs_bytes,
+            signature_bytes,
+            spki_der,
+            kryptering::KeyAlgorithm::Rsa,
+            kryptering::SignatureAlgorithm::RsaPkcs1v15(kryptering::HashAlgorithm::Sha1),
+            None,
+        )
     } else if *sig_alg_oid == OID_SHA224_WITH_RSA {
-        verify_rsa_signature::<sha2::Sha224>(tbs_bytes, signature_bytes, spki_der)
+        verify_with_backend(
+            tbs_bytes,
+            signature_bytes,
+            spki_der,
+            kryptering::KeyAlgorithm::Rsa,
+            kryptering::SignatureAlgorithm::RsaPkcs1v15(kryptering::HashAlgorithm::Sha224),
+            None,
+        )
     }
     // --- Modern RSA PKCS#1 v1.5 ---
     else if *sig_alg_oid == db::rfc5912::SHA_256_WITH_RSA_ENCRYPTION {
-        verify_rsa_signature::<sha2::Sha256>(tbs_bytes, signature_bytes, spki_der)
+        verify_with_backend(
+            tbs_bytes,
+            signature_bytes,
+            spki_der,
+            kryptering::KeyAlgorithm::Rsa,
+            kryptering::SignatureAlgorithm::RsaPkcs1v15(kryptering::HashAlgorithm::Sha256),
+            None,
+        )
     } else if *sig_alg_oid == db::rfc5912::SHA_384_WITH_RSA_ENCRYPTION {
-        verify_rsa_signature::<sha2::Sha384>(tbs_bytes, signature_bytes, spki_der)
+        verify_with_backend(
+            tbs_bytes,
+            signature_bytes,
+            spki_der,
+            kryptering::KeyAlgorithm::Rsa,
+            kryptering::SignatureAlgorithm::RsaPkcs1v15(kryptering::HashAlgorithm::Sha384),
+            None,
+        )
     } else if *sig_alg_oid == db::rfc5912::SHA_512_WITH_RSA_ENCRYPTION {
-        verify_rsa_signature::<sha2::Sha512>(tbs_bytes, signature_bytes, spki_der)
+        verify_with_backend(
+            tbs_bytes,
+            signature_bytes,
+            spki_der,
+            kryptering::KeyAlgorithm::Rsa,
+            kryptering::SignatureAlgorithm::RsaPkcs1v15(kryptering::HashAlgorithm::Sha512),
+            None,
+        )
     } else if *sig_alg_oid == OID_RSASSA_PSS {
         // RSA-PSS: AlgorithmIdentifier parameters should specify the hash,
         // but here we only have the OID. Try SHA-256 first, then SHA-384, SHA-512.
-        verify_rsa_pss_signature::<sha2::Sha256>(tbs_bytes, signature_bytes, spki_der)
-            .or_else(|_| {
-                verify_rsa_pss_signature::<sha2::Sha384>(tbs_bytes, signature_bytes, spki_der)
-            })
-            .or_else(|_| {
-                verify_rsa_pss_signature::<sha2::Sha512>(tbs_bytes, signature_bytes, spki_der)
-            })
+        [
+            kryptering::HashAlgorithm::Sha256,
+            kryptering::HashAlgorithm::Sha384,
+            kryptering::HashAlgorithm::Sha512,
+        ]
+        .into_iter()
+        .find_map(|hash| {
+            verify_with_backend(
+                tbs_bytes,
+                signature_bytes,
+                spki_der,
+                kryptering::KeyAlgorithm::Rsa,
+                kryptering::SignatureAlgorithm::RsaPss(hash),
+                None,
+            )
+            .ok()
+        })
+        .ok_or_else(|| {
+            TrustError::SignatureVerification(
+                "RSA-PSS signature is invalid for every supported digest".into(),
+            )
+        })
     }
     // --- Legacy ECDSA (only reachable under allow_legacy) ---
     else if *sig_alg_oid == OID_ECDSA_WITH_SHA1 {
@@ -311,11 +466,21 @@ pub fn verify_signature_by_oid_with_policy(
     }
     // --- Legacy DSA/DSS with SHA-1 (only reachable under allow_legacy) ---
     else if *sig_alg_oid == OID_DSA_WITH_SHA1 {
-        verify_dsa_signature::<sha1::Sha1>(tbs_bytes, signature_bytes, spki_der)
+        verify_dsa(
+            tbs_bytes,
+            signature_bytes,
+            spki_der,
+            kryptering::HashAlgorithm::Sha1,
+        )
     }
     // --- DSA/DSS with SHA-256 ---
     else if *sig_alg_oid == OID_DSA_WITH_SHA256 {
-        verify_dsa_signature::<sha2::Sha256>(tbs_bytes, signature_bytes, spki_der)
+        verify_dsa(
+            tbs_bytes,
+            signature_bytes,
+            spki_der,
+            kryptering::HashAlgorithm::Sha256,
+        )
     }
     // --- Modern ECDSA — the curve is taken from the key (L-8) ---
     else if *sig_alg_oid == db::rfc5912::ECDSA_WITH_SHA_256 {
@@ -325,7 +490,14 @@ pub fn verify_signature_by_oid_with_policy(
     } else if *sig_alg_oid == db::rfc5912::ECDSA_WITH_SHA_512 {
         verify_ecdsa_bound(tbs_bytes, signature_bytes, spki_der, EcdsaHash::Sha512)
     } else if *sig_alg_oid == OID_ED25519 {
-        verify_ed25519_signature(tbs_bytes, signature_bytes, spki_der)
+        verify_with_backend(
+            tbs_bytes,
+            signature_bytes,
+            spki_der,
+            kryptering::KeyAlgorithm::Ed25519,
+            kryptering::SignatureAlgorithm::Ed25519,
+            None,
+        )
     } else {
         Err(TrustError::UnsupportedAlgorithm(format!(
             "signature algorithm OID: {sig_alg_oid}"
@@ -408,8 +580,7 @@ pub fn verify_rsa_pss_signature_strict(
     spki_der: &[u8],
     parameters: Option<&der::Any>,
 ) -> Result<DigestAlgorithm, TrustError> {
-    use der::Encode;
-    use rsa::pkcs1::RsaPssParams;
+    use der::{Decode, Encode};
 
     let params_any = parameters.ok_or_else(|| {
         TrustError::UnsupportedAlgorithm(
@@ -419,7 +590,7 @@ pub fn verify_rsa_pss_signature_strict(
     let params_der = params_any.to_der().map_err(|e| {
         TrustError::SignatureVerification(format!("failed to re-encode RSASSA-PSS parameters: {e}"))
     })?;
-    let params = RsaPssParams::try_from(params_der.as_slice()).map_err(|e| {
+    let params = RsaPssParamsRef::from_der(&params_der).map_err(|e| {
         TrustError::SignatureVerification(format!("failed to decode RSASSA-PSS parameters: {e}"))
     })?;
 
@@ -436,7 +607,7 @@ pub fn verify_rsa_pss_signature_strict(
             params.mask_gen.oid
         )));
     }
-    let mgf1_hash_oid = params.mask_gen.parameters.as_ref().map(|h| h.oid);
+    let mgf1_hash_oid = params.mask_gen.parameters.map(|h| h.oid);
     if mgf1_hash_oid != Some(params.hash.oid) {
         return Err(TrustError::UnsupportedAlgorithm(format!(
             "RSASSA-PSS MGF1 hash ({}) differs from the message hash ({}); not supported",
@@ -447,24 +618,86 @@ pub fn verify_rsa_pss_signature_strict(
         )));
     }
 
+    if params.trailer_field != 1 {
+        return Err(TrustError::UnsupportedAlgorithm(format!(
+            "unsupported RSASSA-PSS trailerField: {}",
+            params.trailer_field
+        )));
+    }
     let salt_len = params.salt_len as usize;
-    match hash {
-        DigestAlgorithm::Sha256 => {
-            verify_rsa_pss_signature_with_salt::<sha2::Sha256>(tbs, sig, spki_der, salt_len)?
-        }
-        DigestAlgorithm::Sha384 => {
-            verify_rsa_pss_signature_with_salt::<sha2::Sha384>(tbs, sig, spki_der, salt_len)?
-        }
-        DigestAlgorithm::Sha512 => {
-            verify_rsa_pss_signature_with_salt::<sha2::Sha512>(tbs, sig, spki_der, salt_len)?
-        }
+    let backend_hash = match hash {
+        DigestAlgorithm::Sha256 => kryptering::HashAlgorithm::Sha256,
+        DigestAlgorithm::Sha384 => kryptering::HashAlgorithm::Sha384,
+        DigestAlgorithm::Sha512 => kryptering::HashAlgorithm::Sha512,
         other => {
             return Err(TrustError::UnsupportedAlgorithm(format!(
                 "RSASSA-PSS with digest {other:?}"
             )))
         }
-    }
+    };
+    verify_with_backend(
+        tbs,
+        sig,
+        spki_der,
+        kryptering::KeyAlgorithm::Rsa,
+        kryptering::SignatureAlgorithm::RsaPss(backend_hash),
+        Some(salt_len),
+    )?;
     Ok(hash)
+}
+
+/// Borrowing RFC 4055 `RSASSA-PSS-params` decoder kept here so provider-neutral
+/// verification does not pull the RustCrypto `rsa` implementation into AWS-LC
+/// or OpenSSL builds.
+struct RsaPssParamsRef<'a> {
+    hash: spki::AlgorithmIdentifierRef<'a>,
+    mask_gen: spki::AlgorithmIdentifier<spki::AlgorithmIdentifierRef<'a>>,
+    salt_len: u64,
+    trailer_field: u64,
+}
+
+impl<'a> der::DecodeValue<'a> for RsaPssParamsRef<'a> {
+    fn decode_value<R: der::Reader<'a>>(reader: &mut R, header: der::Header) -> der::Result<Self> {
+        use der::{Reader, TagMode, TagNumber};
+
+        const SHA1_OID: const_oid::ObjectIdentifier =
+            const_oid::ObjectIdentifier::new_unwrap("1.3.14.3.2.26");
+        let default_hash = spki::AlgorithmIdentifierRef {
+            oid: SHA1_OID,
+            parameters: Some(der::AnyRef::NULL),
+        };
+        let default_mgf = spki::AlgorithmIdentifier {
+            oid: OID_MGF1,
+            parameters: Some(default_hash),
+        };
+        reader.read_nested(header.length, |reader| {
+            Ok(Self {
+                hash: reader
+                    .context_specific(TagNumber::N0, TagMode::Explicit)?
+                    .unwrap_or(default_hash),
+                mask_gen: reader
+                    .context_specific(TagNumber::N1, TagMode::Explicit)?
+                    .unwrap_or(default_mgf),
+                salt_len: reader
+                    .context_specific(TagNumber::N2, TagMode::Explicit)?
+                    .unwrap_or(20),
+                trailer_field: reader
+                    .context_specific(TagNumber::N3, TagMode::Explicit)?
+                    .unwrap_or(1),
+            })
+        })
+    }
+}
+
+impl der::FixedTag for RsaPssParamsRef<'_> {
+    const TAG: der::Tag = der::Tag::Sequence;
+}
+
+#[cfg(test)]
+fn decode_spki(spki_der: &[u8]) -> Result<spki::SubjectPublicKeyInfoRef<'_>, TrustError> {
+    use der::Decode;
+    spki::SubjectPublicKeyInfoRef::from_der(spki_der)
+        .map_err(|e| TrustError::SignatureVerification(format!("SPKI decode failed: {e}")))
 }
 
 /// Verify a certificate's signature against its issuer's public key.
@@ -530,328 +763,6 @@ pub fn verify_certificate_signature_with_policy(
     )
 }
 
-/// Verify an RSA PKCS#1 v1.5 signature over `tbs` using the given SPKI.
-pub fn verify_rsa_signature<D: digest::Digest + const_oid::AssociatedOid>(
-    tbs: &[u8],
-    sig: &[u8],
-    spki_der: &[u8],
-) -> Result<(), TrustError> {
-    use der::Decode;
-    use rsa::pkcs1v15::Pkcs1v15Sign;
-    use rsa::RsaPublicKey;
-    use spki::SubjectPublicKeyInfoRef;
-
-    let spki = SubjectPublicKeyInfoRef::from_der(spki_der)
-        .map_err(|e| TrustError::SignatureVerification(format!("SPKI decode failed: {e}")))?;
-    let pub_key = RsaPublicKey::try_from(spki)
-        .map_err(|e| TrustError::SignatureVerification(format!("RSA key decode failed: {e}")))?;
-
-    let hash = D::digest(tbs);
-    let scheme = Pkcs1v15Sign::new::<D>();
-    pub_key
-        .verify(scheme, &hash, sig)
-        .map_err(|e| TrustError::SignatureVerification(format!("RSA signature invalid: {e}")))
-}
-
-/// Verify an RSA-PSS (RSASSA-PSS) signature over `tbs` using the given SPKI.
-///
-/// Uses the default salt length (the digest output size). Callers that have
-/// decoded the `RSASSA-PSS-params` saltLength should use
-/// [`verify_rsa_pss_signature_with_salt`] instead, since PSS verification is
-/// salt-length sensitive.
-pub fn verify_rsa_pss_signature<
-    D: digest::Digest + digest::FixedOutputReset + Default + Clone + Send + Sync + 'static,
->(
-    tbs: &[u8],
-    sig: &[u8],
-    spki_der: &[u8],
-) -> Result<(), TrustError> {
-    verify_rsa_pss_signature_with_salt::<D>(
-        tbs,
-        sig,
-        spki_der,
-        <D as digest::Digest>::output_size(),
-    )
-}
-
-/// Verify an RSA-PSS (RSASSA-PSS) signature over `tbs` with an explicit salt
-/// length.
-///
-/// PSS verification is sensitive to the salt length: the value recovered from
-/// the signature must equal `salt_len`. RFC 4055 carries the salt length in the
-/// `RSASSA-PSS-params` of the signature `AlgorithmIdentifier`, so a compliant
-/// verifier must use that value rather than assuming the default. The mask
-/// generation function is MGF1 keyed to the same hash `D` (the only form this
-/// verifier and the underlying `rsa` crate support); callers are responsible
-/// for rejecting parameters that disagree.
-pub fn verify_rsa_pss_signature_with_salt<
-    D: digest::Digest + digest::FixedOutputReset + Default + Clone + Send + Sync + 'static,
->(
-    tbs: &[u8],
-    sig: &[u8],
-    spki_der: &[u8],
-    salt_len: usize,
-) -> Result<(), TrustError> {
-    use der::Decode;
-    use rsa::pss::Pss;
-    use rsa::RsaPublicKey;
-    use spki::SubjectPublicKeyInfoRef;
-
-    let spki = SubjectPublicKeyInfoRef::from_der(spki_der)
-        .map_err(|e| TrustError::SignatureVerification(format!("SPKI decode failed: {e}")))?;
-    let pub_key = RsaPublicKey::try_from(spki)
-        .map_err(|e| TrustError::SignatureVerification(format!("RSA key decode failed: {e}")))?;
-
-    let hash = D::digest(tbs);
-    let scheme = Pss::new_with_salt::<D>(salt_len);
-    pub_key
-        .verify(scheme, &hash, sig)
-        .map_err(|e| TrustError::SignatureVerification(format!("RSA-PSS signature invalid: {e}")))
-}
-
-/// Decode an SPKI from raw DER for the public single-shot ECDSA verifiers.
-fn decode_spki(spki_der: &[u8]) -> Result<spki::SubjectPublicKeyInfoRef<'_>, TrustError> {
-    use der::Decode;
-    spki::SubjectPublicKeyInfoRef::from_der(spki_der)
-        .map_err(|e| TrustError::SignatureVerification(format!("SPKI decode failed: {e}")))
-}
-
-/// Verify an ECDSA P-256 (SHA-256) signature.
-pub fn verify_ecdsa_p256_signature(
-    tbs: &[u8],
-    sig: &[u8],
-    spki_der: &[u8],
-) -> Result<(), TrustError> {
-    verify_ecdsa_p256_spki(decode_spki(spki_der)?, tbs, sig)
-}
-
-fn verify_ecdsa_p256_spki(
-    spki: spki::SubjectPublicKeyInfoRef<'_>,
-    tbs: &[u8],
-    sig: &[u8],
-) -> Result<(), TrustError> {
-    use p256::ecdsa::{signature::Verifier, Signature, VerifyingKey};
-
-    let vk = VerifyingKey::try_from(spki)
-        .map_err(|e| TrustError::SignatureVerification(format!("P-256 key decode failed: {e}")))?;
-    let signature = Signature::from_der(sig)
-        .map_err(|e| TrustError::SignatureVerification(format!("P-256 sig decode failed: {e}")))?;
-
-    vk.verify(tbs, &signature)
-        .map_err(|e| TrustError::SignatureVerification(format!("ECDSA P-256 invalid: {e}")))
-}
-
-/// Verify an ECDSA P-384 (SHA-384) signature.
-pub fn verify_ecdsa_p384_signature(
-    tbs: &[u8],
-    sig: &[u8],
-    spki_der: &[u8],
-) -> Result<(), TrustError> {
-    verify_ecdsa_p384_spki(decode_spki(spki_der)?, tbs, sig)
-}
-
-fn verify_ecdsa_p384_spki(
-    spki: spki::SubjectPublicKeyInfoRef<'_>,
-    tbs: &[u8],
-    sig: &[u8],
-) -> Result<(), TrustError> {
-    use p384::ecdsa::{signature::Verifier, Signature, VerifyingKey};
-
-    let vk = VerifyingKey::try_from(spki)
-        .map_err(|e| TrustError::SignatureVerification(format!("P-384 key decode failed: {e}")))?;
-    let signature = Signature::from_der(sig)
-        .map_err(|e| TrustError::SignatureVerification(format!("P-384 sig decode failed: {e}")))?;
-
-    vk.verify(tbs, &signature)
-        .map_err(|e| TrustError::SignatureVerification(format!("ECDSA P-384 invalid: {e}")))
-}
-
-/// Verify an ECDSA P-521 (SHA-512) signature.
-pub fn verify_ecdsa_p521_signature(
-    tbs: &[u8],
-    sig: &[u8],
-    spki_der: &[u8],
-) -> Result<(), TrustError> {
-    verify_ecdsa_p521_spki(decode_spki(spki_der)?, tbs, sig)
-}
-
-fn verify_ecdsa_p521_spki(
-    spki: spki::SubjectPublicKeyInfoRef<'_>,
-    tbs: &[u8],
-    sig: &[u8],
-) -> Result<(), TrustError> {
-    use ecdsa::signature::hazmat::PrehashVerifier;
-    use sha2::Digest as _;
-
-    let vk = ecdsa::VerifyingKey::<p521::NistP521>::try_from(spki)
-        .map_err(|e| TrustError::SignatureVerification(format!("P-521 key decode failed: {e}")))?;
-    let signature = ecdsa::Signature::<p521::NistP521>::from_der(sig)
-        .map_err(|e| TrustError::SignatureVerification(format!("P-521 sig decode failed: {e}")))?;
-
-    // P-521 doesn't implement DigestPrimitive, so we prehash with SHA-512
-    let hash = sha2::Sha512::digest(tbs);
-    vk.verify_prehash(&hash, &signature)
-        .map_err(|e| TrustError::SignatureVerification(format!("ECDSA P-521 invalid: {e}")))
-}
-
-/// Verify an ECDSA P-521 signature where the *signing algorithm* specified SHA-256
-/// (e.g., a self-signed cert with `ecdsa-with-SHA256` but a P-521 key).
-///
-/// Note: The `ecdsa` crate's `bits2field` requires the hash to be at least
-/// half the field size (33 bytes for P-521). Since SHA-256 produces 32 bytes,
-/// we left-pad with a zero byte to satisfy this constraint.
-pub fn verify_ecdsa_p521_sha256_signature(
-    tbs: &[u8],
-    sig: &[u8],
-    spki_der: &[u8],
-) -> Result<(), TrustError> {
-    verify_ecdsa_p521_sha256_spki(decode_spki(spki_der)?, tbs, sig)
-}
-
-fn verify_ecdsa_p521_sha256_spki(
-    spki: spki::SubjectPublicKeyInfoRef<'_>,
-    tbs: &[u8],
-    sig: &[u8],
-) -> Result<(), TrustError> {
-    use ecdsa::signature::hazmat::PrehashVerifier;
-    use sha2::Digest as _;
-
-    let vk = ecdsa::VerifyingKey::<p521::NistP521>::try_from(spki)
-        .map_err(|e| TrustError::SignatureVerification(format!("P-521 key decode failed: {e}")))?;
-    let signature = ecdsa::Signature::<p521::NistP521>::from_der(sig)
-        .map_err(|e| TrustError::SignatureVerification(format!("P-521 sig decode failed: {e}")))?;
-
-    let hash = sha2::Sha256::digest(tbs);
-    // SHA-256 produces 32 bytes, but ecdsa crate's bits2field requires >= 33 bytes
-    // (half of P-521's 66-byte field size). Left-pad to 66 bytes (field size).
-    let mut padded = vec![0u8; 66];
-    padded[66 - 32..].copy_from_slice(&hash);
-    vk.verify_prehash(&padded, &signature)
-        .map_err(|e| TrustError::SignatureVerification(format!("ECDSA P-521/SHA-256 invalid: {e}")))
-}
-
-/// Verify an ECDSA P-521 signature where the *signing algorithm* specified SHA-384.
-pub fn verify_ecdsa_p521_sha384_signature(
-    tbs: &[u8],
-    sig: &[u8],
-    spki_der: &[u8],
-) -> Result<(), TrustError> {
-    verify_ecdsa_p521_sha384_spki(decode_spki(spki_der)?, tbs, sig)
-}
-
-fn verify_ecdsa_p521_sha384_spki(
-    spki: spki::SubjectPublicKeyInfoRef<'_>,
-    tbs: &[u8],
-    sig: &[u8],
-) -> Result<(), TrustError> {
-    use ecdsa::signature::hazmat::PrehashVerifier;
-    use sha2::Digest as _;
-
-    let vk = ecdsa::VerifyingKey::<p521::NistP521>::try_from(spki)
-        .map_err(|e| TrustError::SignatureVerification(format!("P-521 key decode failed: {e}")))?;
-    let signature = ecdsa::Signature::<p521::NistP521>::from_der(sig)
-        .map_err(|e| TrustError::SignatureVerification(format!("P-521 sig decode failed: {e}")))?;
-
-    let hash = sha2::Sha384::digest(tbs);
-    vk.verify_prehash(&hash, &signature)
-        .map_err(|e| TrustError::SignatureVerification(format!("ECDSA P-521/SHA-384 invalid: {e}")))
-}
-
-/// Verify an ECDSA P-256 (SHA-1) signature (legacy).
-pub fn verify_ecdsa_p256_sha1_signature(
-    tbs: &[u8],
-    sig: &[u8],
-    spki_der: &[u8],
-) -> Result<(), TrustError> {
-    verify_ecdsa_p256_sha1_spki(decode_spki(spki_der)?, tbs, sig)
-}
-
-fn verify_ecdsa_p256_sha1_spki(
-    spki: spki::SubjectPublicKeyInfoRef<'_>,
-    tbs: &[u8],
-    sig: &[u8],
-) -> Result<(), TrustError> {
-    use ecdsa::signature::hazmat::PrehashVerifier;
-    use sha1::Digest as _;
-
-    let vk = p256::ecdsa::VerifyingKey::try_from(spki)
-        .map_err(|e| TrustError::SignatureVerification(format!("P-256 key decode failed: {e}")))?;
-    let signature = p256::ecdsa::Signature::from_der(sig)
-        .map_err(|e| TrustError::SignatureVerification(format!("P-256 sig decode failed: {e}")))?;
-
-    let hash = sha1::Sha1::digest(tbs);
-    // SHA-1 produces 20 bytes; P-256 prehash verification accepts it
-    vk.verify_prehash(&hash, &signature)
-        .map_err(|e| TrustError::SignatureVerification(format!("ECDSA P-256/SHA-1 invalid: {e}")))
-}
-
-/// Verify an ECDSA P-384 (SHA-1) signature (legacy).
-pub fn verify_ecdsa_p384_sha1_signature(
-    tbs: &[u8],
-    sig: &[u8],
-    spki_der: &[u8],
-) -> Result<(), TrustError> {
-    verify_ecdsa_p384_sha1_spki(decode_spki(spki_der)?, tbs, sig)
-}
-
-fn verify_ecdsa_p384_sha1_spki(
-    spki: spki::SubjectPublicKeyInfoRef<'_>,
-    tbs: &[u8],
-    sig: &[u8],
-) -> Result<(), TrustError> {
-    use ecdsa::signature::hazmat::PrehashVerifier;
-    use sha1::Digest as _;
-
-    let vk = p384::ecdsa::VerifyingKey::try_from(spki)
-        .map_err(|e| TrustError::SignatureVerification(format!("P-384 key decode failed: {e}")))?;
-    let signature = p384::ecdsa::Signature::from_der(sig)
-        .map_err(|e| TrustError::SignatureVerification(format!("P-384 sig decode failed: {e}")))?;
-
-    let hash = sha1::Sha1::digest(tbs);
-    vk.verify_prehash(&hash, &signature)
-        .map_err(|e| TrustError::SignatureVerification(format!("ECDSA P-384/SHA-1 invalid: {e}")))
-}
-
-/// Verify an Ed25519 signature.
-pub fn verify_ed25519_signature(tbs: &[u8], sig: &[u8], spki_der: &[u8]) -> Result<(), TrustError> {
-    use der::Decode;
-    use ed25519_dalek::{Signature, Verifier, VerifyingKey};
-
-    let spki = spki::SubjectPublicKeyInfoRef::from_der(spki_der)
-        .map_err(|e| TrustError::SignatureVerification(format!("SPKI decode failed: {e}")))?;
-    let key_bytes = spki.subject_public_key.raw_bytes();
-    let vk = VerifyingKey::try_from(key_bytes)
-        .map_err(|e| TrustError::SignatureVerification(format!("Ed25519 key decode: {e}")))?;
-    let signature = Signature::from_slice(sig)
-        .map_err(|e| TrustError::SignatureVerification(format!("Ed25519 sig decode: {e}")))?;
-
-    vk.verify(tbs, &signature)
-        .map_err(|e| TrustError::SignatureVerification(format!("Ed25519 invalid: {e}")))
-}
-
-/// Verify a DSA (DSS) certificate/CRL/OCSP signature.
-///
-/// `D` selects the digest implied by the signature-algorithm OID (SHA-1 for the
-/// legacy `dsaWithSHA1`, SHA-256 for `dsa-with-SHA256`). The issuer's DSA domain
-/// parameters (p, q, g) and public value `y` are read from `spki_der`; the
-/// signature is the DER-encoded `SEQUENCE { r, s }` carried in the certificate.
-fn verify_dsa_signature<D>(tbs: &[u8], sig: &[u8], spki_der: &[u8]) -> Result<(), TrustError>
-where
-    D: digest::Digest,
-{
-    use der::Decode;
-    use dsa::signature::DigestVerifier;
-    use dsa::{Signature, VerifyingKey};
-
-    let vk = VerifyingKey::try_from(decode_spki(spki_der)?)
-        .map_err(|e| TrustError::SignatureVerification(format!("DSA key decode: {e}")))?;
-    let signature = Signature::from_der(sig)
-        .map_err(|e| TrustError::SignatureVerification(format!("DSA sig decode: {e}")))?;
-
-    vk.verify_digest(D::new_with_prefix(tbs), &signature)
-        .map_err(|e| TrustError::SignatureVerification(format!("DSA invalid: {e}")))
-}
-
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -896,6 +807,12 @@ mod tests {
 
         let ok =
             verify_certificate_signature_with_policy(&dsa, &dsa, &SignaturePolicy::allow_legacy());
+        #[cfg(feature = "aws-lc")]
+        assert!(
+            matches!(ok, Err(TrustError::UnsupportedAlgorithm(ref message)) if message.contains("KeyImport(Dsa)")),
+            "AWS-LC must report DSA as deterministically unsupported: {ok:?}"
+        );
+        #[cfg(not(feature = "aws-lc"))]
         assert!(
             ok.is_ok(),
             "DSA self-signature should verify under legacy: {ok:?}"
@@ -926,6 +843,12 @@ mod tests {
         // branch (failing at SPKI decode with SignatureVerification), never fall
         // through to UnsupportedAlgorithm.
         let err = result.unwrap_err();
+        #[cfg(feature = "aws-lc")]
+        assert!(
+            matches!(err, TrustError::UnsupportedAlgorithm(ref message) if message.contains("KeyImport(Dsa)")),
+            "AWS-LC must report DSA-SHA1 as unsupported: {err:?}"
+        );
+        #[cfg(not(feature = "aws-lc"))]
         assert!(
             !matches!(err, TrustError::UnsupportedAlgorithm(_)),
             "DSA-SHA1 should be dispatched to the DSA branch, not UnsupportedAlgorithm: {err:?}"
@@ -946,6 +869,12 @@ mod tests {
         );
         // Match the variant, not the message text.
         let err = result.unwrap_err();
+        #[cfg(feature = "aws-lc")]
+        assert!(
+            matches!(err, TrustError::UnsupportedAlgorithm(ref message) if message.contains("KeyImport(Dsa)")),
+            "AWS-LC must report DSA-SHA256 as unsupported: {err:?}"
+        );
+        #[cfg(not(feature = "aws-lc"))]
         assert!(
             !matches!(err, TrustError::UnsupportedAlgorithm(_)),
             "DSA-SHA256 should be dispatched to the DSA branch, not UnsupportedAlgorithm: {err:?}"
@@ -965,6 +894,12 @@ mod tests {
         let dsa = load_test_cert(dsa_pem);
 
         let ok = verify_certificate_signature(&dsa, &dsa);
+        #[cfg(feature = "aws-lc")]
+        assert!(
+            matches!(ok, Err(TrustError::UnsupportedAlgorithm(ref message)) if message.contains("KeyImport(Dsa)")),
+            "AWS-LC must report DSA-SHA256 as deterministically unsupported: {ok:?}"
+        );
+        #[cfg(not(feature = "aws-lc"))]
         assert!(
             ok.is_ok(),
             "DSA-SHA256 self-signature should verify under strict: {ok:?}"
@@ -979,6 +914,12 @@ mod tests {
         ));
         let other = load_test_cert(other_pem);
         let bad = verify_certificate_signature(&dsa, &other);
+        #[cfg(feature = "aws-lc")]
+        assert!(
+            matches!(bad, Err(TrustError::UnsupportedAlgorithm(ref message)) if message.contains("KeyImport(Dsa)")),
+            "AWS-LC must reject DSA before key comparison: {bad:?}"
+        );
+        #[cfg(not(feature = "aws-lc"))]
         assert!(
             matches!(bad, Err(TrustError::SignatureVerification(_))),
             "DSA-SHA256 cert must fail against the wrong issuer key: {bad:?}"
@@ -1094,8 +1035,14 @@ mod tests {
         let sig = signing.sign_with_rng(&mut rand::thread_rng(), msg).to_vec();
 
         // Correct salt length declared -> verifies.
-        verify_signature_by_algid(msg, &sig, &spki_der, &pss_algid::<Sha256>(48))
-            .expect("PSS with declared salt 48 must verify");
+        let matching = verify_signature_by_algid(msg, &sig, &spki_der, &pss_algid::<Sha256>(48));
+        #[cfg(feature = "aws-lc")]
+        assert!(
+            matches!(matching, Err(TrustError::UnsupportedAlgorithm(ref message)) if message.contains("salt length 48")),
+            "AWS-LC must report non-digest-length PSS salt as unsupported: {matching:?}"
+        );
+        #[cfg(not(feature = "aws-lc"))]
+        matching.expect("PSS with declared salt 48 must verify");
 
         // Wrong (default) salt length declared -> fails.
         assert!(
