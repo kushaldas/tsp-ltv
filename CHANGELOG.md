@@ -1,5 +1,25 @@
 # Changelog
 
+## 0.4.0 [Unreleased]
+
+### Added
+
+- Forwarded RustCrypto and AWS-LC document providers plus independent ring and
+  AWS-LC TLS providers from Kryptering 0.5. FIPS mode selects AWS-LC
+  exclusively.
+- Attested HTTP client wrapper and hardened, fallible TSA/OCSP/CRL/chain client
+  construction. The named raw-client escape hatch is excluded from FIPS builds.
+- Active AWS-LC FIPS digest and HTTPS-client attestation on x86_64 and aarch64
+  CI runners.
+
+### Changed
+
+- **Breaking:** all digesting, randomness, nonce generation, and certificate,
+  OCSP, CRL, and timestamp signature verification now use Kryptering.
+- **Breaking:** streaming digest construction and network client constructors
+  are fallible; the concrete digest enum is opaque.
+- MSRV is Rust 1.88. `--all-features` is intentionally invalid because provider
+  selections are mutually exclusive.
 
 ## 0.3.1 [2026-07-01]
 

@@ -96,6 +96,7 @@ pub fn build_chain_from_pool_with_policy(
 
         // Search the pool for an issuer
         let mut found = false;
+        let mut matching_issuer_error = None;
         for candidate in pool {
             let candidate_der = candidate
                 .to_der()
@@ -113,21 +114,25 @@ pub fn build_chain_from_pool_with_policy(
 
             if candidate_subject_der == issuer_name_der {
                 // Verify the signature before accepting this link
-                if crate::crypto::verify::verify_certificate_signature_with_policy(
+                match crate::crypto::verify::verify_certificate_signature_with_policy(
                     &current, candidate, policy,
-                )
-                .is_ok()
-                {
-                    visited.push(candidate_der);
-                    chain.push(candidate.clone());
-                    current = candidate.clone();
-                    found = true;
-                    break;
+                ) {
+                    Ok(()) => {
+                        visited.push(candidate_der);
+                        chain.push(candidate.clone());
+                        current = candidate.clone();
+                        found = true;
+                        break;
+                    }
+                    Err(error) => matching_issuer_error = Some(error),
                 }
             }
         }
 
         if !found {
+            if let Some(error) = matching_issuer_error {
+                return Err(error);
+            }
             return Err(TrustError::ChainBroken {
                 index: chain.len() - 1,
                 expected_issuer: format!("{}", current.tbs_certificate.issuer),
@@ -249,12 +254,11 @@ mod tests {
         let (issuer, leaf) = issuer_and_sha1_leaf();
         let pool = [issuer];
 
-        // Strict default: the SHA-1 leaf→issuer link fails the per-link check,
-        // so the chain cannot be built — this is the contract break the policy
-        // must let callers avoid.
+        // Strict default: preserve the precise policy error from the matching
+        // issuer instead of collapsing it into a misleading "chain broken".
         let err = build_chain_from_pool(&leaf, &pool, &[], None).unwrap_err();
         assert!(
-            matches!(err, TrustError::ChainBroken { .. }),
+            matches!(err, TrustError::WeakAlgorithm(_)),
             "strict build must fail on a SHA-1 link, got {err:?}"
         );
 

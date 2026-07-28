@@ -5,6 +5,13 @@ use thiserror::Error;
 /// Errors from RFC 3161 timestamping operations.
 #[derive(Debug, Error)]
 pub enum TspError {
+    #[error(transparent)]
+    Crypto(#[from] kryptering::Error),
+
+    #[cfg(feature = "tsp")]
+    #[error(transparent)]
+    HttpClient(#[from] crate::net::HttpClientError),
+
     #[error("TSA HTTP request failed: {0}")]
     HttpError(String),
 
@@ -22,6 +29,12 @@ pub enum TspError {
 #[cfg(feature = "ltv")]
 #[derive(Debug, Error)]
 pub enum LtvError {
+    #[error(transparent)]
+    Crypto(#[from] kryptering::Error),
+
+    #[error(transparent)]
+    HttpClient(#[from] crate::net::HttpClientError),
+
     #[error("OCSP error: {0}")]
     Ocsp(String),
 

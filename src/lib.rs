@@ -14,6 +14,23 @@
 //! jades for JAdES) builds its own format-specific embedding on top
 //! of these shared clients.
 
+#[cfg(not(any(feature = "rustcrypto", feature = "aws-lc")))]
+compile_error!("select exactly one document provider: rustcrypto or aws-lc");
+#[cfg(all(feature = "rustcrypto", feature = "aws-lc"))]
+compile_error!("document provider features are mutually exclusive: select exactly one");
+#[cfg(all(
+    feature = "tsp",
+    not(any(feature = "tls-ring", feature = "tls-aws-lc"))
+))]
+compile_error!("networking requires exactly one TLS provider: tls-ring or tls-aws-lc");
+#[cfg(all(feature = "tls-ring", feature = "tls-aws-lc"))]
+compile_error!("TLS provider features are mutually exclusive: select exactly one");
+
+pub use kryptering::{
+    backend_info, capabilities, initialize_backend, supports, BackendId, BackendInfo, Capability,
+    FipsStatus, Operation, TlsBackendId,
+};
+
 // Always-compiled modules
 pub mod crypto;
 pub mod der_utils;

@@ -6,11 +6,11 @@
 use std::time::Duration;
 
 use der::{Decode, Encode};
-use reqwest::Client;
 use x509_cert::Certificate;
 
 use super::ocsp::{extract_aia_urls, AiaAccessMethod};
 use crate::error::LtvError;
+use crate::net::AttestedHttpClient;
 use crate::trust::TrustStore;
 
 /// Maximum chain depth to prevent infinite loops.
@@ -34,11 +34,11 @@ const MAX_CERT_BODY_SIZE: usize = 1024 * 1024;
 /// [`crate::net::validate_fetch_url`] before egress: fetches are restricted to
 /// `http`/`https` and the resolved host must be a public address (loopback,
 /// private, link-local/metadata, unique-local, multicast, and CGNAT ranges are
-/// refused). Fetched bodies are capped at [`MAX_CERT_BODY_SIZE`]. These are the
+/// refused). Fetched bodies are capped at `MAX_CERT_BODY_SIZE`. These are the
 /// same controls the CRL fetch path uses (ADR-0010), shared via [`crate::net`].
 #[derive(Debug, Clone)]
 pub struct ChainBuilder {
-    http_client: Client,
+    http_client: AttestedHttpClient,
     timeout: Duration,
     /// Maximum response body size for a fetched certificate (1 MiB default).
     max_body_size: usize,
@@ -49,12 +49,12 @@ impl ChainBuilder {
     ///
     /// The default HTTP client is SSRF-hardened (bounded, internal-address-aware
     /// redirect policy); see [`ChainBuilder`].
-    pub fn new() -> Self {
-        Self {
-            http_client: crate::net::hardened_http_client(),
+    pub fn new() -> Result<Self, LtvError> {
+        Ok(Self {
+            http_client: crate::net::hardened_http_client()?,
             timeout: Duration::from_secs(30),
             max_body_size: MAX_CERT_BODY_SIZE,
-        }
+        })
     }
 
     /// Set the HTTP client.
@@ -63,9 +63,16 @@ impl ChainBuilder {
     /// preserve a bounded, internal-address-aware redirect policy
     /// (see [`crate::net::hardened_http_client`]) so the redirect-to-internal
     /// SSRF bypass stays closed.
-    pub fn http_client(mut self, client: Client) -> Self {
+    pub fn http_client(mut self, client: AttestedHttpClient) -> Self {
         self.http_client = client;
         self
+    }
+
+    /// Explicitly inject an unattested reqwest client outside FIPS mode.
+    #[cfg(not(feature = "fips"))]
+    pub fn unverified_http_client(mut self, client: reqwest::Client) -> Result<Self, LtvError> {
+        self.http_client = crate::net::unverified_http_client(client)?;
+        Ok(self)
     }
 
     /// Set the request timeout.
@@ -243,6 +250,7 @@ impl ChainBuilder {
 
         let response = self
             .http_client
+            .client()
             .get(url)
             .timeout(self.timeout)
             .send()
@@ -304,12 +312,6 @@ impl ChainBuilder {
     }
 }
 
-impl Default for ChainBuilder {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 /// Check if a certificate is self-signed (subject == issuer).
 fn is_self_signed(cert: &Certificate) -> bool {
     cert.tbs_certificate.subject == cert.tbs_certificate.issuer
@@ -321,7 +323,7 @@ mod tests {
 
     #[test]
     fn test_chain_builder_default() {
-        let builder = ChainBuilder::new();
+        let builder = ChainBuilder::new().unwrap();
         assert_eq!(builder.timeout, Duration::from_secs(30));
         assert_eq!(builder.max_body_size, MAX_CERT_BODY_SIZE);
     }
@@ -330,7 +332,7 @@ mod tests {
     async fn test_fetch_certificate_rejects_private_ip_aia_url() {
         // B1: an AIA caIssuers URL pointing at a private/loopback/metadata
         // address must be refused before any network egress (SSRF guard).
-        let builder = ChainBuilder::new();
+        let builder = ChainBuilder::new().unwrap();
         for url in [
             "http://127.0.0.1/ca.crt",
             "http://169.254.169.254/latest/meta-data/",
@@ -353,7 +355,7 @@ mod tests {
     async fn test_fetch_certificate_rejects_non_http_scheme() {
         // B1: non-web schemes (file://, gopher://) are refused by the scheme
         // allowlist before egress.
-        let builder = ChainBuilder::new();
+        let builder = ChainBuilder::new().unwrap();
         let err = builder
             .fetch_certificate("file:///etc/passwd")
             .await

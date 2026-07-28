@@ -126,32 +126,16 @@ impl DigestAlgorithm {
     }
 
     /// Compute the digest of the given data.
-    pub fn digest(&self, data: &[u8]) -> Vec<u8> {
-        use digest::Digest;
-        match self {
-            DigestAlgorithm::Sha256 => sha2::Sha256::digest(data).to_vec(),
-            DigestAlgorithm::Sha384 => sha2::Sha384::digest(data).to_vec(),
-            DigestAlgorithm::Sha512 => sha2::Sha512::digest(data).to_vec(),
-            DigestAlgorithm::Sha3_256 => sha3::Sha3_256::digest(data).to_vec(),
-            DigestAlgorithm::Sha3_384 => sha3::Sha3_384::digest(data).to_vec(),
-            DigestAlgorithm::Sha3_512 => sha3::Sha3_512::digest(data).to_vec(),
-        }
+    pub fn digest(&self, data: &[u8]) -> kryptering::Result<Vec<u8>> {
+        kryptering::digest::digest((*self).into(), data)
     }
 
     /// Create a streaming hasher for this algorithm.
     ///
     /// Use this when you need to hash data in multiple chunks (e.g., the two
     /// ByteRange segments for PDF signing).
-    pub fn new_hasher(&self) -> DigestHasher {
-        use digest::Digest;
-        match self {
-            DigestAlgorithm::Sha256 => DigestHasher::Sha256(sha2::Sha256::new()),
-            DigestAlgorithm::Sha384 => DigestHasher::Sha384(sha2::Sha384::new()),
-            DigestAlgorithm::Sha512 => DigestHasher::Sha512(sha2::Sha512::new()),
-            DigestAlgorithm::Sha3_256 => DigestHasher::Sha3_256(sha3::Sha3_256::new()),
-            DigestAlgorithm::Sha3_384 => DigestHasher::Sha3_384(sha3::Sha3_384::new()),
-            DigestAlgorithm::Sha3_512 => DigestHasher::Sha3_512(sha3::Sha3_512::new()),
-        }
+    pub fn new_hasher(&self) -> kryptering::Result<DigestHasher> {
+        kryptering::digest::new_digest((*self).into()).map(DigestHasher::new)
     }
 
     /// Output size of the digest in bytes.
@@ -196,6 +180,19 @@ impl DigestAlgorithm {
     }
 }
 
+impl From<DigestAlgorithm> for kryptering::HashAlgorithm {
+    fn from(value: DigestAlgorithm) -> Self {
+        match value {
+            DigestAlgorithm::Sha256 => Self::Sha256,
+            DigestAlgorithm::Sha384 => Self::Sha384,
+            DigestAlgorithm::Sha512 => Self::Sha512,
+            DigestAlgorithm::Sha3_256 => Self::Sha3_256,
+            DigestAlgorithm::Sha3_384 => Self::Sha3_384,
+            DigestAlgorithm::Sha3_512 => Self::Sha3_512,
+        }
+    }
+}
+
 impl std::fmt::Display for DigestAlgorithm {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(self.name())
@@ -204,41 +201,24 @@ impl std::fmt::Display for DigestAlgorithm {
 
 // ── DigestHasher ────────────────────────────────────────────────────────
 
-/// Streaming hasher that supports incremental updates.
-pub enum DigestHasher {
-    Sha256(sha2::Sha256),
-    Sha384(sha2::Sha384),
-    Sha512(sha2::Sha512),
-    Sha3_256(sha3::Sha3_256),
-    Sha3_384(sha3::Sha3_384),
-    Sha3_512(sha3::Sha3_512),
+/// Opaque provider-backed streaming hasher.
+pub struct DigestHasher {
+    inner: Box<dyn kryptering::digest::DigestStream>,
 }
 
 impl DigestHasher {
+    fn new(inner: Box<dyn kryptering::digest::DigestStream>) -> Self {
+        Self { inner }
+    }
+
     /// Feed data into the hasher.
     pub fn update(&mut self, data: &[u8]) {
-        use digest::Digest;
-        match self {
-            DigestHasher::Sha256(h) => h.update(data),
-            DigestHasher::Sha384(h) => h.update(data),
-            DigestHasher::Sha512(h) => h.update(data),
-            DigestHasher::Sha3_256(h) => h.update(data),
-            DigestHasher::Sha3_384(h) => h.update(data),
-            DigestHasher::Sha3_512(h) => h.update(data),
-        }
+        self.inner.update(data);
     }
 
     /// Finalize the hash and return the digest bytes.
-    pub fn finalize(self) -> Vec<u8> {
-        use digest::Digest;
-        match self {
-            DigestHasher::Sha256(h) => h.finalize().to_vec(),
-            DigestHasher::Sha384(h) => h.finalize().to_vec(),
-            DigestHasher::Sha512(h) => h.finalize().to_vec(),
-            DigestHasher::Sha3_256(h) => h.finalize().to_vec(),
-            DigestHasher::Sha3_384(h) => h.finalize().to_vec(),
-            DigestHasher::Sha3_512(h) => h.finalize().to_vec(),
-        }
+    pub fn finalize(self) -> kryptering::Result<Vec<u8>> {
+        self.inner.finalize()
     }
 }
 
@@ -492,17 +472,17 @@ mod tests {
     fn test_sha3_digests() {
         let data = b"hello world";
 
-        let sha3_256 = DigestAlgorithm::Sha3_256.digest(data);
+        let sha3_256 = DigestAlgorithm::Sha3_256.digest(data).unwrap();
         assert_eq!(sha3_256.len(), 32);
 
-        let sha3_384 = DigestAlgorithm::Sha3_384.digest(data);
+        let sha3_384 = DigestAlgorithm::Sha3_384.digest(data).unwrap();
         assert_eq!(sha3_384.len(), 48);
 
-        let sha3_512 = DigestAlgorithm::Sha3_512.digest(data);
+        let sha3_512 = DigestAlgorithm::Sha3_512.digest(data).unwrap();
         assert_eq!(sha3_512.len(), 64);
 
         // SHA-2 and SHA-3 should produce different results
-        let sha2_256 = DigestAlgorithm::Sha256.digest(data);
+        let sha2_256 = DigestAlgorithm::Sha256.digest(data).unwrap();
         assert_ne!(sha2_256, sha3_256, "SHA-256 and SHA3-256 should differ");
     }
 
@@ -512,11 +492,11 @@ mod tests {
 
         // One-shot digest should match streaming
         for &alg in DigestAlgorithm::all() {
-            let one_shot = alg.digest(data);
-            let mut hasher = alg.new_hasher();
+            let one_shot = alg.digest(data).unwrap();
+            let mut hasher = alg.new_hasher().unwrap();
             hasher.update(b"hello ");
             hasher.update(b"world");
-            let streaming = hasher.finalize();
+            let streaming = hasher.finalize().unwrap();
             assert_eq!(one_shot, streaming, "mismatch for {alg:?}");
         }
     }

@@ -49,12 +49,12 @@
 use std::time::Duration;
 
 use der::Encode;
-use reqwest::Client;
 use x509_cert::Certificate;
 
 use crate::der_utils;
 use crate::error::LtvError;
 use crate::ltv::status::{RevocationReason, RevocationSource, ValidationStatus};
+use crate::net::AttestedHttpClient;
 
 /// OCSP request Content-Type.
 const OCSP_REQUEST_CONTENT_TYPE: &str = "application/ocsp-request";
@@ -128,16 +128,16 @@ pub struct ParsedBasicOcspResponse {
     pub responses: Vec<SingleResponse>,
     /// Nonce from response extensions, if present.
     pub nonce: Option<Vec<u8>>,
-    /// Embedded certificates (from [0] EXPLICIT SEQUENCE OF Certificate).
+    /// Embedded certificates (from \[0\] EXPLICIT SEQUENCE OF Certificate).
     pub embedded_certs_der: Vec<Vec<u8>>,
 }
 
 /// Responder identification.
 #[derive(Debug, Clone)]
 pub enum ResponderId {
-    /// byName [1] — DER-encoded Name (the responder's DN).
+    /// byName \[1\] — DER-encoded Name (the responder's DN).
     ByName(Vec<u8>),
-    /// byKeyHash [2] — SHA-1 hash of responder's public key.
+    /// byKeyHash \[2\] — SHA-1 hash of responder's public key.
     ByKeyHash(Vec<u8>),
 }
 
@@ -146,23 +146,30 @@ pub enum ResponderId {
 /// OCSP client for querying certificate revocation status.
 #[derive(Debug, Clone)]
 pub struct OcspClient {
-    http_client: Client,
+    http_client: AttestedHttpClient,
     timeout: Duration,
 }
 
 impl OcspClient {
     /// Create a new OCSP client with default settings.
-    pub fn new() -> Self {
-        Self {
-            http_client: crate::net::hardened_http_client(),
+    pub fn new() -> Result<Self, LtvError> {
+        Ok(Self {
+            http_client: crate::net::hardened_http_client()?,
             timeout: Duration::from_secs(30),
-        }
+        })
     }
 
     /// Set the HTTP client.
-    pub fn http_client(mut self, client: Client) -> Self {
+    pub fn http_client(mut self, client: AttestedHttpClient) -> Self {
         self.http_client = client;
         self
+    }
+
+    /// Explicitly inject an unattested reqwest client outside FIPS mode.
+    #[cfg(not(feature = "fips"))]
+    pub fn unverified_http_client(mut self, client: reqwest::Client) -> Result<Self, LtvError> {
+        self.http_client = crate::net::unverified_http_client(client)?;
+        Ok(self)
     }
 
     /// Set the request timeout.
@@ -265,6 +272,7 @@ impl OcspClient {
 
         let response = self
             .http_client
+            .client()
             .post(url)
             .header("Content-Type", OCSP_REQUEST_CONTENT_TYPE)
             .timeout(self.timeout)
@@ -306,12 +314,6 @@ impl OcspClient {
         log::debug!("OCSP response from {url}: {} bytes", resp_bytes.len());
 
         Ok(resp_bytes)
-    }
-}
-
-impl Default for OcspClient {
-    fn default() -> Self {
-        Self::new()
     }
 }
 
@@ -471,7 +473,7 @@ pub fn build_ocsp_request_with_nonce(
     let request_list = der_utils::encode_sequence_from_parts(&[&request]);
 
     // Generate a 30-byte random nonce (matches Java stack)
-    let nonce = generate_nonce();
+    let nonce = generate_nonce()?;
 
     // Build nonce extension:
     // Extension ::= SEQUENCE {
@@ -506,7 +508,7 @@ fn build_cert_id(cert: &Certificate, issuer: &Certificate) -> Result<Vec<u8>, Lt
         .subject
         .to_der()
         .map_err(|e| LtvError::Ocsp(format!("failed to encode issuer name: {e}")))?;
-    let issuer_name_hash = sha1_hash(&issuer_name_der);
+    let issuer_name_hash = sha1_hash(&issuer_name_der)?;
 
     // Hash the issuer's public key
     let issuer_key_der = issuer
@@ -515,7 +517,7 @@ fn build_cert_id(cert: &Certificate, issuer: &Certificate) -> Result<Vec<u8>, Lt
         .subject_public_key
         .raw_bytes()
         .to_vec();
-    let issuer_key_hash = sha1_hash(&issuer_key_der);
+    let issuer_key_hash = sha1_hash(&issuer_key_der)?;
 
     // Serial number of the cert being checked
     let serial_der = cert
@@ -538,10 +540,8 @@ fn build_cert_id(cert: &Certificate, issuer: &Certificate) -> Result<Vec<u8>, Lt
 }
 
 /// Generate a cryptographically random nonce of NONCE_SIZE bytes.
-fn generate_nonce() -> Vec<u8> {
-    let mut nonce = vec![0u8; NONCE_SIZE];
-    getrandom::getrandom(&mut nonce).expect("OS random number generator");
-    nonce
+fn generate_nonce() -> Result<Vec<u8>, LtvError> {
+    Ok(kryptering::random_bytes(NONCE_SIZE)?)
 }
 
 /// Build SHA-1 AlgorithmIdentifier (SEQUENCE { OID, NULL }).
@@ -1113,7 +1113,7 @@ fn verify_ocsp_response_signature(
 
 // ── Responder trust validation ─────────────────────────────────────
 
-/// Outcome of [`validate_responder_trust`]: whether the (now-trusted) OCSP
+/// Outcome of responder trust validation: whether the (now-trusted) OCSP
 /// responder still needs its **own** revocation status checked.
 ///
 /// Per RFC 6960 §4.2.2.2.1, a *delegated* responder certificate (one issued by
@@ -1262,7 +1262,7 @@ fn responder_matches_responder_id(
                 .subject_public_key_info
                 .subject_public_key
                 .raw_bytes();
-            let computed = sha1_hash(key_bytes);
+            let computed = sha1_hash(key_bytes)?;
             if &computed != key_hash {
                 return Err(LtvError::Ocsp(
                     "OCSP responder certificate key hash does not match responderID (byKeyHash)"
@@ -1627,7 +1627,7 @@ pub fn check_revocation_detailed(
         .subject
         .to_der()
         .map_err(|e| LtvError::Ocsp(format!("issuer name encode: {e}")))?;
-    let expected_name_hash = sha1_hash(&issuer_name_der);
+    let expected_name_hash = sha1_hash(&issuer_name_der)?;
 
     let issuer_key_bytes = issuer
         .tbs_certificate
@@ -1635,7 +1635,7 @@ pub fn check_revocation_detailed(
         .subject_public_key
         .raw_bytes()
         .to_vec();
-    let expected_key_hash = sha1_hash(&issuer_key_bytes);
+    let expected_key_hash = sha1_hash(&issuer_key_bytes)?;
 
     let cert_serial = der_utils::parse_integer_body(cert.tbs_certificate.serial_number.as_bytes());
 
@@ -1705,9 +1705,11 @@ pub fn check_revocation_detailed(
 }
 
 /// Compute SHA-1 hash of data.
-fn sha1_hash(data: &[u8]) -> Vec<u8> {
-    use sha1::Digest;
-    sha1::Sha1::digest(data).to_vec()
+fn sha1_hash(data: &[u8]) -> Result<Vec<u8>, LtvError> {
+    Ok(kryptering::digest::digest(
+        kryptering::HashAlgorithm::Sha1,
+        data,
+    )?)
 }
 
 // ── Tests ──────────────────────────────────────────────────────────
@@ -1719,13 +1721,13 @@ mod tests {
 
     #[test]
     fn test_ocsp_client_default() {
-        let client = OcspClient::new();
+        let client = OcspClient::new().unwrap();
         assert_eq!(client.timeout, Duration::from_secs(30));
     }
 
     #[tokio::test]
     async fn test_send_ocsp_request_rejects_loopback_url() {
-        let client = OcspClient::new();
+        let client = OcspClient::new().unwrap();
         let err = client
             .send_ocsp_request("http://127.0.0.1/ocsp", &[0x30, 0x00])
             .await
@@ -1739,7 +1741,7 @@ mod tests {
 
     #[test]
     fn test_sha1_hash() {
-        let hash = sha1_hash(b"test");
+        let hash = sha1_hash(b"test").unwrap();
         assert_eq!(hash.len(), 20); // SHA-1 is 20 bytes
     }
 
@@ -1766,12 +1768,12 @@ mod tests {
 
     #[test]
     fn test_generate_nonce() {
-        let nonce1 = generate_nonce();
+        let nonce1 = generate_nonce().unwrap();
         assert_eq!(nonce1.len(), NONCE_SIZE);
 
         // Two nonces generated at the same time should still differ
         // (because of wrapping_add with index)
-        let nonce2 = generate_nonce();
+        let nonce2 = generate_nonce().unwrap();
         assert_eq!(nonce2.len(), NONCE_SIZE);
     }
 
@@ -2034,14 +2036,14 @@ mod tests {
     ) -> Vec<u8> {
         // CertID
         let issuer_name_der = issuer_cert.tbs_certificate.subject.to_der().unwrap();
-        let issuer_name_hash = sha1_hash(&issuer_name_der);
+        let issuer_name_hash = sha1_hash(&issuer_name_der).unwrap();
         let issuer_key_bytes = issuer_cert
             .tbs_certificate
             .subject_public_key_info
             .subject_public_key
             .raw_bytes()
             .to_vec();
-        let issuer_key_hash = sha1_hash(&issuer_key_bytes);
+        let issuer_key_hash = sha1_hash(&issuer_key_bytes).unwrap();
 
         let serial = cert.tbs_certificate.serial_number.to_der().unwrap();
 
@@ -2518,10 +2520,10 @@ mod tests {
             .subject_public_key
             .raw_bytes()
             .to_vec();
-        let correct = sha1_hash(&key_bytes);
+        let correct = sha1_hash(&key_bytes).unwrap();
         assert!(responder_matches_responder_id(&issuer, &ResponderId::ByKeyHash(correct)).is_ok());
 
-        let wrong = sha1_hash(b"not the responder key");
+        let wrong = sha1_hash(b"not the responder key").unwrap();
         let err = responder_matches_responder_id(&issuer, &ResponderId::ByKeyHash(wrong))
             .expect_err("mismatched responderID byKeyHash must be rejected");
         assert!(

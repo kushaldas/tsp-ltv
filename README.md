@@ -6,6 +6,9 @@ stores, and certificate chain building used by
 [underskrift](https://github.com/kushaldas/underskrift) (PAdES/CAdES),
 bergshamra (XAdES), and jades (JAdES).
 
+Version 0.4 requires Rust 1.88 and delegates all cryptographic operations and
+TLS provider configuration to `kryptering` 0.5.
+
 ## Features
 
 - **RFC 3161 timestamping** — TSA client and pool with failover, TimeStampReq/Resp
@@ -59,15 +62,15 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-tsp-ltv = "0.1"
+tsp-ltv = "0.4"
 ```
 
-All features are enabled by default (`tsp`, `ltv`, `blocking`). To use only
-a subset:
+Defaults are `tsp`, `ltv`, `blocking`, `rustcrypto`, `tls-ring`, and
+`legacy-algorithms`. To use only a subset:
 
 ```toml
 [dependencies]
-tsp-ltv = { version = "0.1", default-features = false, features = ["tsp"] }
+tsp-ltv = { version = "0.4", default-features = false, features = ["tsp", "rustcrypto", "tls-ring"] }
 ```
 
 For crates that only need trust store management and certificate verification
@@ -75,7 +78,7 @@ For crates that only need trust store management and certificate verification
 
 ```toml
 [dependencies]
-tsp-ltv = { version = "0.1", default-features = false }
+tsp-ltv = { version = "0.4", default-features = false, features = ["rustcrypto"] }
 ```
 
 This gives you access to the `trust` and `crypto` modules without pulling in
@@ -86,7 +89,7 @@ OCSP, CRL, or TSP client dependencies.
 ```rust
 use tsp_ltv::tsp::{TsaClient, TsaClientPool};
 
-let client = TsaClient::new("http://timestamp.digicert.com");
+let client = TsaClient::new("http://timestamp.digicert.com")?;
 let hash = vec![0u8; 32]; // SHA-256 hash of signature value
 let token = client.timestamp(&hash).await?;
 
@@ -94,7 +97,7 @@ let token = client.timestamp(&hash).await?;
 let pool = TsaClientPool::from_urls(&[
     "http://timestamp.digicert.com",
     "http://timestamp.globalsign.com/tsa/r6advanced1",
-]);
+])?;
 let token = pool.timestamp(&hash).await?;
 ```
 
@@ -103,8 +106,8 @@ let token = pool.timestamp(&hash).await?;
 ```rust
 use tsp_ltv::ltv::{OcspClient, CrlClient, RevocationConfig, check_certificate_revocation};
 
-let ocsp = OcspClient::new();
-let crl = CrlClient::new();
+let ocsp = OcspClient::new()?;
+let crl = CrlClient::new()?;
 let config = RevocationConfig::default();
 
 let status = check_certificate_revocation(
@@ -148,9 +151,28 @@ trust_store.verify_chain(&chain, None)?;
 | `tsp` | yes | RFC 3161 timestamping (requires network) |
 | `ltv` | yes | OCSP/CRL/chain building (implies `tsp`) |
 | `blocking` | yes | Synchronous API wrappers via `tokio::runtime::Runtime::block_on` |
+| `rustcrypto` | yes | RustCrypto document provider (exactly one document provider is required) |
+| `aws-lc` | no | AWS-LC document provider |
+| `tls-ring` | yes | ring TLS provider for network-enabled builds |
+| `tls-aws-lc` | no | AWS-LC TLS provider |
+| `fips` | no | Select AWS-LC and require explicit, attested provider initialization |
 
 With `default-features = false`, the `trust`, `crypto`, `error`, and
-`der_utils` modules are always available.
+`der_utils` modules are always available, but one document provider still has
+to be selected. Exactly one TLS provider is also required whenever `tsp` (and
+therefore `ltv`) enables networking. Document crypto and TLS are independent;
+there is no provider fallback. In FIPS builds, AWS-LC is the document provider
+and, when networking is enabled, the only TLS provider. `--all-features` is
+intentionally invalid.
+
+Network clients are built fallibly with `net::hardened_http_client()` and carry
+an `AttestedHttpClient`; raw `reqwest::Client` injection is unavailable in
+FIPS builds. Non-FIPS callers that deliberately accept the risk must use the
+explicitly named `unverified_http_client` escape hatch.
+
+In FIPS builds, call `initialize_backend()` before digesting, validation, or
+HTTPS client creation. Enabling the feature does not itself certify the
+application or deployment.
 
 ## License
 

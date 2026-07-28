@@ -1,18 +1,43 @@
 [package]
 name = "tsp-ltv"
-version = "0.3.1"
+version = "0.4.0"
 edition = "2021"
-rust-version = "1.75"
+rust-version = "1.88"
 description = "Shared timestamping (RFC 3161) and long-term validation (OCSP, CRL, trust stores) infrastructure for AdES signatures"
 license = "BSD-2-Clause"
 keywords = ["tsp", "ocsp", "crl", "x509", "digital-signature"]
 categories = ["cryptography"]
 
 [features]
-default = ["tsp", "ltv", "blocking"]
+default = [
+  "tsp",
+  "ltv",
+  "blocking",
+  "rustcrypto",
+  "tls-ring",
+  "legacy-algorithms",
+]
+
+# Document cryptography provider (exactly one).
+rustcrypto = ["kryptering/rustcrypto"]
+aws-lc = ["kryptering/aws-lc"]
+
+# Network TLS provider (exactly one whenever `tsp` is enabled).
+tls-ring = ["kryptering/tls-ring"]
+tls-aws-lc = ["kryptering/tls-aws-lc"]
+
+# Compliance mode. Explicit backend initialization is required before use.
+fips = ["aws-lc", "kryptering/fips"]
+legacy-algorithms = ["kryptering/legacy"]
 
 # RFC 3161 timestamping (TSA client)
-tsp = ["dep:reqwest", "dep:tokio", "dep:subtle"]
+tsp = [
+  "dep:reqwest",
+  "dep:tokio",
+  "dep:subtle",
+  "dep:rustls",
+  "dep:webpki-roots",
+]
 
 # Long-term validation (OCSP/CRL/chain fetching) — requires TSP for network deps
 ltv = ["tsp"]
@@ -21,28 +46,13 @@ ltv = ["tsp"]
 blocking = ["dep:tokio"]
 
 [dependencies]
+kryptering = { version = "0.5.0", default-features = false }
 # CMS / PKCS#7 / X.509 (RustCrypto ecosystem)
 cms = { version = "0.2", features = ["alloc"] }
 x509-cert = { version = "0.2", features = ["pem"] }
 der = { version = "0.7", features = ["alloc", "oid"] }
 spki = "0.7"
 const-oid = { version = "0.9", features = ["db"] }
-
-# Signing algorithms (for certificate/OCSP/CRL signature verification)
-rsa = { version = "0.9", features = ["sha2"] }
-ecdsa = { version = "0.16", features = ["signing", "verifying", "der"] }
-p256 = { version = "0.13", features = ["ecdsa"] }
-p384 = { version = "0.13", features = ["ecdsa"] }
-p521 = { version = "0.13", features = ["ecdsa", "pkcs8"] }
-ed25519-dalek = { version = "2", features = ["pem"] }
-signature = "2"
-
-# Hashing (for OCSP request building, CRL verification, TSP)
-sha2 = "0.10"
-sha3 = "0.10"
-sha1 = { version = "0.10", features = ["oid"] }
-md-5 = { version = "0.10", features = ["oid"] }
-digest = "0.10"
 
 # Error handling
 thiserror = "2"
@@ -57,9 +67,6 @@ base64 = "0.22"
 # Logging
 log = "0.4"
 
-# CSPRNG for nonce generation
-getrandom = { version = "0.2", features = ["std"] }
-
 # Time
 chrono = { version = "0.4", default-features = false, features = [
   "std",
@@ -68,17 +75,37 @@ chrono = { version = "0.4", default-features = false, features = [
 
 # HTTP client — optional (TSA, OCSP, CRL fetching)
 reqwest = { version = "0.12", default-features = false, features = [
-  "rustls-tls",
+  "rustls-tls-no-provider",
 ], optional = true }
+rustls = { version = "0.23", default-features = false, features = ["std"], optional = true }
+webpki-roots = { version = "1", optional = true }
 tokio = { version = "1", features = ["rt", "macros", "time"], optional = true }
 # Constant-time comparisons — only used by the `tsp` module (token.rs).
 subtle = { version = "2", optional = true }
-dsa = "0.6"
 
 [dev-dependencies]
-tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
+rcgen = "=0.13.2"
+# Keep rcgen's transitive time dependency on an audited Rust 1.88-compatible release.
+time = "=0.3.53"
 tempfile = "3"
 # Test-only: generate the TSA signing certificate/key at runtime instead of
 # committing a private key fixture into the repository.
 x509-cert = { version = "0.2", features = ["pem", "builder"] }
 rand = "0.8"
+# Test fixture generation only. Production cryptography is provided solely by
+# Kryptering, so alternate feature trees do not acquire these implementations.
+rsa = { version = "0.9", features = ["sha2"] }
+ecdsa = { version = "0.16", features = ["signing", "verifying", "der"] }
+p256 = { version = "0.13", features = ["ecdsa"] }
+p384 = { version = "0.13", features = ["ecdsa"] }
+p521 = { version = "0.13", features = ["ecdsa", "pkcs8"] }
+ed25519-dalek = { version = "2", features = ["pem"] }
+signature = "2"
+sha2 = "0.10"
+sha3 = "0.10"
+sha1 = { version = "0.10", features = ["oid"] }
+md-5 = { version = "0.10", features = ["oid"] }
+digest = "0.10"
+dsa = "0.6"

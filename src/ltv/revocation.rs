@@ -25,11 +25,12 @@
 //! ```rust,no_run
 //! use tsp_ltv::ltv::revocation::{RevocationConfig, check_certificate_revocation};
 //! use tsp_ltv::ltv::{OcspClient, CrlClient};
-//! # async fn example() {
+//! # async fn example() -> Result<(), tsp_ltv::error::LtvError> {
 //! let config = RevocationConfig::default();
-//! let ocsp = OcspClient::new();
-//! let crl = CrlClient::new();
+//! let ocsp = OcspClient::new()?;
+//! let crl = CrlClient::new()?;
 //! // let status = check_certificate_revocation(&cert, &issuer, &config, &crl, &ocsp, None).await;
+//! # Ok(())
 //! # }
 //! ```
 
@@ -719,8 +720,8 @@ mod tests {
 
         let config = RevocationConfig::default();
         assert!(config.require_revocation_check);
-        let crl_client = CrlClient::new();
-        let ocsp_client = OcspClient::new();
+        let crl_client = CrlClient::new().unwrap();
+        let ocsp_client = OcspClient::new().unwrap();
 
         let status = check_certificate_revocation(
             &intermediate,
@@ -750,8 +751,8 @@ mod tests {
 
         let config = RevocationConfig::disabled();
         assert!(!config.require_revocation_check);
-        let crl_client = CrlClient::new();
-        let ocsp_client = OcspClient::new();
+        let crl_client = CrlClient::new().unwrap();
+        let ocsp_client = OcspClient::new().unwrap();
 
         let status = check_certificate_revocation(
             &intermediate,
@@ -853,8 +854,8 @@ mod tests {
             per_cert_timeout: Duration::from_secs(2),
             ..Default::default()
         };
-        let crl_client = CrlClient::new();
-        let ocsp_client = OcspClient::new();
+        let crl_client = CrlClient::new().unwrap();
+        let ocsp_client = OcspClient::new().unwrap();
 
         let status = check_certificate_revocation(
             &signer,
