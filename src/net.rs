@@ -348,6 +348,9 @@ mod tests {
     }
 
     fn attested_client_with_root(root: Option<CertificateDer<'static>>) -> AttestedHttpClient {
+        #[cfg(feature = "fips")]
+        kryptering::initialize_backend().expect("initialize FIPS backend for HTTPS unit test");
+
         let mut roots = rustls::RootCertStore::empty();
         if let Some(root) = root {
             roots.add(root).expect("add test trust anchor");

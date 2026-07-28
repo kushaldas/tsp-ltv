@@ -59,7 +59,7 @@ jobs:
       - name: AWS-LC excludes RustCrypto primitives
         run: |
           cargo tree --no-default-features --features tsp,ltv,blocking,aws-lc,tls-aws-lc,legacy-algorithms -e normal --prefix none > /tmp/tsp-ltv-aws-tree.txt
-          forbidden='^(rsa|dsa|ecdsa|p256|p384|p521|ed25519-dalek|x25519-dalek|aes |aes-gcm|cbc |des |sha1 |sha2 |sha3 |hmac |ml-dsa|slh-dsa|ml-kem) v'
+          forbidden='^(rsa|dsa|ecdsa|p256|p384|p521|ed25519-dalek|x25519-dalek|aes|aes-gcm|cbc|des|sha1|sha2|sha3|hmac|ml-dsa|slh-dsa|ml-kem) v'
           if rg "$forbidden" /tmp/tsp-ltv-aws-tree.txt; then
             echo "::error::AWS-LC build includes a RustCrypto primitive implementation"
             exit 1
