@@ -516,9 +516,12 @@ fn ip_matches(addr: &[u8], mask: &[u8], name: &[u8]) -> bool {
 /// (case-insensitive, leading/trailing whitespace stripped, internal whitespace
 /// runs collapsed). Byte-equality alone would let a sub-CA escape an
 /// *excludedSubtrees* directoryName by re-encoding the same logical RDN with a
-/// different string type or letter case. Values of any other ASN.1 type fall
-/// back to exact tag + byte equality, and malformed RDNs are a parse error
-/// (fail closed).
+/// different string type or letter case. Values of any other ASN.1 type require
+/// exact tag + byte equality. Malformed RDNs — including a directory-string
+/// value that is not well-formed for its type (e.g. invalid UTF-8 in a
+/// UTF8String, non-ASCII in a PrintableString/IA5String) — are a parse error
+/// that aborts the whole constraint check (fail closed), never a silent
+/// byte-equality fallback.
 fn directory_matches(
     base_wrapped: &[u8],
     name_wrapped: &[u8],
@@ -579,16 +582,40 @@ fn rdn_atvs(rdn_der: &[u8]) -> Result<Vec<Atv>, NameConstraintError> {
                 "trailing data in AttributeTypeAndValue".into(),
             ));
         }
+        // A value tagged as a directory string type must be well-formed for
+        // that type; otherwise it cannot be caseIgnoreMatch-normalised. Reject
+        // it here (fail closed) rather than letting the comparison silently
+        // fall back to byte-equality — a bool matcher cannot fail closed for
+        // both permitted (over-match) and excluded (evasion) directions, so a
+        // malformed directoryName must abort the whole constraint check.
+        if !directory_string_well_formed(val_tag, val_body) {
+            return Err(NameConstraintError::Parse(format!(
+                "malformed directoryName attribute value for string type (tag 0x{val_tag:02x})"
+            )));
+        }
         atvs.push((oid_body.to_vec(), val_tag, val_body.to_vec()));
         pos = rest;
     }
     Ok(atvs)
 }
 
+/// Whether a value body is well-formed for its declared directory string type:
+/// UTF8String (`0x0c`) must be valid UTF-8; PrintableString (`0x13`) and
+/// IA5String (`0x16`) are ASCII-only types, so their bytes must be ASCII. Any
+/// non-directory-string tag is not this function's concern and returns `true`.
+fn directory_string_well_formed(tag: u8, body: &[u8]) -> bool {
+    match tag {
+        0x0c => std::str::from_utf8(body).is_ok(),
+        0x13 | 0x16 => body.is_ascii(),
+        _ => true,
+    }
+}
+
 /// RFC 5280 §7.1 `caseIgnoreMatch` approximation for directory string values:
-/// require valid UTF-8, fold case, strip leading/trailing whitespace, collapse
-/// internal whitespace runs to a single space. Returns `None` for invalid
-/// UTF-8 (caller falls back to exact comparison).
+/// fold case, strip leading/trailing whitespace, collapse internal whitespace
+/// runs to a single space. Returns `None` only for invalid UTF-8, which
+/// [`rdn_atvs`] already rejects for directory-string-tagged values, so this
+/// path is unreachable for those.
 fn normalize_directory_string(bytes: &[u8]) -> Option<String> {
     let s = std::str::from_utf8(bytes).ok()?;
     let mut out = String::with_capacity(s.len());
@@ -610,14 +637,20 @@ fn normalize_directory_string(bytes: &[u8]) -> Option<String> {
 /// Compare two attribute values. Directory-string types compare under
 /// caseIgnoreMatch normalisation (across the interchangeable string tags);
 /// anything else requires exact tag + byte equality.
+///
+/// Directory-string values reaching this point were validated as well-formed by
+/// [`rdn_atvs`], so their normalisation always succeeds; the `_ => false` arm is
+/// therefore defensive (a malformed value would already have aborted the check
+/// with a parse error) rather than a silent byte-equality fallback.
 fn atv_value_matches(b_tag: u8, b_val: &[u8], n_tag: u8, n_val: &[u8]) -> bool {
     if DIRECTORY_STRING_TAGS.contains(&b_tag) && DIRECTORY_STRING_TAGS.contains(&n_tag) {
-        if let (Some(b), Some(n)) = (
+        return match (
             normalize_directory_string(b_val),
             normalize_directory_string(n_val),
         ) {
-            return b == n;
-        }
+            (Some(b), Some(n)) => b == n,
+            _ => false,
+        };
     }
     b_tag == n_tag && b_val == n_val
 }
@@ -815,6 +848,26 @@ mod tests {
         let b = dir_name(CN_OID, 0x04, b"ab");
         assert!(!directory_matches(&a, &b).unwrap());
         assert!(directory_matches(&a, &a).unwrap());
+    }
+
+    #[test]
+    fn directory_name_malformed_string_value_fails_closed() {
+        // A UTF8String (0x0c) carrying invalid UTF-8, and a PrintableString
+        // (0x13) carrying non-ASCII bytes, are malformed for their declared
+        // type. They must abort the comparison with a parse error (fail closed)
+        // rather than silently falling back to byte-equality, which for an
+        // excluded subtree would let the malformed name evade the exclusion.
+        let good = dir_name(CN_OID, 0x0c, b"example");
+        let bad_utf8 = dir_name(CN_OID, 0x0c, &[0xff, 0xfe, 0x00]);
+        let err = directory_matches(&bad_utf8, &good).unwrap_err();
+        assert!(matches!(err, NameConstraintError::Parse(_)));
+        // Malformed value on the name side is equally rejected.
+        let err = directory_matches(&good, &bad_utf8).unwrap_err();
+        assert!(matches!(err, NameConstraintError::Parse(_)));
+
+        let bad_printable = dir_name(CN_OID, 0x13, &[0x41, 0xc9, 0x42]); // non-ASCII
+        let err = directory_matches(&bad_printable, &good).unwrap_err();
+        assert!(matches!(err, NameConstraintError::Parse(_)));
     }
 
     #[test]

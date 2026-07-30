@@ -32,7 +32,11 @@
   semantics across the interchangeable directory string types
   (PrintableString / UTF8String / IA5String) instead of DER byte-equality, so
   an excluded subtree can no longer be evaded by re-encoding or re-casing an
-  RDN. Malformed RDNs fail closed.
+  RDN. A directory-string value that is not well-formed for its declared type
+  (invalid UTF-8 in a UTF8String, non-ASCII in a PrintableString/IA5String)
+  aborts the constraint check as a parse error (fail closed) instead of
+  falling back to byte-equality, closing a malformed-name evasion of an
+  excluded subtree.
 - CRL signature verification requires the issuer certificate's `keyUsage`
   (when present) to assert `cRLSign` (RFC 5280 §4.2.1.3) before any signature
   math.
