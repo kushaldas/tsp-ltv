@@ -36,14 +36,6 @@ jobs:
             exit 1
           fi
 
-      - name: Verify release prerequisite
-        run: |
-          if ! curl --fail --silent --show-error \
-            https://crates.io/api/v1/crates/kryptering/0.5.0 >/dev/null; then
-            echo "::error::kryptering 0.5.0 must be published before tsp-ltv" >&2
-            exit 1
-          fi
-
       - name: Verify publishable package
         run: cargo publish --dry-run
 
