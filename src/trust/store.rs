@@ -1652,6 +1652,75 @@ mod tests {
         store
             .verify_chain_for_purpose(&chain, None, CertRole::EndEntity)
             .expect("end-entity leaf must satisfy EndEntity purpose");
+
+        // But it must NOT satisfy TimestampSigner — no timeStamping EKU (H-4).
+        let err = store
+            .verify_chain_for_purpose(&chain, None, CertRole::TimestampSigner)
+            .expect_err("leaf without timeStamping EKU must fail TimestampSigner purpose");
+        assert!(
+            matches!(err, TrustError::ProfileViolation(ref m) if m.contains("TimestampSigner")),
+            "expected TimestampSigner purpose rejection, got: {err:?}"
+        );
+    }
+
+    #[cfg(feature = "ltv")]
+    #[test]
+    fn test_verify_chain_for_purpose_timestamp_signer() {
+        use crate::ltv::CertRole;
+        use rsa::pkcs1v15::SigningKey;
+        use rsa::signature::Keypair;
+        use rsa::RsaPrivateKey;
+        use sha2::Sha256;
+        use x509_cert::builder::{Builder, CertificateBuilder, Profile};
+        use x509_cert::ext::pkix::ExtendedKeyUsage;
+        use x509_cert::name::Name;
+        use x509_cert::serial_number::SerialNumber;
+        use x509_cert::spki::SubjectPublicKeyInfoOwned;
+        use x509_cert::time::Validity;
+
+        let mut rng = rand::thread_rng();
+        let root_key = RsaPrivateKey::new(&mut rng, 2048).unwrap();
+        let leaf_key = RsaPrivateKey::new(&mut rng, 2048).unwrap();
+        let root_signer = SigningKey::<Sha256>::new(root_key.clone());
+
+        let root_name = "CN=TSA Purpose Root,O=tsp-ltv tests";
+        let root = issue_cert(Profile::Root, root_name, &root_key, &root_signer);
+
+        let leaf_signer = SigningKey::<Sha256>::new(leaf_key.clone());
+        let spki = SubjectPublicKeyInfoOwned::from_key(leaf_signer.verifying_key()).expect("SPKI");
+        let issuer: Name = root_name.parse().unwrap();
+        let subject: Name = "CN=TSA Purpose Leaf,O=tsp-ltv tests".parse().unwrap();
+        let validity =
+            Validity::from_now(std::time::Duration::from_secs(3650 * 24 * 3600)).unwrap();
+        let mut builder = CertificateBuilder::new(
+            Profile::Leaf {
+                issuer,
+                enable_key_agreement: false,
+                enable_key_encipherment: false,
+            },
+            SerialNumber::new(&[0x51]).unwrap(),
+            validity,
+            subject,
+            spki,
+            &root_signer,
+        )
+        .expect("cert builder");
+        // Critical because the EKU set does not include anyExtendedKeyUsage.
+        let ts_eku = const_oid::ObjectIdentifier::new_unwrap("1.3.6.1.5.5.7.3.8");
+        builder
+            .add_extension(&ExtendedKeyUsage(vec![ts_eku]))
+            .expect("add EKU");
+        let leaf = builder
+            .build::<rsa::pkcs1v15::Signature>()
+            .expect("sign cert");
+
+        let mut store = TrustStore::new();
+        store.add_certificate(root.clone()).unwrap();
+        let chain = vec![leaf, root];
+
+        store
+            .verify_chain_for_purpose(&chain, None, CertRole::TimestampSigner)
+            .expect("leaf with critical timeStamping EKU must satisfy TimestampSigner");
     }
 
     // ── M2 name constraints ───────────────────────────────────────

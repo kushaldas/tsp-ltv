@@ -23,6 +23,8 @@
 //! - **IntermediateCa**: must have `CA:TRUE` + `keyCertSign` key usage
 //! - **CrlSigner**: must have `cRLSign` key usage
 //! - **OcspResponder**: must have `id-kp-OCSPSigning` EKU
+//! - **TimestampSigner**: must NOT have `CA:TRUE`; must have a **critical**
+//!   `id-kp-timeStamping` EKU (RFC 3161 §2.3)
 
 use crate::der_utils;
 use crate::error::LtvError;
@@ -41,6 +43,9 @@ const EKU_OID: &str = "2.5.29.37";
 
 /// OCSP Signing EKU OID: 1.3.6.1.5.5.7.3.9
 const OCSP_SIGNING_EKU_OID: &str = "1.3.6.1.5.5.7.3.9";
+
+/// Time Stamping EKU OID: 1.3.6.1.5.5.7.3.8 (RFC 3161 §2.3)
+const TIMESTAMPING_EKU_OID: &str = "1.3.6.1.5.5.7.3.8";
 
 // ── Public types ──────────────────────────────────────────────────
 
@@ -143,6 +148,8 @@ pub enum CertRole {
     CrlSigner,
     /// OCSP responder certificate.
     OcspResponder,
+    /// RFC 3161 timestamping authority (TSA) signing certificate.
+    TimestampSigner,
 }
 
 impl std::fmt::Display for CertRole {
@@ -152,6 +159,7 @@ impl std::fmt::Display for CertRole {
             CertRole::IntermediateCa => write!(f, "IntermediateCa"),
             CertRole::CrlSigner => write!(f, "CrlSigner"),
             CertRole::OcspResponder => write!(f, "OcspResponder"),
+            CertRole::TimestampSigner => write!(f, "TimestampSigner"),
         }
     }
 }
@@ -329,6 +337,7 @@ pub fn has_extension(cert: &Certificate, oid: &const_oid::ObjectIdentifier) -> b
 /// | IntermediateCa | CA must be TRUE | keyCertSign required | — |
 /// | CrlSigner | — | cRLSign required | — |
 /// | OcspResponder | — | — | id-kp-OCSPSigning required |
+/// | TimestampSigner | CA must be FALSE | — | critical id-kp-timeStamping required |
 ///
 /// # Errors
 ///
@@ -341,6 +350,7 @@ pub fn validate_extensions_for_role(cert: &Certificate, role: CertRole) -> Resul
         CertRole::IntermediateCa => validate_intermediate_ca(cert),
         CertRole::CrlSigner => validate_crl_signer(cert),
         CertRole::OcspResponder => validate_ocsp_responder(cert),
+        CertRole::TimestampSigner => validate_timestamp_signer(cert),
     }
 }
 
@@ -428,6 +438,57 @@ fn validate_crl_signer(cert: &Certificate) -> Result<(), LtvError> {
                 "CrlSigner certificate missing keyUsage extension".into(),
             ));
         }
+    }
+
+    Ok(())
+}
+
+/// Validate TSA signing certificate extensions.
+///
+/// RFC 3161 §2.3: the TSA certificate MUST carry an extendedKeyUsage
+/// containing `id-kp-timeStamping`, and the extension MUST be critical.
+fn validate_timestamp_signer(cert: &Certificate) -> Result<(), LtvError> {
+    // Must not be a CA — the TSA signer is an end-entity certificate.
+    let (is_ca, _) = check_basic_constraints(cert)?;
+    if is_ca {
+        return Err(LtvError::X509Extension(
+            "TimestampSigner certificate has basicConstraints CA:TRUE".into(),
+        ));
+    }
+
+    let eku_oid = const_oid::ObjectIdentifier::new_unwrap(EKU_OID);
+    let ts_oid = const_oid::ObjectIdentifier::new_unwrap(TIMESTAMPING_EKU_OID);
+
+    // Locate the EKU extension directly so its `critical` flag is visible.
+    let ext = cert
+        .tbs_certificate
+        .extensions
+        .as_ref()
+        .and_then(|exts| exts.iter().find(|e| e.extn_id == eku_oid))
+        .ok_or_else(|| {
+            LtvError::X509Extension(
+                "TimestampSigner certificate missing extendedKeyUsage extension".into(),
+            )
+        })?;
+    if !ext.critical {
+        return Err(LtvError::X509Extension(
+            "TimestampSigner extendedKeyUsage extension must be critical (RFC 3161 §2.3)".into(),
+        ));
+    }
+
+    let ekus = check_extended_key_usage(cert)?;
+    if !ekus.contains(&ts_oid) {
+        return Err(LtvError::X509Extension(format!(
+            "TimestampSigner certificate missing id-kp-timeStamping EKU (has: {})",
+            if ekus.is_empty() {
+                "(none)".to_string()
+            } else {
+                ekus.iter()
+                    .map(|o| o.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            }
+        )));
     }
 
     Ok(())
@@ -650,6 +711,36 @@ mod tests {
         assert!(
             result.is_err(),
             "signer cert (no cRLSign) should fail CrlSigner validation"
+        );
+    }
+
+    #[test]
+    fn test_validate_timestamp_signer_rejects_no_eku() {
+        let cert = signer_cert();
+        let result = validate_extensions_for_role(&cert, CertRole::TimestampSigner);
+        assert!(
+            result.is_err(),
+            "signer cert (no EKU) should fail TimestampSigner validation"
+        );
+        let err = format!("{}", result.unwrap_err());
+        assert!(
+            err.contains("extendedKeyUsage"),
+            "error should mention extendedKeyUsage: {err}"
+        );
+    }
+
+    #[test]
+    fn test_validate_timestamp_signer_rejects_ca() {
+        let cert = intermediate_cert();
+        let result = validate_extensions_for_role(&cert, CertRole::TimestampSigner);
+        assert!(
+            result.is_err(),
+            "CA cert should fail TimestampSigner validation"
+        );
+        let err = format!("{}", result.unwrap_err());
+        assert!(
+            err.contains("CA:TRUE"),
+            "error should mention CA:TRUE: {err}"
         );
     }
 

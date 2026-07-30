@@ -809,12 +809,29 @@ pub fn verify_crl_signature(parsed_crl: &ParsedCrl, issuer: &Certificate) -> Res
 /// Like [`verify_crl_signature`] but with an explicit
 /// [`SignaturePolicy`](crate::crypto::verify::SignaturePolicy). The default
 /// rejects CRLs signed with MD5/SHA-1/SHA-224.
+///
+/// In addition to the signature itself, the issuer certificate's authority to
+/// sign CRLs is checked: when it carries a `keyUsage` extension, that extension
+/// must assert `cRLSign` (RFC 5280 §4.2.1.3). An absent `keyUsage` imposes no
+/// restriction, consistent with the intermediate-CA extension policy.
 pub fn verify_crl_signature_with_policy(
     parsed_crl: &ParsedCrl,
     issuer: &Certificate,
     policy: &crate::crypto::verify::SignaturePolicy,
 ) -> Result<(), LtvError> {
     use der::Encode;
+
+    // The signing certificate must be authorised to sign CRLs before its key
+    // is even considered: a certificate whose keyUsage excludes cRLSign (e.g.
+    // a TLS or document-signing certificate under the same CA name) must not
+    // be able to vouch for revocation status.
+    if let Some(ku) = crate::ltv::x509_ext::check_key_usage(issuer)? {
+        if !ku.crl_sign {
+            return Err(LtvError::Crl(format!(
+                "CRL issuer certificate keyUsage does not assert cRLSign (has: {ku})"
+            )));
+        }
+    }
 
     let spki_der = issuer
         .tbs_certificate
@@ -979,6 +996,15 @@ fn crl_is_current(
 /// 6. Time-aware: if `revocationDate > validation_time` → `Valid`
 ///
 /// Returns a [`ValidationStatus`] indicating the result.
+///
+/// # Warning — no fail-closed policy is applied
+///
+/// This function (and its `_with_policy` / `_with_options` variants) returns
+/// the **raw** status derived from this single CRL: `Unknown` is *not*
+/// upgraded to a blocking result. Callers making a trust decision should use
+/// [`check_certificate_revocation`](crate::ltv::check_certificate_revocation),
+/// which orchestrates OCSP + CRL and enforces the
+/// [`RevocationConfig`](crate::ltv::RevocationConfig) fail-closed policy.
 pub fn check_revocation(
     crl_der: &[u8],
     cert: &Certificate,
@@ -1481,6 +1507,31 @@ mod tests {
         let wrong_issuer = signer_cert();
         let result = verify_crl_signature(&parsed, &wrong_issuer);
         assert!(result.is_err(), "wrong issuer should fail verification");
+    }
+
+    #[test]
+    fn test_verify_crl_signature_rejects_issuer_without_crl_sign() {
+        let key_path = intermediate_ca_key_pem();
+        let Ok(key_pem) = std::fs::read_to_string(key_path) else {
+            eprintln!("skipping test: intermediate_ca_key.pem not found");
+            return;
+        };
+
+        let issuer = intermediate_ca_cert();
+        let crl_der = build_test_crl(&issuer, &key_pem, &[]);
+        let parsed = parse_crl(&crl_der).unwrap();
+
+        // signer_cert carries keyUsage digitalSignature/contentCommitment but
+        // not cRLSign — the authority check must reject it before any
+        // signature math (and with a cRLSign-specific error, not a generic
+        // signature failure).
+        let non_crl_signer = signer_cert();
+        let err = verify_crl_signature(&parsed, &non_crl_signer)
+            .expect_err("issuer without cRLSign keyUsage must be rejected");
+        assert!(
+            format!("{err}").contains("cRLSign"),
+            "expected cRLSign rejection, got: {err}"
+        );
     }
 
     #[test]

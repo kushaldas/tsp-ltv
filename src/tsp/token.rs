@@ -439,7 +439,19 @@ pub fn verify_timestamp_token(
             None => Some(gen_time_datetime(&tst_info)?),
         };
 
-        store.verify_chain(&chain, effective_time).map_err(|e| {
+        // Bind the leaf to the TimestampSigner role (critical timeStamping EKU,
+        // not a CA) at the chain layer as well (H-4). Without `ltv` the role
+        // machinery is not compiled; the direct `require_timestamping_eku`
+        // check above already enforces the EKU in that configuration.
+        #[cfg(feature = "ltv")]
+        let chain_result = store.verify_chain_for_purpose(
+            &chain,
+            effective_time,
+            crate::ltv::CertRole::TimestampSigner,
+        );
+        #[cfg(not(feature = "ltv"))]
+        let chain_result = store.verify_chain(&chain, effective_time);
+        chain_result.map_err(|e| {
             TspError::VerificationFailed(format!(
                 "TSA certificate does not chain to a trust anchor: {e}"
             ))
@@ -1039,6 +1051,16 @@ pub struct TstInfo {
 ///
 /// The TimeStampToken is a CMS ContentInfo wrapping SignedData,
 /// whose encapsulated content is id-ct-TSTInfo.
+///
+/// # Warning — parsing only, NO verification
+///
+/// This function performs **zero cryptographic verification**: the CMS
+/// signature, the signer certificate, its trust chain, and the timeStamping
+/// EKU are all ignored. The returned fields (including `genTime`) are
+/// **unauthenticated, attacker-controllable data**. Never make a trust
+/// decision from its output — use [`verify_timestamp_token`], which returns
+/// the same [`TstInfo`] only after full RFC 3161 verification. This parser is
+/// intended for display/debugging of token contents.
 pub fn extract_tst_info(token_der: &[u8]) -> Result<TstInfo, TspError> {
     // Parse ContentInfo SEQUENCE
     let (tag, ci_body) = der_utils::parse_tlv(token_der)

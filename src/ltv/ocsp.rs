@@ -1482,6 +1482,18 @@ fn validate_response_freshness(
 /// 6. Time-aware: if `revocationTime > validation_time` → `Valid`
 ///
 /// Returns a [`ValidationStatus`] indicating the result.
+///
+/// # Warning — no fail-closed policy is applied
+///
+/// This function (and its `_with_policy` / `_with_options` / `_detailed`
+/// variants) returns the **raw** status of this single OCSP response:
+/// `Unknown` here means "status could not be established" and is *not*
+/// upgraded to a blocking result, and the delegated-responder revocation
+/// check (RFC 6960 §4.2.2.2.1) is reported but not recursed into. Callers
+/// making a trust decision should use
+/// [`check_certificate_revocation`](crate::ltv::check_certificate_revocation),
+/// which orchestrates OCSP + CRL and enforces the
+/// [`RevocationConfig`](crate::ltv::RevocationConfig) fail-closed policy.
 pub fn check_revocation(
     response_der: &[u8],
     cert: &Certificate,
