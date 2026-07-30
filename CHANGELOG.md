@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.4.0 [Unreleased]
+## 0.4.0 [2026-07-30]
 
 ### Added
 
@@ -11,6 +11,41 @@
   construction. The named raw-client escape hatch is excluded from FIPS builds.
 - Active AWS-LC FIPS digest and HTTPS-client attestation on x86_64 and aarch64
   CI runners.
+- `CertRole::TimestampSigner`: requires that `basicConstraints` does not assert
+  `cA:TRUE` (an absent extension denotes a non-CA end-entity per RFC 5280
+  §4.2.1.9 and is accepted) and a **critical** `id-kp-timeStamping` EKU
+  (RFC 3161 §2.3). `verify_timestamp_token`
+  now binds the TSA chain to this purpose via `verify_chain_for_purpose` when
+  the `ltv` feature is enabled, completing audit finding H-4. The same TSA
+  profile (critical timeStamping EKU and not-a-CA) is enforced feature-
+  independently in the always-compiled CMS verification path, so `tsp`-only
+  and `ltv` builds reject the same certificates.
+
+### Security
+
+- The delegated-OCSP-responder revocation sub-check (RFC 6960 §4.2.2.2.1) now
+  inherits `require_revocation_check`: under the strict default, a delegated
+  responder without `id-pkix-ocsp-nocheck` whose own revocation status cannot
+  be established hard-fails (`Invalid`) instead of passing. Relaxed
+  configurations keep the previous tolerance.
+- directoryName name-constraint matching uses RFC 5280 §7.1 `caseIgnoreMatch`
+  semantics across the interchangeable directory string types
+  (PrintableString / UTF8String / IA5String) instead of DER byte-equality, so
+  an excluded subtree can no longer be evaded by re-encoding or re-casing an
+  RDN. A directory-string value that is not well-formed for its declared type
+  (invalid UTF-8 in a UTF8String, non-ASCII in a PrintableString/IA5String)
+  aborts the constraint check as a parse error (fail closed) instead of
+  falling back to byte-equality, closing a malformed-name evasion of an
+  excluded subtree.
+- CRL signature verification requires the issuer certificate's `keyUsage`
+  (when present) to assert `cRLSign` (RFC 5280 §4.2.1.3) before any signature
+  math.
+- Documented that `extract_tst_info` performs **no** cryptographic
+  verification (use `verify_timestamp_token`) and that the low-level
+  `ocsp::check_revocation*` / `crl::check_revocation*` APIs apply no
+  fail-closed policy (use `ltv::check_certificate_revocation`).
+- All 23 findings of the security audit (`SECURITY_AUDIT_REPORT.md`) are now
+  resolved and re-verified against this tree.
 
 ### Changed
 
@@ -20,6 +55,9 @@
   are fallible; the concrete digest enum is opaque.
 - MSRV is Rust 1.88. `--all-features` is intentionally invalid because provider
   selections are mutually exclusive.
+- The DSA verification tests assert per feature configuration: builds without
+  `legacy-algorithms` pin the fail-closed `UnsupportedAlgorithm` behaviour, so
+  every provider/feature combination passes without losing DSA coverage.
 
 ## 0.3.1 [2026-07-01]
 

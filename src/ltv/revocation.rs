@@ -442,12 +442,13 @@ async fn run_ocsp_check(
         // status is Revoked — or definitively Invalid (e.g. an exhausted
         // recursion budget on a nested delegation, or an integrity failure on
         // the responder's own revocation data) — the OCSP response cannot be
-        // trusted, so we fail closed (Invalid). Only an Unknown/unreachable
-        // responder-revocation result is tolerated: it does not invalidate an
-        // otherwise-good response on its own (the response's own
-        // freshness/signature already passed) and is left to the overall
-        // policy. Recursion is bounded by `max_ocsp_recursion` so a responder
-        // that itself uses a delegated responder cannot loop unboundedly.
+        // trusted, so we fail closed (Invalid). The sub-check inherits the
+        // parent's `require_revocation_check` policy, so under the strict
+        // default an Unknown/unreachable responder-revocation result also
+        // blocks (upgraded to Invalid inside the sub-check); only under a
+        // relaxed policy is it tolerated. Recursion is bounded by
+        // `max_ocsp_recursion` so a responder that itself uses a delegated
+        // responder cannot loop unboundedly.
         if let Some(responder) = &outcome.delegated_responder {
             if config.max_ocsp_recursion == 0 {
                 // No budget to check the responder's own status. Fail closed:
@@ -501,11 +502,16 @@ async fn run_ocsp_check(
 ///
 /// Runs the same OCSP+CRL machinery as a normal certificate, but with
 /// `max_ocsp_recursion` decremented so a responder that is itself served by a
-/// delegated responder cannot recurse without bound. `require_revocation_check`
-/// is relaxed for this sub-check: an *unreachable* responder-revocation source
-/// must not, by itself, turn an otherwise-valid response into a hard failure —
-/// only a definitively **Revoked** responder does (handled by the caller). The
-/// merged status is returned without the fail-closed upgrade.
+/// delegated responder cannot recurse without bound. The parent's
+/// `require_revocation_check` policy is **inherited**: under the strict default
+/// an unreachable/absent responder-revocation source upgrades to `Invalid`
+/// (RFC 6960 §4.2.2.2.1 — a delegated responder without `id-pkix-ocsp-nocheck`
+/// whose own status cannot be established is not trustworthy, and an attacker
+/// who can block the responder's revocation sources must not be able to keep a
+/// revoked responder's responses acceptable). Under a relaxed policy
+/// (`require_revocation_check == false`) an `Unknown` responder status is
+/// tolerated and only a definitively **Revoked**/**Invalid** responder blocks
+/// (handled by the caller).
 async fn check_delegated_responder_revocation(
     responder: &Certificate,
     ca_issuer: &Certificate,
@@ -518,9 +524,8 @@ async fn check_delegated_responder_revocation(
         // Decrement the recursion budget; bottom out at 0 (the OCSP path treats
         // a delegated responder with no remaining budget as fail-closed).
         max_ocsp_recursion: config.max_ocsp_recursion.saturating_sub(1),
-        // Do not upgrade Unknown→Invalid here: an unreachable responder-status
-        // source must not invalidate the (already-validated) primary response.
-        require_revocation_check: false,
+        // Inherit the parent's strictness (see the doc comment above).
+        require_revocation_check: config.require_revocation_check,
         ..config.clone()
     };
 
@@ -560,7 +565,11 @@ async fn check_delegated_responder_revocation(
         ),
     };
 
-    resolve_priority(ocsp_status, crl_status)
+    // Apply the inherited policy to the merged responder status: under strict,
+    // an Unknown (unreachable/absent responder-revocation source) upgrades to
+    // Invalid, which the caller treats as blocking.
+    let merged = resolve_priority(ocsp_status, crl_status);
+    enforce_revocation_policy(merged, sub_config.require_revocation_check)
 }
 
 // ── Internal: CRL check ───────────────────────────────────────────

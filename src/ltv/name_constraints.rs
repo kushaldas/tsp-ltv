@@ -21,7 +21,10 @@
 //! - **iPAddress** (`[7]`) — CIDR (`address/netmask`) containment for IPv4 and
 //!   IPv6.
 //! - **directoryName** (`[4]`) — RDN-prefix containment over the DER-encoded
-//!   `Name`.
+//!   `Name`, with attribute values in the interchangeable directory string
+//!   types (PrintableString / UTF8String / IA5String) compared under RFC 5280
+//!   §7.1 `caseIgnoreMatch` semantics rather than raw byte-equality, so a
+//!   re-encoded or re-cased RDN cannot evade an excluded subtree.
 //!
 //! Both the certificate **subject** directoryName and every applicable
 //! **subjectAltName** GeneralName of each subordinate certificate are checked
@@ -506,6 +509,19 @@ fn ip_matches(addr: &[u8], mask: &[u8], name: &[u8]) -> bool {
 /// sequence is a prefix of the asserted name's RDN sequence (RFC 5280
 /// §4.2.1.10). Both inputs are the DER of the `[4]`-EXPLICIT wrapper or the bare
 /// Name; we normalise to the inner Name SEQUENCE then compare RDN-by-RDN.
+///
+/// RDN comparison is **not** raw byte-equality: attribute values carried in the
+/// interchangeable directory string types (PrintableString, UTF8String,
+/// IA5String) are compared per RFC 5280 §7.1 `caseIgnoreMatch` semantics
+/// (case-insensitive, leading/trailing whitespace stripped, internal whitespace
+/// runs collapsed). Byte-equality alone would let a sub-CA escape an
+/// *excludedSubtrees* directoryName by re-encoding the same logical RDN with a
+/// different string type or letter case. Values of any other ASN.1 type require
+/// exact tag + byte equality. Malformed RDNs — including a directory-string
+/// value that is not well-formed for its type (e.g. invalid UTF-8 in a
+/// UTF8String, non-ASCII in a PrintableString/IA5String) — are a parse error
+/// that aborts the whole constraint check (fail closed), never a silent
+/// byte-equality fallback.
 fn directory_matches(
     base_wrapped: &[u8],
     name_wrapped: &[u8],
@@ -515,9 +531,158 @@ fn directory_matches(
     if base_rdns.len() > name_rdns.len() {
         return Ok(false);
     }
-    // Prefix match: each of the base's RDNs must equal the corresponding RDN of
-    // the asserted name (DER byte-equality — the simple, conservative test).
-    Ok(base_rdns.iter().zip(name_rdns.iter()).all(|(b, n)| b == n))
+    // Prefix match: each of the base's RDNs must match the corresponding RDN of
+    // the asserted name under caseIgnoreMatch-normalised comparison.
+    for (b, n) in base_rdns.iter().zip(name_rdns.iter()) {
+        if !rdn_matches(b, n)? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+/// ASN.1 string tags treated as interchangeable "directory string" types for
+/// caseIgnoreMatch comparison: UTF8String (0x0c), PrintableString (0x13),
+/// IA5String (0x16).
+const DIRECTORY_STRING_TAGS: [u8; 3] = [0x0c, 0x13, 0x16];
+
+/// One `AttributeTypeAndValue`: `(type OID body, value tag, value body)`.
+type Atv = (Vec<u8>, u8, Vec<u8>);
+
+/// Parse one RDN (SET, `0x31`) into its `AttributeTypeAndValue` components.
+fn rdn_atvs(rdn_der: &[u8]) -> Result<Vec<Atv>, NameConstraintError> {
+    let (tag, body) = parse_tlv(rdn_der)
+        .map_err(|e| NameConstraintError::Parse(format!("directoryName RDN: {e}")))?;
+    if tag != 0x31 {
+        return Err(NameConstraintError::Parse(format!(
+            "directoryName RDN tag 0x{tag:02x}, expected SET"
+        )));
+    }
+    let mut atvs = Vec::new();
+    let mut pos = &body[..];
+    while !pos.is_empty() {
+        let (atv_tag, atv_body, rest) = parse_tlv_with_rest(pos)
+            .map_err(|e| NameConstraintError::Parse(format!("AttributeTypeAndValue: {e}")))?;
+        if atv_tag != 0x30 {
+            return Err(NameConstraintError::Parse(format!(
+                "AttributeTypeAndValue tag 0x{atv_tag:02x}, expected SEQUENCE"
+            )));
+        }
+        let (oid_tag, oid_body, val_rest) = parse_tlv_with_rest(atv_body)
+            .map_err(|e| NameConstraintError::Parse(format!("attribute type: {e}")))?;
+        if oid_tag != 0x06 {
+            return Err(NameConstraintError::Parse(format!(
+                "attribute type tag 0x{oid_tag:02x}, expected OID"
+            )));
+        }
+        let (val_tag, val_body, trailing) = parse_tlv_with_rest(val_rest)
+            .map_err(|e| NameConstraintError::Parse(format!("attribute value: {e}")))?;
+        if !trailing.is_empty() {
+            return Err(NameConstraintError::Parse(
+                "trailing data in AttributeTypeAndValue".into(),
+            ));
+        }
+        // A value tagged as a directory string type must be well-formed for
+        // that type; otherwise it cannot be caseIgnoreMatch-normalised. Reject
+        // it here (fail closed) rather than letting the comparison silently
+        // fall back to byte-equality — a bool matcher cannot fail closed for
+        // both permitted (over-match) and excluded (evasion) directions, so a
+        // malformed directoryName must abort the whole constraint check.
+        if !directory_string_well_formed(val_tag, val_body) {
+            return Err(NameConstraintError::Parse(format!(
+                "malformed directoryName attribute value for string type (tag 0x{val_tag:02x})"
+            )));
+        }
+        atvs.push((oid_body.to_vec(), val_tag, val_body.to_vec()));
+        pos = rest;
+    }
+    Ok(atvs)
+}
+
+/// Whether a value body is well-formed for its declared directory string type:
+/// UTF8String (`0x0c`) must be valid UTF-8; PrintableString (`0x13`) and
+/// IA5String (`0x16`) are ASCII-only types, so their bytes must be ASCII. Any
+/// non-directory-string tag is not this function's concern and returns `true`.
+fn directory_string_well_formed(tag: u8, body: &[u8]) -> bool {
+    match tag {
+        0x0c => std::str::from_utf8(body).is_ok(),
+        0x13 | 0x16 => body.is_ascii(),
+        _ => true,
+    }
+}
+
+/// RFC 5280 §7.1 `caseIgnoreMatch` approximation for directory string values:
+/// fold case, strip leading/trailing whitespace, collapse internal whitespace
+/// runs to a single space. Returns `None` only for invalid UTF-8, which
+/// [`rdn_atvs`] already rejects for directory-string-tagged values, so this
+/// path is unreachable for those.
+fn normalize_directory_string(bytes: &[u8]) -> Option<String> {
+    let s = std::str::from_utf8(bytes).ok()?;
+    let mut out = String::with_capacity(s.len());
+    let mut pending_space = false;
+    for c in s.chars() {
+        if c.is_whitespace() {
+            pending_space = !out.is_empty();
+        } else {
+            if pending_space {
+                out.push(' ');
+                pending_space = false;
+            }
+            out.extend(c.to_lowercase());
+        }
+    }
+    Some(out)
+}
+
+/// Compare two attribute values. Directory-string types compare under
+/// caseIgnoreMatch normalisation (across the interchangeable string tags);
+/// anything else requires exact tag + byte equality.
+///
+/// Directory-string values reaching this point were validated as well-formed by
+/// [`rdn_atvs`], so their normalisation always succeeds; the `_ => false` arm is
+/// therefore defensive (a malformed value would already have aborted the check
+/// with a parse error) rather than a silent byte-equality fallback.
+fn atv_value_matches(b_tag: u8, b_val: &[u8], n_tag: u8, n_val: &[u8]) -> bool {
+    if DIRECTORY_STRING_TAGS.contains(&b_tag) && DIRECTORY_STRING_TAGS.contains(&n_tag) {
+        return match (
+            normalize_directory_string(b_val),
+            normalize_directory_string(n_val),
+        ) {
+            (Some(b), Some(n)) => b == n,
+            _ => false,
+        };
+    }
+    b_tag == n_tag && b_val == n_val
+}
+
+/// Compare two RDNs (SETs of AttributeTypeAndValue) as multisets: same number
+/// of attributes, and every base attribute pairs with a distinct name attribute
+/// of the same type OID and a matching value. Multiset comparison (rather than
+/// positional) tolerates encoder differences in SET ordering.
+fn rdn_matches(base_rdn: &[u8], name_rdn: &[u8]) -> Result<bool, NameConstraintError> {
+    let base = rdn_atvs(base_rdn)?;
+    let name = rdn_atvs(name_rdn)?;
+    if base.len() != name.len() {
+        return Ok(false);
+    }
+    let mut used = vec![false; name.len()];
+    for (b_oid, b_tag, b_val) in &base {
+        let mut found = false;
+        for (i, (n_oid, n_tag, n_val)) in name.iter().enumerate() {
+            if used[i] || n_oid != b_oid {
+                continue;
+            }
+            if atv_value_matches(*b_tag, b_val, *n_tag, n_val) {
+                used[i] = true;
+                found = true;
+                break;
+            }
+        }
+        if !found {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 /// Given the DER of a directoryName (either the bare `Name` SEQUENCE `30..` or
@@ -633,6 +798,76 @@ mod tests {
         .unwrap_err();
 
         assert!(matches!(err, NameConstraintError::Parse(ref m) if m.contains("directoryName")));
+    }
+
+    /// Encode a single-RDN `Name` SEQUENCE: `SEQ { SET { SEQ { OID, value } } }`.
+    /// `oid_body` is the raw OID content bytes (e.g. `[0x55, 0x04, 0x03]` = CN).
+    fn dir_name(oid_body: &[u8], value_tag: u8, value: &[u8]) -> Vec<u8> {
+        use crate::der_utils::{encode_sequence_raw, encode_tlv};
+        let atv = encode_sequence_raw(
+            &[encode_tlv(0x06, oid_body), encode_tlv(value_tag, value)].concat(),
+        );
+        let rdn = encode_tlv(0x31, &atv);
+        encode_sequence_raw(&rdn)
+    }
+
+    const CN_OID: &[u8] = &[0x55, 0x04, 0x03]; // 2.5.4.3
+    const O_OID: &[u8] = &[0x55, 0x04, 0x0A]; // 2.5.4.10
+
+    #[test]
+    fn directory_name_case_and_string_type_insensitive() {
+        // PrintableString "Example CA" must match UTF8String "example ca":
+        // an excluded-subtree constraint cannot be evaded by re-encoding the
+        // same logical RDN with a different string type or letter case.
+        let printable = dir_name(CN_OID, 0x13, b"Example CA");
+        let utf8_lower = dir_name(CN_OID, 0x0c, b"example ca");
+        assert!(directory_matches(&printable, &utf8_lower).unwrap());
+        assert!(directory_matches(&utf8_lower, &printable).unwrap());
+
+        // Whitespace runs collapse; leading/trailing whitespace is stripped.
+        let padded = dir_name(CN_OID, 0x0c, b"  Example   CA ");
+        assert!(directory_matches(&printable, &padded).unwrap());
+    }
+
+    #[test]
+    fn directory_name_still_distinguishes_different_values() {
+        let a = dir_name(CN_OID, 0x13, b"Example CA");
+        let b = dir_name(CN_OID, 0x13, b"Other CA");
+        assert!(!directory_matches(&a, &b).unwrap());
+
+        // Same value under a different attribute type must not match.
+        let cn = dir_name(CN_OID, 0x13, b"Example CA");
+        let o = dir_name(O_OID, 0x13, b"Example CA");
+        assert!(!directory_matches(&cn, &o).unwrap());
+    }
+
+    #[test]
+    fn directory_name_non_string_values_exact_match_only() {
+        // Non directory-string types (here OCTET STRING) compare byte-exact.
+        let a = dir_name(CN_OID, 0x04, b"AB");
+        let b = dir_name(CN_OID, 0x04, b"ab");
+        assert!(!directory_matches(&a, &b).unwrap());
+        assert!(directory_matches(&a, &a).unwrap());
+    }
+
+    #[test]
+    fn directory_name_malformed_string_value_fails_closed() {
+        // A UTF8String (0x0c) carrying invalid UTF-8, and a PrintableString
+        // (0x13) carrying non-ASCII bytes, are malformed for their declared
+        // type. They must abort the comparison with a parse error (fail closed)
+        // rather than silently falling back to byte-equality, which for an
+        // excluded subtree would let the malformed name evade the exclusion.
+        let good = dir_name(CN_OID, 0x0c, b"example");
+        let bad_utf8 = dir_name(CN_OID, 0x0c, &[0xff, 0xfe, 0x00]);
+        let err = directory_matches(&bad_utf8, &good).unwrap_err();
+        assert!(matches!(err, NameConstraintError::Parse(_)));
+        // Malformed value on the name side is equally rejected.
+        let err = directory_matches(&good, &bad_utf8).unwrap_err();
+        assert!(matches!(err, NameConstraintError::Parse(_)));
+
+        let bad_printable = dir_name(CN_OID, 0x13, &[0x41, 0xc9, 0x42]); // non-ASCII
+        let err = directory_matches(&bad_printable, &good).unwrap_err();
+        assert!(matches!(err, NameConstraintError::Parse(_)));
     }
 
     #[test]

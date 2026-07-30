@@ -807,12 +807,19 @@ mod tests {
 
         let ok =
             verify_certificate_signature_with_policy(&dsa, &dsa, &SignaturePolicy::allow_legacy());
-        #[cfg(feature = "aws-lc")]
+        // Without the legacy-algorithms feature, verify_dsa fails closed before
+        // reaching any backend — regardless of provider.
+        #[cfg(not(feature = "legacy-algorithms"))]
+        assert!(
+            matches!(ok, Err(TrustError::UnsupportedAlgorithm(ref message)) if message.contains("legacy-algorithms")),
+            "without legacy-algorithms, DSA must fail closed: {ok:?}"
+        );
+        #[cfg(all(feature = "legacy-algorithms", feature = "aws-lc"))]
         assert!(
             matches!(ok, Err(TrustError::UnsupportedAlgorithm(ref message)) if message.contains("KeyImport(Dsa)")),
             "AWS-LC must report DSA as deterministically unsupported: {ok:?}"
         );
-        #[cfg(not(feature = "aws-lc"))]
+        #[cfg(all(feature = "legacy-algorithms", not(feature = "aws-lc")))]
         assert!(
             ok.is_ok(),
             "DSA self-signature should verify under legacy: {ok:?}"
@@ -841,14 +848,22 @@ mod tests {
         );
         // Match the variant, not the message text: the OID must reach the DSA
         // branch (failing at SPKI decode with SignatureVerification), never fall
-        // through to UnsupportedAlgorithm.
+        // through to the unknown-OID UnsupportedAlgorithm path. Without the
+        // legacy-algorithms feature the DSA branch itself fails closed with a
+        // feature-specific UnsupportedAlgorithm — assert that message so an
+        // unknown-OID fall-through still cannot pass.
         let err = result.unwrap_err();
-        #[cfg(feature = "aws-lc")]
+        #[cfg(not(feature = "legacy-algorithms"))]
+        assert!(
+            matches!(err, TrustError::UnsupportedAlgorithm(ref message) if message.contains("legacy-algorithms")),
+            "without legacy-algorithms, DSA-SHA1 must fail closed in the DSA branch: {err:?}"
+        );
+        #[cfg(all(feature = "legacy-algorithms", feature = "aws-lc"))]
         assert!(
             matches!(err, TrustError::UnsupportedAlgorithm(ref message) if message.contains("KeyImport(Dsa)")),
             "AWS-LC must report DSA-SHA1 as unsupported: {err:?}"
         );
-        #[cfg(not(feature = "aws-lc"))]
+        #[cfg(all(feature = "legacy-algorithms", not(feature = "aws-lc")))]
         assert!(
             !matches!(err, TrustError::UnsupportedAlgorithm(_)),
             "DSA-SHA1 should be dispatched to the DSA branch, not UnsupportedAlgorithm: {err:?}"
@@ -867,14 +882,20 @@ mod tests {
             &OID_DSA_WITH_SHA256,
             &SignaturePolicy::strict(),
         );
-        // Match the variant, not the message text.
+        // Match the variant, not the message text (same feature matrix as the
+        // DSA-SHA1 dispatch test above).
         let err = result.unwrap_err();
-        #[cfg(feature = "aws-lc")]
+        #[cfg(not(feature = "legacy-algorithms"))]
+        assert!(
+            matches!(err, TrustError::UnsupportedAlgorithm(ref message) if message.contains("legacy-algorithms")),
+            "without legacy-algorithms, DSA-SHA256 must fail closed in the DSA branch: {err:?}"
+        );
+        #[cfg(all(feature = "legacy-algorithms", feature = "aws-lc"))]
         assert!(
             matches!(err, TrustError::UnsupportedAlgorithm(ref message) if message.contains("KeyImport(Dsa)")),
             "AWS-LC must report DSA-SHA256 as unsupported: {err:?}"
         );
-        #[cfg(not(feature = "aws-lc"))]
+        #[cfg(all(feature = "legacy-algorithms", not(feature = "aws-lc")))]
         assert!(
             !matches!(err, TrustError::UnsupportedAlgorithm(_)),
             "DSA-SHA256 should be dispatched to the DSA branch, not UnsupportedAlgorithm: {err:?}"
@@ -894,12 +915,17 @@ mod tests {
         let dsa = load_test_cert(dsa_pem);
 
         let ok = verify_certificate_signature(&dsa, &dsa);
-        #[cfg(feature = "aws-lc")]
+        #[cfg(not(feature = "legacy-algorithms"))]
+        assert!(
+            matches!(ok, Err(TrustError::UnsupportedAlgorithm(ref message)) if message.contains("legacy-algorithms")),
+            "without legacy-algorithms, DSA-SHA256 must fail closed: {ok:?}"
+        );
+        #[cfg(all(feature = "legacy-algorithms", feature = "aws-lc"))]
         assert!(
             matches!(ok, Err(TrustError::UnsupportedAlgorithm(ref message)) if message.contains("KeyImport(Dsa)")),
             "AWS-LC must report DSA-SHA256 as deterministically unsupported: {ok:?}"
         );
-        #[cfg(not(feature = "aws-lc"))]
+        #[cfg(all(feature = "legacy-algorithms", not(feature = "aws-lc")))]
         assert!(
             ok.is_ok(),
             "DSA-SHA256 self-signature should verify under strict: {ok:?}"
@@ -914,12 +940,17 @@ mod tests {
         ));
         let other = load_test_cert(other_pem);
         let bad = verify_certificate_signature(&dsa, &other);
-        #[cfg(feature = "aws-lc")]
+        #[cfg(not(feature = "legacy-algorithms"))]
+        assert!(
+            matches!(bad, Err(TrustError::UnsupportedAlgorithm(ref message)) if message.contains("legacy-algorithms")),
+            "without legacy-algorithms, DSA must fail closed before key comparison: {bad:?}"
+        );
+        #[cfg(all(feature = "legacy-algorithms", feature = "aws-lc"))]
         assert!(
             matches!(bad, Err(TrustError::UnsupportedAlgorithm(ref message)) if message.contains("KeyImport(Dsa)")),
             "AWS-LC must reject DSA before key comparison: {bad:?}"
         );
-        #[cfg(not(feature = "aws-lc"))]
+        #[cfg(all(feature = "legacy-algorithms", not(feature = "aws-lc")))]
         assert!(
             matches!(bad, Err(TrustError::SignatureVerification(_))),
             "DSA-SHA256 cert must fail against the wrong issuer key: {bad:?}"
