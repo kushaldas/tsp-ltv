@@ -23,7 +23,8 @@
 //! - **IntermediateCa**: must have `CA:TRUE` + `keyCertSign` key usage
 //! - **CrlSigner**: must have `cRLSign` key usage
 //! - **OcspResponder**: must have `id-kp-OCSPSigning` EKU
-//! - **TimestampSigner**: must NOT have `CA:TRUE`; must have a **critical**
+//! - **TimestampSigner**: must not assert `basicConstraints cA:TRUE` (an absent
+//!   extension is accepted — `cA` defaults to FALSE); must have a **critical**
 //!   `id-kp-timeStamping` EKU (RFC 3161 §2.3)
 
 use crate::der_utils;
@@ -337,7 +338,7 @@ pub fn has_extension(cert: &Certificate, oid: &const_oid::ObjectIdentifier) -> b
 /// | IntermediateCa | CA must be TRUE | keyCertSign required | — |
 /// | CrlSigner | — | cRLSign required | — |
 /// | OcspResponder | — | — | id-kp-OCSPSigning required |
-/// | TimestampSigner | CA must be FALSE | — | critical id-kp-timeStamping required |
+/// | TimestampSigner | CA must not be TRUE (absent OK) | — | critical id-kp-timeStamping required |
 ///
 /// # Errors
 ///
@@ -446,9 +447,22 @@ fn validate_crl_signer(cert: &Certificate) -> Result<(), LtvError> {
 /// Validate TSA signing certificate extensions.
 ///
 /// RFC 3161 §2.3: the TSA certificate MUST carry an extendedKeyUsage
-/// containing `id-kp-timeStamping`, and the extension MUST be critical.
+/// containing `id-kp-timeStamping`, and the extension MUST be critical — this
+/// critical EKU is the actual authorisation that binds the certificate to the
+/// timestamping purpose.
+///
+/// The certificate must also not be a CA: `basicConstraints` must not assert
+/// `cA:TRUE`. An **absent** `basicConstraints` extension is accepted — RFC 5280
+/// §4.2.1.9 defaults `cA` to FALSE, so an end-entity certificate legitimately
+/// omits it, and rejecting such a certificate would falsely reject valid
+/// timestamps. This mirrors the codebase's absent-extension convention (an
+/// absent `keyUsage` on an intermediate imposes no restriction; see L-3 /
+/// [`validate_intermediate_ca_extensions`](crate::trust::store)).
 fn validate_timestamp_signer(cert: &Certificate) -> Result<(), LtvError> {
-    // Must not be a CA — the TSA signer is an end-entity certificate.
+    // Must not be a CA. An absent basicConstraints already denotes a non-CA
+    // end-entity (cA defaults to FALSE), so only an explicit cA:TRUE is a
+    // purpose-confusion violation here; the critical timeStamping EKU below is
+    // the positive authorisation.
     let (is_ca, _) = check_basic_constraints(cert)?;
     if is_ca {
         return Err(LtvError::X509Extension(

@@ -11,8 +11,10 @@
   construction. The named raw-client escape hatch is excluded from FIPS builds.
 - Active AWS-LC FIPS digest and HTTPS-client attestation on x86_64 and aarch64
   CI runners.
-- `CertRole::TimestampSigner`: requires `basicConstraints` CA:FALSE and a
-  **critical** `id-kp-timeStamping` EKU (RFC 3161 §2.3). `verify_timestamp_token`
+- `CertRole::TimestampSigner`: requires that `basicConstraints` does not assert
+  `cA:TRUE` (an absent extension denotes a non-CA end-entity per RFC 5280
+  §4.2.1.9 and is accepted) and a **critical** `id-kp-timeStamping` EKU
+  (RFC 3161 §2.3). `verify_timestamp_token`
   now binds the TSA chain to this purpose via `verify_chain_for_purpose` when
   the `ltv` feature is enabled, completing audit finding H-4 (`tsp`-only builds
   keep the direct token-level EKU check).

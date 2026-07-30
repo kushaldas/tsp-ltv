@@ -451,10 +451,12 @@ pub fn verify_timestamp_token(
         );
         #[cfg(not(feature = "ltv"))]
         let chain_result = store.verify_chain(&chain, effective_time);
+        // The error covers both chain-building/anchor failures and, under `ltv`,
+        // leaf purpose/profile violations (missing timeStamping EKU, non-critical
+        // EKU, CA:TRUE), so keep the message general and defer to the inner error
+        // for the specific cause.
         chain_result.map_err(|e| {
-            TspError::VerificationFailed(format!(
-                "TSA certificate does not chain to a trust anchor: {e}"
-            ))
+            TspError::VerificationFailed(format!("TSA certificate chain validation failed: {e}"))
         })?;
     }
 
