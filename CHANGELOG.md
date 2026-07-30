@@ -16,8 +16,10 @@
   §4.2.1.9 and is accepted) and a **critical** `id-kp-timeStamping` EKU
   (RFC 3161 §2.3). `verify_timestamp_token`
   now binds the TSA chain to this purpose via `verify_chain_for_purpose` when
-  the `ltv` feature is enabled, completing audit finding H-4 (`tsp`-only builds
-  keep the direct token-level EKU check).
+  the `ltv` feature is enabled, completing audit finding H-4. The same TSA
+  profile (critical timeStamping EKU and not-a-CA) is enforced feature-
+  independently in the always-compiled CMS verification path, so `tsp`-only
+  and `ltv` builds reject the same certificates.
 
 ### Security
 

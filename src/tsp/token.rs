@@ -38,6 +38,9 @@ const ID_MESSAGE_DIGEST_ATTR: ObjectIdentifier =
 /// Extended Key Usage extension (2.5.29.37)
 const ID_CE_EXT_KEY_USAGE: ObjectIdentifier = ObjectIdentifier::new_unwrap("2.5.29.37");
 
+/// Basic Constraints extension (2.5.29.19)
+const ID_CE_BASIC_CONSTRAINTS: ObjectIdentifier = ObjectIdentifier::new_unwrap("2.5.29.19");
+
 /// id-kp-timeStamping extended key usage (1.3.6.1.5.5.7.3.8).
 ///
 /// RFC 3161 §2.3 requires the TSA signing certificate to carry this EKU,
@@ -439,10 +442,11 @@ pub fn verify_timestamp_token(
             None => Some(gen_time_datetime(&tst_info)?),
         };
 
-        // Bind the leaf to the TimestampSigner role (critical timeStamping EKU,
-        // not a CA) at the chain layer as well (H-4). Without `ltv` the role
-        // machinery is not compiled; the direct `require_timestamping_eku`
-        // check above already enforces the EKU in that configuration.
+        // Bind the leaf to the TimestampSigner role at the chain layer as well
+        // (H-4). Without `ltv` the role machinery is not compiled, but the
+        // always-compiled CMS path already enforces the same TSA profile
+        // (critical timeStamping EKU via `require_timestamping_eku`, not-a-CA via
+        // `require_not_ca`), so both build configurations reject the same certs.
         #[cfg(feature = "ltv")]
         let chain_result = store.verify_chain_for_purpose(
             &chain,
@@ -634,6 +638,14 @@ fn verify_token_cms(
 
     // --- require a critical id-kp-timeStamping EKU on the signer ---
     require_timestamping_eku(&signer)?;
+
+    // --- the TSA signer must not be a CA (RFC 3161 §2.3 profile) ---
+    // Enforced here, in the always-compiled CMS path, so the same TSA profile
+    // holds in both `tsp`-only and `ltv` builds. The `ltv` chain path also runs
+    // this via `CertRole::TimestampSigner`; keeping it here closes the gap where
+    // a `tsp`-only build (which calls plain `verify_chain`) would otherwise
+    // accept a CA certificate carrying a critical timeStamping EKU.
+    require_not_ca(&signer)?;
 
     // The TSTInfo is now authenticated; parse its fields.
     let tst_info = parse_tst_info_body(&tst_info_der)?;
@@ -916,6 +928,32 @@ fn require_timestamping_eku(cert: &Certificate) -> Result<(), TspError> {
         ));
     }
 
+    Ok(())
+}
+
+/// Require that `cert` is not a CA: its `basicConstraints` extension, if
+/// present, must not assert `cA:TRUE`.
+///
+/// An **absent** `basicConstraints` extension is accepted — RFC 5280 §4.2.1.9
+/// defaults `cA` to FALSE, so an end-entity TSA certificate legitimately omits
+/// it; rejecting such a certificate would falsely reject valid timestamps. A
+/// malformed extension is a hard failure (fail closed). Uses the always-compiled
+/// `der_utils` parser so the check is feature-independent (both `tsp`-only and
+/// `ltv` builds enforce it).
+fn require_not_ca(cert: &Certificate) -> Result<(), TspError> {
+    let Some(exts) = cert.tbs_certificate.extensions.as_ref() else {
+        return Ok(()); // no extensions => no basicConstraints => not a CA
+    };
+    let Some(bc_ext) = exts.iter().find(|e| e.extn_id == ID_CE_BASIC_CONSTRAINTS) else {
+        return Ok(()); // absent basicConstraints => cA defaults to FALSE
+    };
+    let (is_ca, _) = der_utils::parse_basic_constraints(bc_ext.extn_value.as_bytes())
+        .map_err(|e| TspError::VerificationFailed(format!("TSA basicConstraints: {e}")))?;
+    if is_ca {
+        return Err(TspError::VerificationFailed(
+            "TSA certificate asserts basicConstraints CA:TRUE (RFC 3161 §2.3)".into(),
+        ));
+    }
     Ok(())
 }
 
@@ -2030,6 +2068,66 @@ mod tests {
         assert!(
             matches!(err, TspError::VerificationFailed(_)),
             "signer without timeStamping EKU must be rejected, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn test_reject_ca_signer_with_timestamping_eku() {
+        // A CA certificate (basicConstraints cA:TRUE) that also carries a
+        // critical id-kp-timeStamping EKU. The signature verifies and the EKU
+        // check passes, so only the not-a-CA profile check can reject it. This
+        // runs on the always-compiled CMS path (no trust store, no `ltv`), so
+        // it proves both build configurations enforce the TSA-must-not-be-a-CA
+        // requirement (PR #17 review).
+        use rsa::pkcs1v15::SigningKey;
+        use rsa::signature::Keypair;
+        use sha2::Sha256;
+        use x509_cert::builder::{Builder, CertificateBuilder, Profile};
+        use x509_cert::ext::pkix::ExtendedKeyUsage;
+        use x509_cert::name::Name;
+        use x509_cert::serial_number::SerialNumber;
+        use x509_cert::spki::SubjectPublicKeyInfoOwned;
+        use x509_cert::time::Validity;
+
+        let mut rng = rand::thread_rng();
+        let ca_key = RsaPrivateKey::new(&mut rng, 2048).expect("RSA keygen");
+        let ca_signing = SigningKey::<Sha256>::new(ca_key.clone());
+        let spki = SubjectPublicKeyInfoOwned::from_key(ca_signing.verifying_key()).expect("SPKI");
+        let subject: Name = "CN=Rogue CA TSA,O=tsp-ltv tests".parse().unwrap();
+        let validity =
+            Validity::from_now(std::time::Duration::from_secs(3650 * 24 * 3600)).unwrap();
+        // Profile::Root emits basicConstraints cA:TRUE and self-signs.
+        let mut builder = CertificateBuilder::new(
+            Profile::Root,
+            SerialNumber::new(&[0x77]).unwrap(),
+            validity,
+            subject,
+            spki,
+            &ca_signing,
+        )
+        .expect("cert builder");
+        builder
+            .add_extension(&ExtendedKeyUsage(vec![ID_KP_TIME_STAMPING]))
+            .expect("add EKU");
+        let ca_cert = builder
+            .build::<rsa::pkcs1v15::Signature>()
+            .expect("sign cert");
+
+        let hash = vec![0x66u8; 32];
+        let token = build_signed_token(&ca_cert, &ca_key, &[], &hash, 1, false);
+        let err = verify_timestamp_token(
+            &token,
+            &hash,
+            DigestAlgorithm::Sha256,
+            None,
+            None,
+            None,
+            &[],
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, TspError::VerificationFailed(ref m) if m.contains("CA:TRUE")),
+            "CA certificate must be rejected as a TSA signer, got {err:?}"
         );
     }
 
