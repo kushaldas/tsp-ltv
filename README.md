@@ -7,7 +7,7 @@ stores, and certificate chain building used by
 bergshamra (XAdES), and jades (JAdES).
 
 Version 0.4 requires Rust 1.88 and delegates all cryptographic operations and
-TLS provider configuration to `kryptering` 0.5.
+TLS provider configuration to `kryptering` 0.6.0 from crates.io.
 
 ## Features
 

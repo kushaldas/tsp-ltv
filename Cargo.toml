@@ -46,7 +46,7 @@ ltv = ["tsp"]
 blocking = ["dep:tokio"]
 
 [dependencies]
-kryptering = { version = "0.5.0", default-features = false }
+kryptering = { version = "0.6.0", default-features = false }
 # CMS / PKCS#7 / X.509 (RustCrypto ecosystem)
 cms = { version = "0.2", features = ["alloc"] }
 x509-cert = { version = "0.2", features = ["pem"] }

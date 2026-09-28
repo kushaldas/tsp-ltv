@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+## 0.5.0 [2026-09-28]
+
+### Changed
+
+- Use Kryptering 0.6.0 and related dependencies.
+
 ## 0.4.0 [2026-07-30]
 
 ### Added
