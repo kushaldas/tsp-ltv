@@ -1,6 +1,6 @@
 [package]
 name = "tsp-ltv"
-version = "0.4.0"
+version = "0.5.0"
 edition = "2021"
 rust-version = "1.88"
 description = "Shared timestamping (RFC 3161) and long-term validation (OCSP, CRL, trust stores) infrastructure for AdES signatures"
