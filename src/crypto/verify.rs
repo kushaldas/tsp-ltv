@@ -1202,9 +1202,8 @@ mod tests {
     #[test]
     fn test_ecdsa_curve_is_bound_to_declared_hash() {
         // L-8: ECDSA verification dispatches on the SPKI named curve. A P-256
-        // key + ecdsa-with-SHA256 verifies; the same key under a SHA-512-declared
-        // OID is rejected as an unsupported curve/hash pairing (no cross-curve
-        // trial-and-error).
+        // key + ecdsa-with-SHA256 verifies; the same signature under
+        // ecdsa-with-SHA512 is rejected.
         use const_oid::db;
         use p256::ecdsa::{signature::Signer, Signature, SigningKey};
         use rsa::pkcs8::EncodePublicKey;
@@ -1229,14 +1228,13 @@ mod tests {
         verify_signature_by_oid(msg, &sig_der, &spki_der, &db::rfc5912::ECDSA_WITH_SHA_256)
             .expect("P-256 + ecdsa-with-SHA256 must verify");
 
-        // Mismatched declared hash for a P-256 key is rejected (not silently
-        // retried against another curve).
+        // A SHA-256 signature does not verify against the SHA-512 digest.
         let err =
             verify_signature_by_oid(msg, &sig_der, &spki_der, &db::rfc5912::ECDSA_WITH_SHA_512)
                 .unwrap_err();
         assert!(
             matches!(err, TrustError::SignatureVerification(_)),
-            "P-256 key under a SHA-512 ECDSA OID must be rejected, got {err:?}"
+            "SHA-256 signature under ecdsa-with-SHA512 must be rejected, got {err:?}"
         );
     }
 
