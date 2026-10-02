@@ -1241,6 +1241,71 @@ mod tests {
     }
 
     #[test]
+    fn test_ecdsa_p256_p384_additional_hashes_verify() {
+        use const_oid::db;
+        use rsa::pkcs8::EncodePublicKey;
+        use sha2::{Digest, Sha256, Sha384, Sha512};
+        use signature::hazmat::PrehashSigner;
+
+        let msg = b"ECDSA test message";
+
+        let p256_sk = p256::ecdsa::SigningKey::random(&mut rand::thread_rng());
+        let p256_spki = p256_sk
+            .verifying_key()
+            .to_public_key_der()
+            .unwrap()
+            .as_bytes()
+            .to_vec();
+        let p256_sign = |digest: &[u8]| -> Vec<u8> {
+            let sig: p256::ecdsa::Signature = p256_sk.sign_prehash(digest).unwrap();
+            sig.to_der().as_bytes().to_vec()
+        };
+
+        let p384_sk = p384::ecdsa::SigningKey::random(&mut rand::thread_rng());
+        let p384_spki = p384_sk
+            .verifying_key()
+            .to_public_key_der()
+            .unwrap()
+            .as_bytes()
+            .to_vec();
+        let p384_sign = |digest: &[u8]| -> Vec<u8> {
+            let sig: p384::ecdsa::Signature = p384_sk.sign_prehash(digest).unwrap();
+            sig.to_der().as_bytes().to_vec()
+        };
+
+        let cases = [
+            (
+                "P-256 + ecdsa-with-SHA384",
+                &p256_spki,
+                p256_sign(&Sha384::digest(msg)),
+                db::rfc5912::ECDSA_WITH_SHA_384,
+            ),
+            (
+                "P-256 + ecdsa-with-SHA512",
+                &p256_spki,
+                p256_sign(&Sha512::digest(msg)),
+                db::rfc5912::ECDSA_WITH_SHA_512,
+            ),
+            (
+                "P-384 + ecdsa-with-SHA256",
+                &p384_spki,
+                p384_sign(&Sha256::digest(msg)),
+                db::rfc5912::ECDSA_WITH_SHA_256,
+            ),
+            (
+                "P-384 + ecdsa-with-SHA512",
+                &p384_spki,
+                p384_sign(&Sha512::digest(msg)),
+                db::rfc5912::ECDSA_WITH_SHA_512,
+            ),
+        ];
+        for (name, spki_der, sig_der, oid) in &cases {
+            verify_signature_by_oid(msg, sig_der, spki_der, oid)
+                .unwrap_or_else(|e| panic!("{name} must verify, got {e:?}"));
+        }
+    }
+
+    #[test]
     fn test_ec_named_curve_rejects_non_ec_key() {
         // An RSA SPKI under the ECDSA path must be rejected, not misdispatched.
         let ca_pem = include_str!(concat!(
