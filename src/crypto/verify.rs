@@ -117,15 +117,9 @@ fn ec_named_curve(spki: &spki::SubjectPublicKeyInfoRef<'_>) -> Result<EcCurve, T
     }
 }
 
-/// Verify an ECDSA signature, binding the verifying key's curve (read from the
-/// SPKI) to the hash the signature-algorithm OID declared (finding L-8).
-///
-/// Previously the dispatcher tried each curve in turn via `or_else`, so e.g. a
-/// P-521 key could satisfy an `ecdsa-with-SHA256` OID — a curve/hash strength
-/// mismatch. Here the curve is taken from the key and only the conformant
-/// (curve, hash) pairings are accepted; the unusual-but-real P-521-with-SHA-256
-/// and P-521-with-SHA-384 combinations seen on some self-signed certificates are
-/// kept, but cross-curve guesses are rejected.
+/// Verify an ECDSA signature with the curve from the key's SPKI and the hash
+/// from the signature-algorithm OID (finding L-8). Unsupported curve/hash
+/// pairings are rejected.
 fn verify_ecdsa_bound(
     tbs: &[u8],
     sig: &[u8],
