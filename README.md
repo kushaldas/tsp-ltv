@@ -6,9 +6,6 @@ stores, and certificate chain building used by
 [underskrift](https://github.com/kushaldas/underskrift) (PAdES/CAdES),
 bergshamra (XAdES), and jades (JAdES).
 
-Version 0.4 requires Rust 1.88 and delegates all cryptographic operations and
-TLS provider configuration to `kryptering` 0.7.0 from crates.io.
-
 ## Features
 
 - **RFC 3161 timestamping** — TSA client and pool with failover, TimeStampReq/Resp
