@@ -7,6 +7,7 @@ use std::time::Duration;
 
 use super::token;
 use crate::crypto::algorithm::DigestAlgorithm;
+use crate::der_utils;
 use crate::error::TspError;
 use crate::net::AttestedHttpClient;
 
@@ -234,7 +235,7 @@ impl TsaClient {
         let token_der = token::validate_timestamp_response(
             &resp,
             data_hash,
-            Some(nonce),
+            Some(&der_utils::encode_integer_body_u64(nonce)),
             self.digest_algorithm,
             &self.verification_certs,
         )?;

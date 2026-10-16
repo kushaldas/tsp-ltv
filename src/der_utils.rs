@@ -122,6 +122,11 @@ pub fn encode_der_length(out: &mut Vec<u8>, len: usize) {
 
 /// Encode a non-negative integer as DER INTEGER.
 pub fn encode_integer_u64(val: u64) -> Vec<u8> {
+    encode_tlv(0x02, &encode_integer_body_u64(val))
+}
+
+/// Encode a non-negative integer as a DER INTEGER body (no tag/length).
+pub fn encode_integer_body_u64(val: u64) -> Vec<u8> {
     let be_bytes = val.to_be_bytes();
     let start = be_bytes.iter().position(|&b| b != 0).unwrap_or(7);
     let significant = &be_bytes[start..];
@@ -132,8 +137,7 @@ pub fn encode_integer_u64(val: u64) -> Vec<u8> {
         value_bytes.push(0x00);
     }
     value_bytes.extend_from_slice(significant);
-
-    encode_tlv(0x02, &value_bytes)
+    value_bytes
 }
 
 /// Decode a DER INTEGER body (no tag/length) to `u64`.
