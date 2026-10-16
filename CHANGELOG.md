@@ -2,6 +2,31 @@
 
 ## Unreleased
 
+## 0.6.0 [2026-10-16]
+
+### Changed
+
+- Use Kryptering 0.7.0. Its RustCrypto provider now sits on the `digest 0.11`
+  / `signature 3` / `der 0.8` trait line, so the lockfile carries that line
+  next to the `der 0.7` / `digest 0.10` line that `cms` 0.2 and `x509-cert`
+  0.2 still require; tsp-ltv exchanges only bytes and enums with Kryptering,
+  so no source changed. Kryptering's PKCS#11 provider no longer unloads a
+  module when all handles are dropped or when `C_Initialize` fails, which
+  removes a segmentation fault seen with the Thales Luna client.
+- Rolled forward in-range dependency patches: `thiserror` 2.0.21, `log`
+  0.4.34, `rustls` 0.23.46, `webpki-roots` 1.0.9, `tokio` 1.53.3,
+  `tokio-rustls` 0.26.6, `rand` 0.8.8 and `sha1` 0.10.7 (dev-only), plus the
+  usual transitive roll-forward. `cargo audit` is clean apart from the
+  allow-listed RUSTSEC-2023-0071.
+- Cargo now uses the MSRV-aware resolver (`resolver = "3"`), so `cargo update`
+  keeps the lockfile within `rust-version = 1.88`; without it the roll-forward
+  above had picked `aes` 0.9.3, which requires Rust 1.89 and would have failed
+  the MSRV job.
+- `docs/ecosystem.md` records today's `cargo outdated` snapshot: `x509-cert`
+  0.3, `ecdsa` 0.17, the P-curves 0.14, `ed25519-dalek` 3 and `dsa` 0.7 are now
+  stable, but `cms` 0.3 and `rsa` 0.10 are not, so the format, digest and
+  signature waves stay deferred for tsp-ltv's own dependencies.
+
 ## 0.5.0 [2026-09-28]
 
 ### Changed

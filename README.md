@@ -7,7 +7,7 @@ stores, and certificate chain building used by
 bergshamra (XAdES), and jades (JAdES).
 
 Version 0.4 requires Rust 1.88 and delegates all cryptographic operations and
-TLS provider configuration to `kryptering` 0.6.0 from crates.io.
+TLS provider configuration to `kryptering` 0.7.0 from crates.io.
 
 ## Features
 
@@ -62,7 +62,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-tsp-ltv = "0.4"
+tsp-ltv = "0.6"
 ```
 
 Defaults are `tsp`, `ltv`, `blocking`, `rustcrypto`, `tls-ring`, and
@@ -70,7 +70,7 @@ Defaults are `tsp`, `ltv`, `blocking`, `rustcrypto`, `tls-ring`, and
 
 ```toml
 [dependencies]
-tsp-ltv = { version = "0.4", default-features = false, features = ["tsp", "rustcrypto", "tls-ring"] }
+tsp-ltv = { version = "0.6", default-features = false, features = ["tsp", "rustcrypto", "tls-ring"] }
 ```
 
 For crates that only need trust store management and certificate verification
@@ -78,7 +78,7 @@ For crates that only need trust store management and certificate verification
 
 ```toml
 [dependencies]
-tsp-ltv = { version = "0.4", default-features = false, features = ["rustcrypto"] }
+tsp-ltv = { version = "0.6", default-features = false, features = ["rustcrypto"] }
 ```
 
 This gives you access to the `trust` and `crypto` modules without pulling in
