@@ -7,9 +7,9 @@
 //! - RSA PKCS#1 v1.5 with MD5 (legacy), SHA-1 (legacy), SHA-224 (legacy), SHA-256, SHA-384, SHA-512
 //! - RSA-PSS (RSASSA-PSS) with SHA-256, SHA-384, SHA-512
 //! - ECDSA P-256/P-384 with SHA-1 (legacy)
-//! - ECDSA P-256 with SHA-256
-//! - ECDSA P-384 with SHA-384
-//! - ECDSA P-521 with SHA-512
+//! - ECDSA P-256 with SHA-256, SHA-384, SHA-512
+//! - ECDSA P-384 with SHA-256, SHA-384, SHA-512
+//! - ECDSA P-521 with SHA-256, SHA-384, SHA-512
 //! - Ed25519
 //! - DSA (DSS) with SHA-1 (legacy) and SHA-256
 //!
@@ -117,15 +117,9 @@ fn ec_named_curve(spki: &spki::SubjectPublicKeyInfoRef<'_>) -> Result<EcCurve, T
     }
 }
 
-/// Verify an ECDSA signature, binding the verifying key's curve (read from the
-/// SPKI) to the hash the signature-algorithm OID declared (finding L-8).
-///
-/// Previously the dispatcher tried each curve in turn via `or_else`, so e.g. a
-/// P-521 key could satisfy an `ecdsa-with-SHA256` OID — a curve/hash strength
-/// mismatch. Here the curve is taken from the key and only the conformant
-/// (curve, hash) pairings are accepted; the unusual-but-real P-521-with-SHA-256
-/// and P-521-with-SHA-384 combinations seen on some self-signed certificates are
-/// kept, but cross-curve guesses are rejected.
+/// Verify an ECDSA signature with the curve from the key's SPKI and the hash
+/// from the signature-algorithm OID (finding L-8). Unsupported curve/hash
+/// pairings are rejected.
 fn verify_ecdsa_bound(
     tbs: &[u8],
     sig: &[u8],
@@ -145,8 +139,20 @@ fn verify_ecdsa_bound(
         (EcCurve::P256, EcdsaHash::Sha256) => {
             (kryptering::EcCurve::P256, kryptering::HashAlgorithm::Sha256)
         }
+        (EcCurve::P256, EcdsaHash::Sha384) => {
+            (kryptering::EcCurve::P256, kryptering::HashAlgorithm::Sha384)
+        }
+        (EcCurve::P256, EcdsaHash::Sha512) => {
+            (kryptering::EcCurve::P256, kryptering::HashAlgorithm::Sha512)
+        }
+        (EcCurve::P384, EcdsaHash::Sha256) => {
+            (kryptering::EcCurve::P384, kryptering::HashAlgorithm::Sha256)
+        }
         (EcCurve::P384, EcdsaHash::Sha384) => {
             (kryptering::EcCurve::P384, kryptering::HashAlgorithm::Sha384)
+        }
+        (EcCurve::P384, EcdsaHash::Sha512) => {
+            (kryptering::EcCurve::P384, kryptering::HashAlgorithm::Sha512)
         }
         (EcCurve::P521, EcdsaHash::Sha512) => {
             (kryptering::EcCurve::P521, kryptering::HashAlgorithm::Sha512)
@@ -1190,9 +1196,8 @@ mod tests {
     #[test]
     fn test_ecdsa_curve_is_bound_to_declared_hash() {
         // L-8: ECDSA verification dispatches on the SPKI named curve. A P-256
-        // key + ecdsa-with-SHA256 verifies; the same key under a SHA-512-declared
-        // OID is rejected as an unsupported curve/hash pairing (no cross-curve
-        // trial-and-error).
+        // key + ecdsa-with-SHA256 verifies; the same signature under
+        // ecdsa-with-SHA512 is rejected.
         use const_oid::db;
         use p256::ecdsa::{signature::Signer, Signature, SigningKey};
         use rsa::pkcs8::EncodePublicKey;
@@ -1217,15 +1222,79 @@ mod tests {
         verify_signature_by_oid(msg, &sig_der, &spki_der, &db::rfc5912::ECDSA_WITH_SHA_256)
             .expect("P-256 + ecdsa-with-SHA256 must verify");
 
-        // Mismatched declared hash for a P-256 key is rejected (not silently
-        // retried against another curve).
+        // A SHA-256 signature does not verify against the SHA-512 digest.
         let err =
             verify_signature_by_oid(msg, &sig_der, &spki_der, &db::rfc5912::ECDSA_WITH_SHA_512)
                 .unwrap_err();
         assert!(
             matches!(err, TrustError::SignatureVerification(_)),
-            "P-256 key under a SHA-512 ECDSA OID must be rejected, got {err:?}"
+            "SHA-256 signature under ecdsa-with-SHA512 must be rejected, got {err:?}"
         );
+    }
+
+    #[test]
+    fn test_ecdsa_p256_p384_additional_hashes_verify() {
+        use const_oid::db;
+        use rsa::pkcs8::EncodePublicKey;
+        use sha2::{Digest, Sha256, Sha384, Sha512};
+        use signature::hazmat::PrehashSigner;
+
+        let msg = b"ECDSA test message";
+
+        let p256_sk = p256::ecdsa::SigningKey::random(&mut rand::thread_rng());
+        let p256_spki = p256_sk
+            .verifying_key()
+            .to_public_key_der()
+            .unwrap()
+            .as_bytes()
+            .to_vec();
+        let p256_sign = |digest: &[u8]| -> Vec<u8> {
+            let sig: p256::ecdsa::Signature = p256_sk.sign_prehash(digest).unwrap();
+            sig.to_der().as_bytes().to_vec()
+        };
+
+        let p384_sk = p384::ecdsa::SigningKey::random(&mut rand::thread_rng());
+        let p384_spki = p384_sk
+            .verifying_key()
+            .to_public_key_der()
+            .unwrap()
+            .as_bytes()
+            .to_vec();
+        let p384_sign = |digest: &[u8]| -> Vec<u8> {
+            let sig: p384::ecdsa::Signature = p384_sk.sign_prehash(digest).unwrap();
+            sig.to_der().as_bytes().to_vec()
+        };
+
+        let cases = [
+            (
+                "P-256 + ecdsa-with-SHA384",
+                &p256_spki,
+                p256_sign(&Sha384::digest(msg)),
+                db::rfc5912::ECDSA_WITH_SHA_384,
+            ),
+            (
+                "P-256 + ecdsa-with-SHA512",
+                &p256_spki,
+                p256_sign(&Sha512::digest(msg)),
+                db::rfc5912::ECDSA_WITH_SHA_512,
+            ),
+            (
+                "P-384 + ecdsa-with-SHA256",
+                &p384_spki,
+                p384_sign(&Sha256::digest(msg)),
+                db::rfc5912::ECDSA_WITH_SHA_256,
+            ),
+            (
+                "P-384 + ecdsa-with-SHA512",
+                &p384_spki,
+                p384_sign(&Sha512::digest(msg)),
+                db::rfc5912::ECDSA_WITH_SHA_512,
+            ),
+        ];
+        for (name, spki_der, sig_der, oid) in &cases {
+            verify_signature_by_oid(msg, sig_der, spki_der, oid)
+                .unwrap_or_else(|e| panic!("{name} must verify, got {e:?}"));
+        }
     }
 
     #[test]
