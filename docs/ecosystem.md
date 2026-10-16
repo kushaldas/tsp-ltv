@@ -1,6 +1,6 @@
 # Dependency ecosystem status
 
-**Last reviewed:** 2026-06-27
+**Last reviewed:** 2026-10-16 (previous: 2026-06-27)
 **Tool:** `cargo outdated --depth 1` against the top-level `Cargo.toml`
 **Scope:** direct deps only (transitives are `cargo audit`'s job)
 
@@ -11,7 +11,26 @@ crates into this security library, because the stable consumers (`cms`,
 majors. It exists so future `cargo outdated` runs don't re-litigate the same
 investigation.
 
-## Decision (2026-06-27)
+## Decision (2026-10-16, unchanged from 2026-06-27)
+
+**Stay on stable for tsp-ltv's own dependencies.** `x509-cert` 0.3.0, `ecdsa`
+0.17.0, `p256`/`p384`/`p521` 0.14.0, `ed25519-dalek` 3.0.0, `dsa` 0.7.0,
+`base64` 0.23 and `rcgen` 0.14 have shipped stable since the last review, but
+`cms` is still `0.3.0-rc.0` and `rsa` is still `0.10.0-rc.19`. `cms` anchors
+the format wave and `rsa` anchors the digest and signature waves, so none of
+the waves below can be taken whole yet (see "Never take partial waves").
+
+Kryptering 0.7.0, which tsp-ltv now depends on, already moved its RustCrypto
+provider to the new trait line (`der` 0.8, `digest` 0.11, `signature` 3,
+`rand_core` 0.10, `rsa` pinned at `=0.10.0-rc.19`; rationale in Kryptering's
+own `docs/ecosystem.md`). tsp-ltv exchanges only bytes and plain enums with
+Kryptering, so both lines coexist in `Cargo.lock` without a trait-identity
+clash. Every production cryptographic operation goes through Kryptering, so
+the pre-release `rsa` in the tree is the one Kryptering chose and audited;
+tsp-ltv's own `rsa 0.9` / `digest 0.10` line is used for CMS and X.509 parsing
+and for test fixture generation.
+
+Previous decision text follows.
 
 **Stay on stable.** The entire RustCrypto stack is mid-migration: the trait
 crates (`der` 0.8, `digest` 0.11, `signature` 3, `sha2/sha1/sha3/md-5`,
@@ -171,6 +190,60 @@ HTTPS calls, so a wrong roots choice would not be caught here. The closest
 behavior-preserving config is `features = ["rustls", "webpki-roots"]`.
 
 ---
+
+## What was actually pulled on 2026-10-16
+
+`cargo outdated --depth 1` on 2026-10-16 (direct deps a major behind, all
+deferred per the decision above):
+
+| Crate | Current | Latest | Why not taken |
+|---|---|---|---|
+| `der` / `spki` / `const-oid` / `pem-rfc7468` | 0.7.10 / 0.7.3 / 0.9.6 / 0.7.0 | 0.8.2 / 0.8.1 / 0.10.2 / 1.0.0 | format wave, `cms` 0.3 still rc |
+| `x509-cert` | 0.2.5 | 0.3.0 (stable) | format wave, moves with `cms` |
+| `digest` / `sha1` / `sha2` / `sha3` / `md-5` (dev) | 0.10.x | 0.11.x / 0.12.0 | digest wave, `rsa` 0.10 still rc |
+| `ecdsa` / `p256` / `p384` / `p521` / `dsa` (dev) | 0.16.9 / 0.13.x / 0.6.3 | 0.17.0 / 0.14.0 / 0.7.0 (stable) | digest and signature waves, `rsa` 0.10 still rc |
+| `ed25519-dalek` / `signature` (dev) | 2.2.0 / 2.2.0 | 3.0.0 (stable) | signature wave, `cms`/`rsa` |
+| `rand` (dev) | 0.8.8 | 0.10.3 | rand_core wave, `rsa` 0.10 still rc |
+| `base64` | 0.22.1 | 0.23.1 | standalone; defer to a dedicated change, API review needed |
+| `rcgen` / `time` (dev) | 0.13.2 / 0.3.53 | 0.14.10 / 0.3.55 | pinned exactly for Rust 1.88; revisit with MSRV |
+| `reqwest` | 0.12.28 | 0.13.5 | feature rename, see the reqwest section |
+
+Direct deps rolled forward in range by `cargo update` (through `sfw`):
+
+```
+kryptering     0.6.0   -> 0.7.0   (manifest bump)
+thiserror      2.0.18  -> 2.0.21
+log            0.4.33  -> 0.4.34
+rustls         0.23.45 -> 0.23.46
+webpki-roots   1.0.8   -> 1.0.9
+tokio          1.52.3  -> 1.53.3
+tokio-rustls   0.26.4  -> 0.26.6   (dev-dependency)
+rand           0.8.6   -> 0.8.8    (dev-dependency)
+sha1           0.10.6  -> 0.10.7   (dev-dependency)
+```
+
+The manifest now sets `resolver = "3"`. The first `cargo update` of the day,
+under the edition-2021 default resolver, selected `aes` 0.9.3 (`rust-version =
+1.89`) behind Kryptering; the MSRV-aware resolver downgraded it to 0.9.2, the
+version Kryptering's own lockfile pins. Always run `cargo update` with this
+resolver in place; the "Rust 1.88 MSRV" CI job (`cargo +1.88.0 check --locked`)
+is the backstop.
+
+Kryptering 0.7.0 adds `k256`, `bp256`, `bp384`, `x448`, `primefield` and `wnaf`
+to the tree and drops `either` and `itertools`. The duplicated majors now in
+the lockfile, all from the Kryptering line next to tsp-ltv's own line:
+`const-oid`, `der`, `digest`, `getrandom`, `md-5`, `pem-rfc7468`, `pkcs8`,
+`rand_core`, `rsa`, `sha1`, `sha2`, `sha3`, `signature`, `spki`. They collapse
+when the waves above are taken.
+
+Verification on 2026-10-16, against `kryptering 0.7.0` from crates.io (its
+packaged sources are byte-identical to the tree tested beforehand):
+- `cargo build --locked` and `cargo clippy --locked --tests -- -D warnings`: clean
+- `cargo test --locked` (default features): 247 + 8 tests passed
+- `cargo test --locked --no-default-features --features rustcrypto,legacy-algorithms`: 71 + 3 passed
+- `cargo test --locked --no-default-features --features tsp,ltv,blocking,aws-lc,tls-aws-lc,legacy-algorithms`: 247 + 8 passed
+- `cargo audit`: exit 0 (RUSTSEC-2023-0071 remains allow-listed in `.cargo/audit.toml`)
+- `cargo publish --dry-run --locked`: packages and builds
 
 ## What was actually pulled on 2026-06-27
 
