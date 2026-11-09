@@ -1200,9 +1200,9 @@ mod tests {
         // ecdsa-with-SHA512 is rejected.
         use const_oid::db;
         use p256::ecdsa::{signature::Signer, Signature, SigningKey};
-        use rsa::pkcs8::EncodePublicKey;
+        use p256::elliptic_curve::{pkcs8::EncodePublicKey, Generate};
 
-        let sk = SigningKey::random(&mut rand::thread_rng());
+        let sk = SigningKey::generate();
         let spki_der = sk
             .verifying_key()
             .to_public_key_der()
@@ -1235,13 +1235,13 @@ mod tests {
     #[test]
     fn test_ecdsa_p256_p384_additional_hashes_verify() {
         use const_oid::db;
-        use rsa::pkcs8::EncodePublicKey;
+        use p256::ecdsa::signature::hazmat::PrehashSigner;
+        use p256::elliptic_curve::{pkcs8::EncodePublicKey, Generate};
         use sha2::{Digest, Sha256, Sha384, Sha512};
-        use signature::hazmat::PrehashSigner;
 
         let msg = b"ECDSA test message";
 
-        let p256_sk = p256::ecdsa::SigningKey::random(&mut rand::thread_rng());
+        let p256_sk = p256::ecdsa::SigningKey::generate();
         let p256_spki = p256_sk
             .verifying_key()
             .to_public_key_der()
@@ -1253,7 +1253,7 @@ mod tests {
             sig.to_der().as_bytes().to_vec()
         };
 
-        let p384_sk = p384::ecdsa::SigningKey::random(&mut rand::thread_rng());
+        let p384_sk = p384::ecdsa::SigningKey::generate();
         let p384_spki = p384_sk
             .verifying_key()
             .to_public_key_der()

@@ -1,6 +1,6 @@
 [package]
 name = "tsp-ltv"
-version = "0.6.0"
+version = "0.6.1"
 edition = "2021"
 rust-version = "1.88"
 # MSRV-aware resolver: `cargo update` stays within rust-version (needs cargo 1.84+).
@@ -101,15 +101,7 @@ rand = "0.8"
 # Test fixture generation only. Production cryptography is provided solely by
 # Kryptering, so alternate feature trees do not acquire these implementations.
 rsa = { version = "0.9", features = ["sha2"] }
-ecdsa = { version = "0.16", features = ["signing", "verifying", "der"] }
-p256 = { version = "0.13", features = ["ecdsa"] }
-p384 = { version = "0.13", features = ["ecdsa"] }
-p521 = { version = "0.13", features = ["ecdsa", "pkcs8"] }
-ed25519-dalek = { version = "2", features = ["pem"] }
-signature = "2"
+p256 = { version = "0.14", features = ["ecdsa"] }
+p384 = { version = "0.14", features = ["ecdsa"] }
 sha2 = "0.10"
-sha3 = "0.10"
 sha1 = { version = "0.10", features = ["oid"] }
-md-5 = { version = "0.10", features = ["oid"] }
-digest = "0.10"
-dsa = "0.6"

@@ -1,8 +1,50 @@
 # Dependency ecosystem status
 
-**Last reviewed:** 2026-10-16 (previous: 2026-06-27)
+**Last reviewed:** 2026-11-08 (previous: 2026-10-16)
 **Tool:** `cargo outdated --depth 1` against the top-level `Cargo.toml`
 **Scope:** direct deps only (transitives are `cargo audit`'s job)
+
+## Audit remediation (2026-11-08)
+
+The dependency decisions below are historical. RUSTSEC-2026-0387 affects
+`crypto-bigint < 0.7.6`, including 0.5.5 pulled in exclusively by our old ECDSA
+test helpers. `cargo update` alone could not remove that version:
+
+| Consumer | Dependency requirement before remediation |
+|---|---|
+| `p256 0.13.2`, `p384 0.13.1`, `p521 0.13.3` | `elliptic-curve 0.13` |
+| `ecdsa 0.16.9` | `elliptic-curve 0.13` |
+| `elliptic-curve 0.13.8` | `crypto-bigint 0.5` |
+
+Moved the used test dependencies `p256` and `p384` to 0.14.0, matching
+Kryptering's existing `ecdsa 0.17`, `elliptic-curve 0.14.3`, and patched
+`crypto-bigint 0.7.11`. Removed unused direct test dependencies `ecdsa`, `p521`,
+`ed25519-dalek`, `signature`, `sha3`, `md-5`, `digest`, and `dsa`.
+The ECDSA tests now use the curves' matching `signature 3`, `pkcs8 0.11`, and
+`Generate` APIs through their re-exports. They exchange only encoded bytes
+with the older format and RSA test helpers, so no shared trait crosses between
+the two versions. This moves the complete ECDSA test helper group without
+requiring a migration of the production CMS/X.509 API or pre-release RSA.
+
+`cargo outdated --depth 1` confirmed no compatible direct updates before this
+change; unrelated major updates remain deferred. `cargo update` also advanced
+`crypto-common 0.1.6` to 0.1.7 (which pins `generic-array 0.14.7`), and retained
+the lockfile updates already present in the working tree. The old
+`crypto-bigint 0.5.5` dependency tree is removed entirely. No advisory ignore
+was added; the existing RUSTSEC-2023-0071 exception remains unchanged.
+
+Verification:
+
+- `cargo audit --deny warnings`: exit 0 with the existing RSA exception.
+- `cargo test --locked`: 248 unit tests and 8 doc tests passed.
+- `cargo test --locked --no-default-features --features rustcrypto,legacy-algorithms`:
+  72 unit tests and 3 doc tests passed.
+- `cargo test --locked --no-default-features --features tsp,ltv,blocking,aws-lc,tls-aws-lc,legacy-algorithms`:
+  248 unit tests and 8 doc tests passed. The normal AWS-LC dependency tree
+  still excludes RustCrypto primitive implementations.
+- `cargo +1.88.0 check --locked --tests --target-dir target/msrv`: passed.
+- `cargo clippy --locked --tests -- -D warnings`: passed.
+- `cargo fmt --all -- --check` and `git diff --check`: passed.
 
 This document records which direct-dep major bumps are *ecosystem-blocked* — the
 new major exists, but taking it would require pulling **pre-release** crypto
