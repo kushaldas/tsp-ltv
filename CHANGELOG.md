@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+## 0.6.1 [2026-11-09]
+
+### Security
+
+- Remove the test-only `crypto-bigint 0.5.5` dependency affected by
+  RUSTSEC-2026-0387 by upgrading the ECDSA test helpers to `p256` and `p384`
+  0.14 and removing unused crypto test dependencies. The remaining
+  `crypto-bigint` is patched at 0.7.11. No advisory exceptions were added.
+
 ## 0.6.0 [2026-10-16]
 
 ### Changed
