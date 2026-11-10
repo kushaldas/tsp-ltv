@@ -352,7 +352,7 @@ pub fn parse_timestamp_response(der_bytes: &[u8]) -> Result<TimeStampResp, TspEr
 pub fn validate_timestamp_response(
     resp: &TimeStampResp,
     expected_hash: &[u8],
-    expected_nonce: Option<u64>,
+    expected_nonce: Option<&[u8]>,
     digest_algorithm: DigestAlgorithm,
     extra_certs: &[Certificate],
 ) -> Result<Vec<u8>, TspError> {
@@ -409,7 +409,7 @@ pub fn verify_timestamp_token(
     token_der: &[u8],
     expected_hash: &[u8],
     digest_algorithm: DigestAlgorithm,
-    expected_nonce: Option<u64>,
+    expected_nonce: Option<&[u8]>,
     trust_store: Option<&TrustStore>,
     validation_time: Option<der::DateTime>,
     extra_certs: &[Certificate],
@@ -663,7 +663,7 @@ fn verify_token_cms(
 fn check_tst_info_matches(
     tst_info: &TstInfo,
     expected_hash: &[u8],
-    expected_nonce: Option<u64>,
+    expected_nonce: Option<&[u8]>,
     digest_algorithm: DigestAlgorithm,
 ) -> Result<(), TspError> {
     use subtle::ConstantTimeEq;
@@ -687,12 +687,12 @@ fn check_tst_info_matches(
     }
 
     if let Some(expected) = expected_nonce {
-        match tst_info.nonce {
+        match &tst_info.nonce {
             // Constant-time nonce comparison (L-7).
-            Some(actual) if bool::from(actual.ct_eq(&expected)) => {}
+            Some(actual) if nonce_values_equal(expected, actual) => {}
             Some(actual) => {
                 return Err(TspError::InvalidResponse(format!(
-                    "nonce mismatch: expected {expected}, got {actual}"
+                    "nonce mismatch: expected {expected:02x?}, got {actual:02x?}"
                 )));
             }
             None => {
@@ -704,6 +704,27 @@ fn check_tst_info_matches(
     }
 
     Ok(())
+}
+
+/// Whether two DER INTEGER bodies encode the same non-negative value.
+/// Empty or negative bodies are always considered different.
+fn nonce_values_equal(a: &[u8], b: &[u8]) -> bool {
+    use subtle::ConstantTimeEq;
+
+    fn magnitude(bytes: &[u8]) -> Option<&[u8]> {
+        match bytes.first() {
+            Some(first) if first & 0x80 == 0 => {
+                let start = bytes.iter().position(|&b| b != 0).unwrap_or(bytes.len());
+                Some(&bytes[start..])
+            }
+            _ => None,
+        }
+    }
+
+    match (magnitude(a), magnitude(b)) {
+        (Some(a), Some(b)) => bool::from(a.ct_eq(b)),
+        _ => false,
+    }
 }
 
 /// Find the certificate identified by a CMS `SignerIdentifier` among `certs`.
@@ -1081,8 +1102,8 @@ pub struct TstInfo {
     pub serial_number: Vec<u8>,
     /// The generation time (raw DER bytes of GeneralizedTime).
     pub gen_time_der: Vec<u8>,
-    /// Nonce from the response (if present).
-    pub nonce: Option<u64>,
+    /// Nonce from the response (if present), as a DER INTEGER body.
+    pub nonce: Option<Vec<u8>>,
     /// The TSA policy OID.
     pub policy_oid: Option<String>,
 }
@@ -1172,6 +1193,24 @@ pub fn extract_tst_info(token_der: &[u8]) -> Result<TstInfo, TspError> {
     parse_tst_info_body(tst_info_der)
 }
 
+/// Check that a DER INTEGER body (no tag/length) encodes a non-negative
+/// integer of any width.
+///
+/// Returns an error if the body is empty, the integer is negative (high bit of
+/// the first byte set), or the encoding is not minimal (X.690 §8.3.2).
+fn check_non_negative_integer(bytes: &[u8]) -> Result<(), String> {
+    match bytes {
+        [] => Err("empty INTEGER body".into()),
+        [first, ..] if first & 0x80 != 0 => Err(format!(
+            "negative INTEGER body not allowed: 0x{first:02x}..."
+        )),
+        [0x00, second, ..] if second & 0x80 == 0 => {
+            Err("INTEGER body is not minimally encoded".into())
+        }
+        _ => Ok(()),
+    }
+}
+
 /// Parse the inner TSTInfo SEQUENCE body.
 ///
 /// ```text
@@ -1250,10 +1289,14 @@ fn parse_tst_info_body(der_bytes: &[u8]) -> Result<TstInfo, TspError> {
                 }
                 // nonce INTEGER
                 0x02 => {
-                    nonce =
-                        Some(der_utils::decode_integer_u64(fbody).map_err(|e| {
+                    // Accept any nonce that decodes as a u64, or a minimally
+                    // encoded non-negative nonce of any width.
+                    if der_utils::decode_integer_u64(fbody).is_err() {
+                        check_non_negative_integer(fbody).map_err(|e| {
                             TspError::InvalidResponse(format!("TSTInfo nonce: {e}"))
-                        })?);
+                        })?;
+                    }
+                    nonce = Some(fbody.to_vec());
                 }
                 // tsa [0] GeneralName
                 0xA0 => {
@@ -1731,6 +1774,16 @@ mod tests {
     /// Build a DER-encoded TSTInfo with the given message imprint hash, nonce,
     /// and genTime (GeneralizedTime contents, i.e. b"YYYYMMDDHHMMSSZ").
     fn build_tst_info(hash: &[u8], nonce: u64, gen_time_bytes: &[u8]) -> Vec<u8> {
+        build_tst_info_with_nonce_der(hash, &der_utils::encode_integer_u64(nonce), gen_time_bytes)
+    }
+
+    /// Like [`build_tst_info`] but with a caller-supplied (possibly malformed)
+    /// nonce INTEGER TLV.
+    fn build_tst_info_with_nonce_der(
+        hash: &[u8],
+        nonce_int: &[u8],
+        gen_time_bytes: &[u8],
+    ) -> Vec<u8> {
         let version = der_utils::encode_integer_u64(1);
         // policy OID (arbitrary but well-formed)
         let policy = der_utils::encode_tlv(0x06, &[0x2B, 0x06, 0x01, 0x04, 0x01]);
@@ -1740,14 +1793,13 @@ mod tests {
         let message_imprint = der_utils::encode_sequence_from_parts(&[&alg, &hashed]);
         let serial = der_utils::encode_integer_u64(42);
         let gen_time = der_utils::encode_tlv(0x18, gen_time_bytes);
-        let nonce_int = der_utils::encode_integer_u64(nonce);
         let body = [
             version,
             policy,
             message_imprint,
             serial,
             gen_time,
-            nonce_int,
+            nonce_int.to_vec(),
         ]
         .concat();
         der_utils::encode_sequence_raw(&body)
@@ -1890,14 +1942,115 @@ mod tests {
             &token,
             &hash,
             DigestAlgorithm::Sha256,
-            Some(nonce),
+            Some(&der_utils::encode_integer_body_u64(nonce)),
             None,
             None,
             &[],
         )
         .expect("validly-signed token must verify");
         assert_eq!(tst.message_hash, hash);
-        assert_eq!(tst.nonce, Some(nonce));
+        assert_eq!(tst.nonce, Some(der_utils::encode_integer_body_u64(nonce)));
+    }
+
+    #[test]
+    fn test_check_non_negative_integer() {
+        assert!(check_non_negative_integer(&[0x00]).is_ok());
+        assert!(check_non_negative_integer(&[0x42]).is_ok());
+        assert!(check_non_negative_integer(&[0x00, 0x80]).is_ok());
+        assert!(check_non_negative_integer(&[0x7Fu8; 20]).is_ok());
+        assert!(check_non_negative_integer(&[&[0x00][..], &[0xC5u8; 20][..]].concat()).is_ok());
+
+        assert!(check_non_negative_integer(&[]).is_err());
+        assert!(check_non_negative_integer(&[0x80]).is_err());
+        assert!(check_non_negative_integer(&[0xFF, 0x00]).is_err());
+        assert!(check_non_negative_integer(&[0x00, 0x00]).is_err());
+        assert!(check_non_negative_integer(&[0x00, 0x01]).is_err());
+        assert!(check_non_negative_integer(&[0x00, 0x00, 0x80]).is_err());
+    }
+
+    #[test]
+    fn test_tst_info_accepts_nonce_wider_than_64_bits() {
+        let hash = vec![0x5Au8; 32];
+        let nonce = [&[0x00][..], &[0xC5u8; 20][..]].concat();
+        let tst_info_der = build_tst_info_with_nonce_der(
+            &hash,
+            &der_utils::encode_tlv(0x02, &nonce),
+            &gen_time_within(),
+        );
+        let tst = parse_tst_info_body(&tst_info_der).unwrap();
+        assert_eq!(tst.nonce.as_deref(), Some(&nonce[..]));
+
+        check_tst_info_matches(&tst, &hash, Some(&nonce), DigestAlgorithm::Sha256)
+            .expect("matching wide nonce must be accepted");
+
+        let mut other = nonce.clone();
+        other[20] ^= 0x01;
+        let err =
+            check_tst_info_matches(&tst, &hash, Some(&other), DigestAlgorithm::Sha256).unwrap_err();
+        assert!(format!("{err}").contains("nonce mismatch"), "{err}");
+    }
+
+    #[test]
+    fn test_nonce_compared_by_value() {
+        let hash = vec![0x5Au8; 32];
+        let tst = parse_tst_info_body(&build_tst_info(&hash, 128, &gen_time_within())).unwrap();
+        let matching: [&[u8]; 3] = [&[0x00, 0x80], &[0x00, 0x00, 0x80], &128u64.to_be_bytes()];
+        for expected in matching {
+            check_tst_info_matches(&tst, &hash, Some(expected), DigestAlgorithm::Sha256)
+                .expect("equal nonce value must match");
+        }
+
+        let mismatching: [&[u8]; 3] = [&[0x80], &[0x00, 0x81], &[]];
+        for expected in mismatching {
+            let err = check_tst_info_matches(&tst, &hash, Some(expected), DigestAlgorithm::Sha256)
+                .unwrap_err();
+            assert!(format!("{err}").contains("nonce mismatch"), "{err}");
+        }
+    }
+
+    #[test]
+    fn test_accept_non_minimal_nonce_within_64_bits() {
+        let hash = vec![0x5Au8; 32];
+        let tst_info_der = build_tst_info_with_nonce_der(
+            &hash,
+            &[0x02, 0x03, 0x00, 0x00, 0x07],
+            &gen_time_within(),
+        );
+        let tst = parse_tst_info_body(&tst_info_der).unwrap();
+        check_tst_info_matches(
+            &tst,
+            &hash,
+            Some(&der_utils::encode_integer_body_u64(7)),
+            DigestAlgorithm::Sha256,
+        )
+        .expect("non-minimal nonce within 64 bits must still match by value");
+    }
+
+    #[test]
+    fn test_reject_negative_nonce_sign_confusion() {
+        // Negative nonces are rejected at parse time (M-8).
+        let hash = vec![0x5Au8; 32];
+        for nonce_int in [
+            vec![0x02, 0x01, 0x80],
+            [&[0x02, 0x14][..], &[0xC5u8; 20][..]].concat(),
+        ] {
+            let tst_info_der = build_tst_info_with_nonce_der(&hash, &nonce_int, &gen_time_within());
+            let err = parse_tst_info_body(&tst_info_der).unwrap_err();
+            assert!(format!("{err}").contains("TSTInfo nonce"), "{err}");
+        }
+    }
+
+    #[test]
+    fn test_reject_empty_or_wide_non_minimal_nonce() {
+        let hash = vec![0x5Au8; 32];
+        for nonce_int in [
+            vec![0x02, 0x00],
+            [&[0x02, 0x0A, 0x00, 0x00][..], &[0x01u8; 8][..]].concat(),
+        ] {
+            let tst_info_der = build_tst_info_with_nonce_der(&hash, &nonce_int, &gen_time_within());
+            let err = parse_tst_info_body(&tst_info_der).unwrap_err();
+            assert!(format!("{err}").contains("TSTInfo nonce"), "{err}");
+        }
     }
 
     #[test]
@@ -1922,7 +2075,7 @@ mod tests {
             &token,
             &hash,
             DigestAlgorithm::Sha256,
-            Some(nonce),
+            Some(&der_utils::encode_integer_body_u64(nonce)),
             Some(&store),
             Some(validation_time()),
             &[],
