@@ -5,7 +5,7 @@
 //! The four-valued model (Valid, Revoked, Invalid, Unknown) drives the entire
 //! certificate validation pipeline and policy framework.
 
-use chrono::{DateTime, Utc};
+use time::UtcDateTime;
 
 /// Source of a revocation check result.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -119,7 +119,7 @@ pub enum ValidationStatus {
         /// Which method confirmed validity.
         source: RevocationSource,
         /// When the check was performed.
-        checked_at: DateTime<Utc>,
+        checked_at: UtcDateTime,
     },
 
     /// Certificate has been revoked.
@@ -129,7 +129,7 @@ pub enum ValidationStatus {
         /// Why the certificate was revoked.
         reason: RevocationReason,
         /// When the certificate was revoked.
-        revocation_time: DateTime<Utc>,
+        revocation_time: UtcDateTime,
     },
 
     /// Certificate validation failed (structural/crypto error).
@@ -198,7 +198,11 @@ impl std::fmt::Display for ValidationStatus {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Valid { source, checked_at } => {
-                write!(f, "VALID (via {source}, checked at {checked_at})")
+                write!(
+                    f,
+                    "VALID (via {source}, checked at {})",
+                    crate::der_utils::fmt_instant(*checked_at)
+                )
             }
             Self::Revoked {
                 source,
@@ -207,7 +211,8 @@ impl std::fmt::Display for ValidationStatus {
             } => {
                 write!(
                     f,
-                    "REVOKED (via {source}, reason={reason}, time={revocation_time})"
+                    "REVOKED (via {source}, reason={reason}, time={})",
+                    crate::der_utils::fmt_instant(*revocation_time)
                 )
             }
             Self::Invalid { reason } => write!(f, "INVALID ({reason})"),
@@ -258,7 +263,7 @@ mod tests {
     fn test_validation_status_predicates() {
         let valid = ValidationStatus::Valid {
             source: RevocationSource::Ocsp,
-            checked_at: Utc::now(),
+            checked_at: UtcDateTime::now(),
         };
         assert!(valid.is_valid());
         assert!(!valid.is_revoked());
@@ -266,7 +271,7 @@ mod tests {
         let revoked = ValidationStatus::Revoked {
             source: RevocationSource::Crl,
             reason: RevocationReason::KeyCompromise,
-            revocation_time: Utc::now(),
+            revocation_time: UtcDateTime::now(),
         };
         assert!(revoked.is_revoked());
         assert!(!revoked.is_valid());
@@ -286,12 +291,12 @@ mod tests {
     fn test_resolve_priority_revoked_wins() {
         let valid = ValidationStatus::Valid {
             source: RevocationSource::Ocsp,
-            checked_at: Utc::now(),
+            checked_at: UtcDateTime::now(),
         };
         let revoked = ValidationStatus::Revoked {
             source: RevocationSource::Crl,
             reason: RevocationReason::KeyCompromise,
-            revocation_time: Utc::now(),
+            revocation_time: UtcDateTime::now(),
         };
 
         let result = resolve_priority(valid, revoked);
@@ -302,7 +307,7 @@ mod tests {
     fn test_resolve_priority_valid_over_unknown() {
         let valid = ValidationStatus::Valid {
             source: RevocationSource::Crl,
-            checked_at: Utc::now(),
+            checked_at: UtcDateTime::now(),
         };
         let unknown = ValidationStatus::Unknown {
             reason: "timeout".into(),
@@ -335,7 +340,7 @@ mod tests {
         // turned into a hard failure by a bogus result from the other source.
         let valid = ValidationStatus::Valid {
             source: RevocationSource::Ocsp,
-            checked_at: Utc::now(),
+            checked_at: UtcDateTime::now(),
         };
         let invalid = ValidationStatus::Invalid {
             reason: "forged CRL".into(),
@@ -348,12 +353,35 @@ mod tests {
     fn test_display() {
         let valid = ValidationStatus::Valid {
             source: RevocationSource::Ocsp,
-            checked_at: Utc::now(),
+            checked_at: UtcDateTime::now(),
         };
         let s = format!("{valid}");
         assert!(s.starts_with("VALID (via OCSP"));
 
         let reason = RevocationReason::KeyCompromise;
         assert_eq!(format!("{reason}"), "keyCompromise");
+    }
+
+    #[test]
+    fn test_display_formats_instants_as_rfc3339() {
+        let at = crate::der_utils::parse_generalized_time(b"20260601120307Z").unwrap();
+        let valid = ValidationStatus::Valid {
+            source: RevocationSource::Ocsp,
+            checked_at: at,
+        };
+        assert_eq!(
+            format!("{valid}"),
+            "VALID (via OCSP, checked at 2026-06-01T12:03:07Z)"
+        );
+
+        let revoked = ValidationStatus::Revoked {
+            source: RevocationSource::Crl,
+            reason: RevocationReason::KeyCompromise,
+            revocation_time: at,
+        };
+        assert_eq!(
+            format!("{revoked}"),
+            "REVOKED (via CRL, reason=keyCompromise, time=2026-06-01T12:03:07Z)"
+        );
     }
 }

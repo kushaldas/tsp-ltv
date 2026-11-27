@@ -84,7 +84,7 @@ pub enum CertStatus {
     /// Certificate has been revoked.
     Revoked {
         /// When the certificate was revoked.
-        revocation_time: chrono::DateTime<chrono::Utc>,
+        revocation_time: time::UtcDateTime,
         /// Reason for revocation, if provided.
         reason: RevocationReason,
     },
@@ -106,9 +106,9 @@ pub struct SingleResponse {
     /// The revocation status.
     pub cert_status: CertStatus,
     /// thisUpdate for this response.
-    pub this_update: chrono::DateTime<chrono::Utc>,
+    pub this_update: time::UtcDateTime,
     /// nextUpdate (optional).
-    pub next_update: Option<chrono::DateTime<chrono::Utc>>,
+    pub next_update: Option<time::UtcDateTime>,
 }
 
 /// A parsed BasicOCSPResponse.
@@ -123,7 +123,7 @@ pub struct ParsedBasicOcspResponse {
     /// Responder ID — either byName (DER Name) or byKeyHash (OCTET STRING body).
     pub responder_id: ResponderId,
     /// producedAt timestamp.
-    pub produced_at: chrono::DateTime<chrono::Utc>,
+    pub produced_at: time::UtcDateTime,
     /// Individual certificate responses.
     pub responses: Vec<SingleResponse>,
     /// Nonce from response extensions, if present.
@@ -1152,44 +1152,28 @@ fn validate_responder_trust(
     issuer: &Certificate,
     parsed: &ParsedBasicOcspResponse,
     policy: &crate::crypto::verify::SignaturePolicy,
-    now: chrono::DateTime<chrono::Utc>,
+    now: time::UtcDateTime,
 ) -> Result<ResponderRevocationCheck, LtvError> {
     // Check the responder certificate's own validity period (M-6).
     let validity = &responder_cert.tbs_certificate.validity;
     let not_before = validity.not_before.to_date_time();
     let not_after = validity.not_after.to_date_time();
-    // Convert der::DateTime to chrono for comparison
-    let nb = chrono::DateTime::parse_from_rfc3339(&format!(
-        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
-        not_before.year(),
-        { not_before.month() },
-        { not_before.day() },
-        { not_before.hour() },
-        { not_before.minutes() },
-        { not_before.seconds() }
-    ))
-    .map_err(|e| LtvError::Ocsp(format!("invalid responder notBefore: {e}")))?
-    .with_timezone(&chrono::Utc);
-    let na = chrono::DateTime::parse_from_rfc3339(&format!(
-        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
-        not_after.year(),
-        { not_after.month() },
-        { not_after.day() },
-        { not_after.hour() },
-        { not_after.minutes() },
-        { not_after.seconds() }
-    ))
-    .map_err(|e| LtvError::Ocsp(format!("invalid responder notAfter: {e}")))?
-    .with_timezone(&chrono::Utc);
+    // Convert der::DateTime to a UTC instant for comparison
+    let nb = crate::der_utils::der_datetime_to_utc(&not_before)
+        .map_err(|e| LtvError::Ocsp(format!("invalid responder notBefore: {e}")))?;
+    let na = crate::der_utils::der_datetime_to_utc(&not_after)
+        .map_err(|e| LtvError::Ocsp(format!("invalid responder notAfter: {e}")))?;
 
     if now < nb {
         return Err(LtvError::Ocsp(format!(
-            "OCSP responder certificate is not yet valid (notBefore: {nb})"
+            "OCSP responder certificate is not yet valid (notBefore: {})",
+            crate::der_utils::fmt_instant(nb)
         )));
     }
     if now > na {
         return Err(LtvError::Ocsp(format!(
-            "OCSP responder certificate is expired (notAfter: {na})"
+            "OCSP responder certificate is expired (notAfter: {})",
+            crate::der_utils::fmt_instant(na)
         )));
     }
 
@@ -1390,21 +1374,21 @@ pub struct OcspFreshness {
     /// Clock skew tolerance applied to staleness/max-age comparisons.
     /// Accommodates small differences between the responder's and the
     /// validator's clocks. Default: 5 minutes.
-    pub clock_skew: chrono::Duration,
+    pub clock_skew: time::Duration,
 
     /// Maximum age (measured from `thisUpdate`) tolerated for a response that
     /// omits the optional `nextUpdate` field. RFC 6960 allows `nextUpdate` to be
     /// absent ("fresher information is always available"); rather than treat
     /// such a response as eternally fresh, it is rejected once it is older than
     /// this bound. Default: 24 hours.
-    pub max_age_without_next_update: chrono::Duration,
+    pub max_age_without_next_update: time::Duration,
 }
 
 impl Default for OcspFreshness {
     fn default() -> Self {
         Self {
-            clock_skew: chrono::Duration::minutes(5),
-            max_age_without_next_update: chrono::Duration::hours(24),
+            clock_skew: time::Duration::minutes(5),
+            max_age_without_next_update: time::Duration::hours(24),
         }
     }
 }
@@ -1429,7 +1413,7 @@ impl Default for OcspFreshness {
 /// response), never the fail-open `Unknown`.
 fn validate_response_freshness(
     sr: &SingleResponse,
-    now: chrono::DateTime<chrono::Utc>,
+    now: time::UtcDateTime,
     freshness: &OcspFreshness,
 ) -> Result<(), LtvError> {
     let skew = freshness.clock_skew;
@@ -1439,8 +1423,9 @@ fn validate_response_freshness(
             // Sanity: a window that ends before it starts is malformed.
             if next_update < sr.this_update {
                 return Err(LtvError::Ocsp(format!(
-                    "OCSP response has nextUpdate ({next_update}) before thisUpdate ({})",
-                    sr.this_update
+                    "OCSP response has nextUpdate ({}) before thisUpdate ({})",
+                    crate::der_utils::fmt_instant(next_update),
+                    crate::der_utils::fmt_instant(sr.this_update)
                 )));
             }
             // Anti-replay: reject once the validation instant is past nextUpdate.
@@ -1448,7 +1433,9 @@ fn validate_response_freshness(
             // later-collected archival evidence — is not stale and is kept.)
             if now > next_update + skew {
                 return Err(LtvError::Ocsp(format!(
-                    "OCSP response is stale: nextUpdate ({next_update}) is before validation time ({now})"
+                    "OCSP response is stale: nextUpdate ({}) is before validation time ({})",
+                    crate::der_utils::fmt_instant(next_update),
+                    crate::der_utils::fmt_instant(now)
                 )));
             }
         }
@@ -1459,8 +1446,10 @@ fn validate_response_freshness(
             let max_valid = sr.this_update + freshness.max_age_without_next_update + skew;
             if now > max_valid {
                 return Err(LtvError::Ocsp(format!(
-                    "OCSP response without nextUpdate is too old: thisUpdate ({}), validation time ({now}), max age {}",
-                    sr.this_update, freshness.max_age_without_next_update
+                    "OCSP response without nextUpdate is too old: thisUpdate ({}), validation time ({}), max age {}",
+                    crate::der_utils::fmt_instant(sr.this_update),
+                    crate::der_utils::fmt_instant(now),
+                    freshness.max_age_without_next_update
                 )));
             }
         }
@@ -1499,7 +1488,7 @@ pub fn check_revocation(
     cert: &Certificate,
     issuer: &Certificate,
     nonce: Option<&[u8]>,
-    validation_time: Option<chrono::DateTime<chrono::Utc>>,
+    validation_time: Option<time::UtcDateTime>,
 ) -> Result<ValidationStatus, LtvError> {
     check_revocation_with_policy(
         response_der,
@@ -1524,7 +1513,7 @@ pub fn check_revocation_with_policy(
     cert: &Certificate,
     issuer: &Certificate,
     nonce: Option<&[u8]>,
-    validation_time: Option<chrono::DateTime<chrono::Utc>>,
+    validation_time: Option<time::UtcDateTime>,
     policy: &crate::crypto::verify::SignaturePolicy,
 ) -> Result<ValidationStatus, LtvError> {
     check_revocation_with_options(
@@ -1553,7 +1542,7 @@ pub fn check_revocation_with_options(
     cert: &Certificate,
     issuer: &Certificate,
     nonce: Option<&[u8]>,
-    validation_time: Option<chrono::DateTime<chrono::Utc>>,
+    validation_time: Option<time::UtcDateTime>,
     policy: &crate::crypto::verify::SignaturePolicy,
     freshness: &OcspFreshness,
 ) -> Result<ValidationStatus, LtvError> {
@@ -1598,11 +1587,11 @@ pub fn check_revocation_detailed(
     cert: &Certificate,
     issuer: &Certificate,
     nonce: Option<&[u8]>,
-    validation_time: Option<chrono::DateTime<chrono::Utc>>,
+    validation_time: Option<time::UtcDateTime>,
     policy: &crate::crypto::verify::SignaturePolicy,
     freshness: &OcspFreshness,
 ) -> Result<OcspCheckOutcome, LtvError> {
-    let now = validation_time.unwrap_or_else(chrono::Utc::now);
+    let now = validation_time.unwrap_or_else(time::UtcDateTime::now);
 
     // 1. Parse OCSP response
     let parsed = parse_ocsp_response(response_der)?;
@@ -2080,7 +2069,15 @@ mod tests {
                 reason,
             } => {
                 // revoked [1] IMPLICIT RevokedInfo
-                let rt_str = revocation_time.format("%Y%m%d%H%M%SZ").to_string();
+                let rt_str = format!(
+                    "{:04}{:02}{:02}{:02}{:02}{:02}Z",
+                    revocation_time.year(),
+                    u8::from(revocation_time.month()),
+                    revocation_time.day(),
+                    revocation_time.hour(),
+                    revocation_time.minute(),
+                    revocation_time.second()
+                );
                 let mut revoked_body = der_utils::encode_tlv(0x18, rt_str.as_bytes());
                 if *reason != RevocationReason::Unspecified {
                     let reason_enum = der_utils::encode_tlv(0x0A, &[reason.code()]);
@@ -2144,9 +2141,11 @@ mod tests {
         let issuer = intermediate_ca_cert();
         let cert = signer_cert();
 
-        let revocation_time = chrono::DateTime::parse_from_rfc3339("2026-03-01T00:00:00Z")
-            .unwrap()
-            .with_timezone(&chrono::Utc);
+        let revocation_time = time::UtcDateTime::parse(
+            "2026-03-01T00:00:00Z",
+            &time::format_description::well_known::Rfc3339,
+        )
+        .unwrap();
         let status = CertStatus::Revoked {
             revocation_time,
             reason: RevocationReason::KeyCompromise,
@@ -2199,9 +2198,11 @@ mod tests {
         let response_der =
             build_test_ocsp_response(&issuer, &key_pem, &cert, &CertStatus::Good, None);
 
-        let validation_time = chrono::DateTime::parse_from_rfc3339("2026-06-01T12:00:00Z")
-            .unwrap()
-            .with_timezone(&chrono::Utc);
+        let validation_time = time::UtcDateTime::parse(
+            "2026-06-01T12:00:00Z",
+            &time::format_description::well_known::Rfc3339,
+        )
+        .unwrap();
 
         let status =
             check_revocation(&response_der, &cert, &issuer, None, Some(validation_time)).unwrap();
@@ -2219,9 +2220,11 @@ mod tests {
         let issuer = intermediate_ca_cert();
         let cert = signer_cert();
 
-        let revocation_time = chrono::DateTime::parse_from_rfc3339("2026-03-01T00:00:00Z")
-            .unwrap()
-            .with_timezone(&chrono::Utc);
+        let revocation_time = time::UtcDateTime::parse(
+            "2026-03-01T00:00:00Z",
+            &time::format_description::well_known::Rfc3339,
+        )
+        .unwrap();
         let cert_status = CertStatus::Revoked {
             revocation_time,
             reason: RevocationReason::Superseded,
@@ -2229,9 +2232,11 @@ mod tests {
 
         let response_der = build_test_ocsp_response(&issuer, &key_pem, &cert, &cert_status, None);
 
-        let validation_time = chrono::DateTime::parse_from_rfc3339("2026-06-01T12:00:00Z")
-            .unwrap()
-            .with_timezone(&chrono::Utc);
+        let validation_time = time::UtcDateTime::parse(
+            "2026-06-01T12:00:00Z",
+            &time::format_description::well_known::Rfc3339,
+        )
+        .unwrap();
 
         let status =
             check_revocation(&response_der, &cert, &issuer, None, Some(validation_time)).unwrap();
@@ -2251,9 +2256,11 @@ mod tests {
 
         // Revocation time is 2027-01-01, validation time is 2026-06-01
         // → should be VALID at validation_time
-        let revocation_time = chrono::DateTime::parse_from_rfc3339("2027-01-01T00:00:00Z")
-            .unwrap()
-            .with_timezone(&chrono::Utc);
+        let revocation_time = time::UtcDateTime::parse(
+            "2027-01-01T00:00:00Z",
+            &time::format_description::well_known::Rfc3339,
+        )
+        .unwrap();
         let cert_status = CertStatus::Revoked {
             revocation_time,
             reason: RevocationReason::Unspecified,
@@ -2265,9 +2272,11 @@ mod tests {
         // response was produced shortly after (thisUpdate 2026-06-01T12:00Z,
         // nextUpdate 2026-06-08T12:00Z). Later-collected evidence is accepted,
         // and the 2027 revocation is in the future, so the result is Valid.
-        let validation_time = chrono::DateTime::parse_from_rfc3339("2026-06-01T00:00:00Z")
-            .unwrap()
-            .with_timezone(&chrono::Utc);
+        let validation_time = time::UtcDateTime::parse(
+            "2026-06-01T00:00:00Z",
+            &time::format_description::well_known::Rfc3339,
+        )
+        .unwrap();
 
         let status =
             check_revocation(&response_der, &cert, &issuer, None, Some(validation_time)).unwrap();
@@ -2296,9 +2305,11 @@ mod tests {
             build_test_ocsp_response(&issuer, &key_pem, &cert, &CertStatus::Good, None);
 
         // Far past nextUpdate (the replay window the old code accepted forever).
-        let validation_time = chrono::DateTime::parse_from_rfc3339("2026-09-01T12:00:00Z")
-            .unwrap()
-            .with_timezone(&chrono::Utc);
+        let validation_time = time::UtcDateTime::parse(
+            "2026-09-01T12:00:00Z",
+            &time::format_description::well_known::Rfc3339,
+        )
+        .unwrap();
 
         let err = check_revocation(&response_der, &cert, &issuer, None, Some(validation_time))
             .expect_err("stale OCSP response must be rejected");
@@ -2338,9 +2349,11 @@ mod tests {
             Some("20260608120000Z"), // nextUpdate
         );
 
-        let validation_time = chrono::DateTime::parse_from_rfc3339("2026-06-01T13:00:00Z")
-            .unwrap()
-            .with_timezone(&chrono::Utc);
+        let validation_time = time::UtcDateTime::parse(
+            "2026-06-01T13:00:00Z",
+            &time::format_description::well_known::Rfc3339,
+        )
+        .unwrap();
 
         let status =
             check_revocation(&response_der, &cert, &issuer, None, Some(validation_time)).unwrap();
@@ -2367,9 +2380,11 @@ mod tests {
             build_test_ocsp_response(&issuer, &key_pem, &cert, &CertStatus::Good, None);
 
         // 3 minutes after nextUpdate — inside the 5-minute skew.
-        let validation_time = chrono::DateTime::parse_from_rfc3339("2026-06-08T12:03:00Z")
-            .unwrap()
-            .with_timezone(&chrono::Utc);
+        let validation_time = time::UtcDateTime::parse(
+            "2026-06-08T12:03:00Z",
+            &time::format_description::well_known::Rfc3339,
+        )
+        .unwrap();
 
         let status =
             check_revocation(&response_der, &cert, &issuer, None, Some(validation_time)).unwrap();
@@ -2380,9 +2395,11 @@ mod tests {
     fn test_validate_response_freshness_no_next_update_max_age() {
         // With nextUpdate absent, the response is fresh up to max_age from
         // thisUpdate and stale beyond it.
-        let this_update = chrono::DateTime::parse_from_rfc3339("2026-06-01T12:00:00Z")
-            .unwrap()
-            .with_timezone(&chrono::Utc);
+        let this_update = time::UtcDateTime::parse(
+            "2026-06-01T12:00:00Z",
+            &time::format_description::well_known::Rfc3339,
+        )
+        .unwrap();
         let sr = SingleResponse {
             hash_algorithm_oid: vec![],
             issuer_name_hash: vec![],
@@ -2395,16 +2412,16 @@ mod tests {
         let freshness = OcspFreshness::default(); // 24h max age, 5m skew
 
         // 12 hours later — within the 24h bound.
-        let within = this_update + chrono::Duration::hours(12);
+        let within = this_update + time::Duration::hours(12);
         assert!(validate_response_freshness(&sr, within, &freshness).is_ok());
 
         // Validation instant *before* thisUpdate (later-collected evidence) is
         // always within bound.
-        let before = this_update - chrono::Duration::hours(6);
+        let before = this_update - time::Duration::hours(6);
         assert!(validate_response_freshness(&sr, before, &freshness).is_ok());
 
         // 25 hours later — beyond the 24h bound (+ skew).
-        let beyond = this_update + chrono::Duration::hours(25);
+        let beyond = this_update + time::Duration::hours(25);
         let err = validate_response_freshness(&sr, beyond, &freshness)
             .expect_err("response older than max age must be rejected");
         assert!(
@@ -2427,9 +2444,11 @@ mod tests {
         let response_der =
             build_test_ocsp_response(&issuer, &key_pem, &cert, &CertStatus::Unknown, None);
 
-        let validation_time = chrono::DateTime::parse_from_rfc3339("2026-06-01T12:00:00Z")
-            .unwrap()
-            .with_timezone(&chrono::Utc);
+        let validation_time = time::UtcDateTime::parse(
+            "2026-06-01T12:00:00Z",
+            &time::format_description::well_known::Rfc3339,
+        )
+        .unwrap();
 
         let status =
             check_revocation(&response_der, &cert, &issuer, None, Some(validation_time)).unwrap();
@@ -2451,9 +2470,11 @@ mod tests {
         let response_der =
             build_test_ocsp_response(&issuer, &key_pem, &cert, &CertStatus::Good, Some(nonce));
 
-        let validation_time = chrono::DateTime::parse_from_rfc3339("2026-06-01T12:00:00Z")
-            .unwrap()
-            .with_timezone(&chrono::Utc);
+        let validation_time = time::UtcDateTime::parse(
+            "2026-06-01T12:00:00Z",
+            &time::format_description::well_known::Rfc3339,
+        )
+        .unwrap();
 
         let status = check_revocation(
             &response_der,
@@ -2568,9 +2589,11 @@ mod tests {
             &der_utils::encode_tlv(0xA1, &wrong_name),
         );
 
-        let validation_time = chrono::DateTime::parse_from_rfc3339("2026-06-01T12:00:00Z")
-            .unwrap()
-            .with_timezone(&chrono::Utc);
+        let validation_time = time::UtcDateTime::parse(
+            "2026-06-01T12:00:00Z",
+            &time::format_description::well_known::Rfc3339,
+        )
+        .unwrap();
         let err = check_revocation(&response_der, &cert, &issuer, None, Some(validation_time))
             .expect_err("a response with a mismatched responderID must be rejected");
         assert!(
@@ -2593,9 +2616,11 @@ mod tests {
         let cert = signer_cert();
         let response_der =
             build_test_ocsp_response(&issuer, &key_pem, &cert, &CertStatus::Good, None);
-        let validation_time = chrono::DateTime::parse_from_rfc3339("2026-06-01T12:00:00Z")
-            .unwrap()
-            .with_timezone(&chrono::Utc);
+        let validation_time = time::UtcDateTime::parse(
+            "2026-06-01T12:00:00Z",
+            &time::format_description::well_known::Rfc3339,
+        )
+        .unwrap();
 
         let outcome = check_revocation_detailed(
             &response_der,

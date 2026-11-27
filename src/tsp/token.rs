@@ -1696,34 +1696,42 @@ mod tests {
         0x06, 0x09, 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x01,
     ];
 
-    /// Format a chrono UTC instant as GeneralizedTime contents (YYYYMMDDHHMMSSZ).
-    fn fmt_generalized(dt: chrono::DateTime<chrono::Utc>) -> Vec<u8> {
-        dt.format("%Y%m%d%H%M%SZ").to_string().into_bytes()
+    /// Format a UTC instant as GeneralizedTime contents (YYYYMMDDHHMMSSZ).
+    fn fmt_generalized(dt: time::UtcDateTime) -> Vec<u8> {
+        format!(
+            "{:04}{:02}{:02}{:02}{:02}{:02}Z",
+            dt.year(),
+            u8::from(dt.month()),
+            dt.day(),
+            dt.hour(),
+            dt.minute(),
+            dt.second()
+        )
+        .into_bytes()
     }
 
     /// A genTime inside the runtime TSA cert validity. The cert is valid from
     /// "now" for ~10 years, so the current instant is always inside. Derived
     /// from the clock (not a hard-coded calendar date) so tests don't expire.
     fn gen_time_within() -> Vec<u8> {
-        fmt_generalized(chrono::Utc::now())
+        fmt_generalized(time::UtcDateTime::now())
     }
 
     /// A genTime past the runtime TSA cert's notAfter (~now + 10y).
     fn gen_time_after_validity() -> Vec<u8> {
-        fmt_generalized(chrono::Utc::now() + chrono::Duration::days(365 * 20))
+        fmt_generalized(time::UtcDateTime::now() + time::Duration::days(365 * 20))
     }
 
     /// A `der::DateTime` for "now", used as the chain validation time.
     fn validation_time() -> der::DateTime {
-        use chrono::{Datelike, Timelike};
-        let n = chrono::Utc::now();
+        let n = time::UtcDateTime::now();
         der::DateTime::new(
             n.year() as u16,
-            n.month() as u8,
-            n.day() as u8,
-            n.hour() as u8,
-            n.minute() as u8,
-            n.second() as u8,
+            u8::from(n.month()),
+            n.day(),
+            n.hour(),
+            n.minute(),
+            n.second(),
         )
         .unwrap()
     }
