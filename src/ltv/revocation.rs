@@ -36,7 +36,7 @@
 
 use std::time::Duration;
 
-use chrono::{DateTime, Utc};
+use time::UtcDateTime;
 use x509_cert::Certificate;
 
 use crate::error::LtvError;
@@ -241,7 +241,7 @@ pub async fn check_certificate_revocation(
     config: &RevocationConfig,
     crl_client: &CrlClient,
     ocsp_client: &OcspClient,
-    validation_time: Option<DateTime<Utc>>,
+    validation_time: Option<UtcDateTime>,
 ) -> ValidationStatus {
     // Run OCSP and CRL checks concurrently with a per-cert timeout
     let ocsp_fut = run_ocsp_check(
@@ -351,7 +351,7 @@ pub fn check_certificate_revocation_blocking(
     config: &RevocationConfig,
     crl_client: &CrlClient,
     ocsp_client: &OcspClient,
-    validation_time: Option<DateTime<Utc>>,
+    validation_time: Option<UtcDateTime>,
 ) -> ValidationStatus {
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -382,7 +382,7 @@ async fn run_ocsp_check(
     config: &RevocationConfig,
     crl_client: &CrlClient,
     ocsp_client: &OcspClient,
-    validation_time: Option<DateTime<Utc>>,
+    validation_time: Option<UtcDateTime>,
 ) -> ValidationStatus {
     // Check if cert has OCSP URLs
     let urls = OcspClient::extract_ocsp_urls(cert);
@@ -518,7 +518,7 @@ async fn check_delegated_responder_revocation(
     config: &RevocationConfig,
     crl_client: &CrlClient,
     ocsp_client: &OcspClient,
-    validation_time: Option<DateTime<Utc>>,
+    validation_time: Option<UtcDateTime>,
 ) -> ValidationStatus {
     let sub_config = RevocationConfig {
         // Decrement the recursion budget; bottom out at 0 (the OCSP path treats
@@ -584,7 +584,7 @@ async fn run_crl_check(
     issuer: &Certificate,
     config: &RevocationConfig,
     crl_client: &CrlClient,
-    validation_time: Option<DateTime<Utc>>,
+    validation_time: Option<UtcDateTime>,
 ) -> ValidationStatus {
     // Check if cert has CRL distribution points
     let urls = CrlClient::extract_crl_urls(cert);
@@ -784,7 +784,7 @@ mod tests {
         // Test the resolve_priority logic directly through the merge
         let ocsp = ValidationStatus::Valid {
             source: RevocationSource::Ocsp,
-            checked_at: Utc::now(),
+            checked_at: UtcDateTime::now(),
         };
         let crl = ValidationStatus::Unknown {
             reason: "no CRL endpoints".into(),
@@ -801,7 +801,7 @@ mod tests {
         let crl = ValidationStatus::Revoked {
             source: RevocationSource::Crl,
             reason: crate::ltv::status::RevocationReason::KeyCompromise,
-            revocation_time: Utc::now(),
+            revocation_time: UtcDateTime::now(),
         };
         let result = resolve_priority(ocsp, crl);
         assert!(result.is_revoked());
@@ -811,11 +811,11 @@ mod tests {
     async fn test_resolve_both_valid_picks_first() {
         let ocsp = ValidationStatus::Valid {
             source: RevocationSource::Ocsp,
-            checked_at: Utc::now(),
+            checked_at: UtcDateTime::now(),
         };
         let crl = ValidationStatus::Valid {
             source: RevocationSource::Crl,
-            checked_at: Utc::now(),
+            checked_at: UtcDateTime::now(),
         };
         let result = resolve_priority(ocsp, crl);
         // Both valid, first (OCSP) wins since priorities are equal
@@ -908,14 +908,14 @@ mod tests {
     fn test_enforce_policy_passes_valid_and_revoked_through() {
         let valid = ValidationStatus::Valid {
             source: RevocationSource::Ocsp,
-            checked_at: Utc::now(),
+            checked_at: UtcDateTime::now(),
         };
         assert!(enforce_revocation_policy(valid, true).is_valid());
 
         let revoked = ValidationStatus::Revoked {
             source: RevocationSource::Crl,
             reason: crate::ltv::status::RevocationReason::KeyCompromise,
-            revocation_time: Utc::now(),
+            revocation_time: UtcDateTime::now(),
         };
         assert!(enforce_revocation_policy(revoked, true).is_revoked());
     }

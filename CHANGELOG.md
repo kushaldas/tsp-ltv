@@ -2,6 +2,37 @@
 
 ## Unreleased
 
+### Security
+
+- Update `url` to 2.5.9 (RUSTSEC-2026-0592, stack overflow in `Url::origin()`
+  on nested `blob:` URLs).
+
+### Changed
+
+- **Breaking:** replace `chrono` with `time` (RUSTSEC-2026-0543: `chrono` is
+  unmaintained). Instants are now `time::UtcDateTime` and durations
+  `time::Duration`. This changes the public types of:
+  - `der_utils::parse_generalized_time`, `parse_utc_time` and `parse_x509_time`
+    (return `Result<time::UtcDateTime, String>`);
+  - the timestamp fields of `RevokedEntry`, `ParsedCrl`, `SingleResponse`,
+    `ParsedBasicOcspResponse` and `CertStatus::Revoked`, and the `checked_at` /
+    `revocation_time` fields of `ValidationStatus`;
+  - the `validation_time: Option<...>` parameters of the CRL, OCSP and combined
+    revocation checks;
+  - `clock_skew` and `max_age_without_next_update` in `CrlFreshness` and
+    `OcspFreshness` (now `time::Duration`).
+
+  DER parsing and every validity comparison are unchanged. Instants in
+  `ValidationStatus`'s display and in the CRL/OCSP stale-response and
+  responder-validity errors are still printed as readable timestamps, now in
+  RFC 3339 form (`2026-06-01T12:03:07Z`) instead of `2026-06-01 12:03:07 UTC`.
+  Durations in those messages print in `time`'s form (`1d`) instead of `PT86400S`.
+  `Display` and `Debug` of the raw `time` types themselves differ from `chrono`'s.
+  `chrono` and its platform dependencies (`iana-time-zone`, `windows-*`) leave
+  the dependency tree. See `docs/migrating-chrono-to-time.md` for a conversion
+  table and the overflow and message-text differences, and
+  `docs/adr/0016-replace-chrono-with-time.md` for the decision.
+
 ## 0.6.1 [2026-11-09]
 
 ### Security
