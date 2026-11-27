@@ -4,7 +4,7 @@ Date: 2026-11-27
 
 ## Status
 
-Proposed
+Accepted
 
 ## Context
 
@@ -56,8 +56,7 @@ durations.
   technically, with `Timestamp` and `SignedDuration` as direct equivalents. It
   is a new dependency for every consumer, whereas `time` is already present in
   this tree and in several downstream crates. The two are otherwise close, so
-  this ADR records the choice; it can be revisited if the maintainer prefers
-  `jiff`.
+  the deciding factor is the existing presence of `time`.
 - **`std::time::SystemTime` / `Duration`.** No new dependency, but no calendar
   fields, so DER time parsing and the fixed-date tests would need hand-written
   date arithmetic.
