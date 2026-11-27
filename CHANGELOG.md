@@ -27,9 +27,11 @@
   responder-validity errors are still printed as readable timestamps, now in
   RFC 3339 form (`2026-06-01T12:03:07Z`) instead of `2026-06-01 12:03:07 UTC`.
   Durations in those messages print in `time`'s form (`1d`) instead of `PT86400S`.
-  `Display` and `Debug` of the raw `time` types themselves differ from `chrono`'s. `chrono` and its platform dependencies (`iana-time-zone`,
-  `windows-*`) leave the dependency tree.
-  See `docs/adr/0016-replace-chrono-with-time.md`.
+  `Display` and `Debug` of the raw `time` types themselves differ from `chrono`'s.
+  `chrono` and its platform dependencies (`iana-time-zone`, `windows-*`) leave
+  the dependency tree. See `docs/migrating-chrono-to-time.md` for a conversion
+  table and the overflow and message-text differences, and
+  `docs/adr/0016-replace-chrono-with-time.md` for the decision.
 
 ## 0.6.1 [2026-11-09]
 
