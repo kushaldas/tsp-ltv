@@ -934,7 +934,7 @@ fn validate_crl_freshness(
             // Anti-replay: reject once the validation instant is past nextUpdate.
             // (A CRL whose window lies at/after the validation instant —
             // later-collected archival evidence — is not stale and is kept.)
-            if now > next_update + skew {
+            if now > crate::der_utils::saturating_add(next_update, skew) {
                 return Err(LtvError::Crl(format!(
                     "CRL is stale: nextUpdate ({}) is before validation time ({})",
                     crate::der_utils::fmt_instant(next_update),
@@ -946,7 +946,13 @@ fn validate_crl_freshness(
             // No nextUpdate: bound the CRL's age from thisUpdate so an old CRL
             // cannot be relied on indefinitely. A CRL whose window starts at/after
             // the validation time is always within bound.
-            let max_valid = parsed.this_update + freshness.max_age_without_next_update + skew;
+            let max_valid = crate::der_utils::saturating_add(
+                crate::der_utils::saturating_add(
+                    parsed.this_update,
+                    freshness.max_age_without_next_update,
+                ),
+                skew,
+            );
             if now > max_valid {
                 return Err(LtvError::Crl(format!(
                     "CRL without nextUpdate is too old: thisUpdate ({}), validation time ({}), max age {}",
@@ -979,7 +985,7 @@ fn crl_is_current(der: &[u8], now: time::UtcDateTime, freshness: &CrlFreshness) 
         return false;
     };
     // Not yet valid (window starts in the future, beyond skew) → not current.
-    if now + freshness.clock_skew < parsed.this_update {
+    if crate::der_utils::saturating_add(now, freshness.clock_skew) < parsed.this_update {
         return false;
     }
     // Past nextUpdate / max-age → not current.
@@ -1761,6 +1767,79 @@ mod tests {
             res.is_err(),
             "beyond max-age without nextUpdate must be rejected"
         );
+    }
+
+    /// A CRL with no signature or entries, only the fields freshness reads.
+    fn crl_with_window(this_update: &str, next_update: Option<&str>) -> ParsedCrl {
+        ParsedCrl {
+            tbs_bytes: Vec::new(),
+            signature_algorithm: spki::AlgorithmIdentifierOwned {
+                oid: spki::ObjectIdentifier::new_unwrap("1.2.840.113549.1.1.11"),
+                parameters: None,
+            },
+            signature_bytes: Vec::new(),
+            issuer_der: Vec::new(),
+            this_update: instant(this_update),
+            next_update: next_update.map(instant),
+            revoked_entries: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn test_validate_crl_freshness_year_9999_does_not_panic() {
+        // `nextUpdate` at the last representable second, plus the default skew,
+        // is past the range of `UtcDateTime`. It must be treated as a very
+        // distant instant (fresh), not panic.
+        let parsed = crl_with_window("2026-06-01T00:00:00Z", Some("9999-12-31T23:59:59Z"));
+        let now = instant("2026-06-01T00:00:00Z");
+        assert!(validate_crl_freshness(&parsed, now, &CrlFreshness::default()).is_ok());
+
+        // Same without `nextUpdate`: `thisUpdate` + max age + skew overflows.
+        let parsed = crl_with_window("9999-12-31T23:59:00Z", None);
+        assert!(validate_crl_freshness(&parsed, now, &CrlFreshness::default()).is_ok());
+    }
+
+    /// An unsigned CRL (only its window matters here) as DER bytes.
+    fn unsigned_crl_der(this_update: &[u8], next_update: &[u8]) -> Vec<u8> {
+        let alg = crate::der_utils::encode_sequence_from_parts(&[
+            &[
+                0x06, 0x09, 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x0b,
+            ],
+            &[0x05, 0x00],
+        ]);
+        let issuer = crate::der_utils::encode_sequence_raw(&[]);
+        let tbs = crate::der_utils::encode_sequence_from_parts(&[
+            &alg,
+            &issuer,
+            &crate::der_utils::encode_tlv(0x18, this_update),
+            &crate::der_utils::encode_tlv(0x18, next_update),
+        ]);
+        crate::der_utils::encode_sequence_from_parts(&[
+            &tbs,
+            &alg,
+            &crate::der_utils::encode_tlv(0x03, &[0x00, 0x01]),
+        ])
+    }
+
+    #[test]
+    fn test_crl_is_current_year_9999_next_update_does_not_panic() {
+        // The fetch layer calls `crl_is_current` on bytes straight off the wire,
+        // before any signature check, so a hostile `nextUpdate` must not panic.
+        let der = unsigned_crl_der(b"20260601000000Z", b"99991231235959Z");
+        let now = instant("2026-06-01T00:00:00Z");
+        assert!(crl_is_current(&der, now, &CrlFreshness::default()));
+    }
+
+    #[test]
+    fn test_validate_crl_freshness_extreme_skew_does_not_panic() {
+        let parsed = crl_with_window("2026-06-01T00:00:00Z", Some("2026-06-02T00:00:00Z"));
+        let freshness = CrlFreshness {
+            clock_skew: time::Duration::MAX,
+            max_age_without_next_update: time::Duration::MAX,
+        };
+        let now = instant("2027-06-01T00:00:00Z");
+        // A skew of that size means nothing is ever stale; the point is no panic.
+        assert!(validate_crl_freshness(&parsed, now, &freshness).is_ok());
     }
 
     #[test]

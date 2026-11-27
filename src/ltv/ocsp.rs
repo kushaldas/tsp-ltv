@@ -1431,7 +1431,7 @@ fn validate_response_freshness(
             // Anti-replay: reject once the validation instant is past nextUpdate.
             // (A response whose window lies at/after the validation instant —
             // later-collected archival evidence — is not stale and is kept.)
-            if now > next_update + skew {
+            if now > crate::der_utils::saturating_add(next_update, skew) {
                 return Err(LtvError::Ocsp(format!(
                     "OCSP response is stale: nextUpdate ({}) is before validation time ({})",
                     crate::der_utils::fmt_instant(next_update),
@@ -1443,7 +1443,13 @@ fn validate_response_freshness(
             // No nextUpdate: bound the response's age from thisUpdate so an old
             // response cannot be relied on indefinitely. A response whose window
             // starts at/after the validation time is always within bound.
-            let max_valid = sr.this_update + freshness.max_age_without_next_update + skew;
+            let max_valid = crate::der_utils::saturating_add(
+                crate::der_utils::saturating_add(
+                    sr.this_update,
+                    freshness.max_age_without_next_update,
+                ),
+                skew,
+            );
             if now > max_valid {
                 return Err(LtvError::Ocsp(format!(
                     "OCSP response without nextUpdate is too old: thisUpdate ({}), validation time ({}), max age {}",
@@ -2428,6 +2434,32 @@ mod tests {
             matches!(err, LtvError::Ocsp(ref m) if m.contains("too old")),
             "got: {err}"
         );
+    }
+
+    #[test]
+    fn test_validate_response_freshness_year_9999_does_not_panic() {
+        let parse = |s: &str| {
+            time::UtcDateTime::parse(s, &time::format_description::well_known::Rfc3339).unwrap()
+        };
+        let now = parse("2026-06-01T00:00:00Z");
+        let response = |this_update: &str, next_update: Option<&str>| SingleResponse {
+            hash_algorithm_oid: vec![],
+            issuer_name_hash: vec![],
+            issuer_key_hash: vec![],
+            serial_number: vec![],
+            cert_status: CertStatus::Good,
+            this_update: parse(this_update),
+            next_update: next_update.map(parse),
+        };
+        let freshness = OcspFreshness::default();
+
+        // `nextUpdate` + skew leaves the representable range: not stale.
+        let sr = response("2026-06-01T00:00:00Z", Some("9999-12-31T23:59:59Z"));
+        assert!(validate_response_freshness(&sr, now, &freshness).is_ok());
+
+        // No `nextUpdate`: `thisUpdate` + max age + skew leaves it too.
+        let sr = response("9999-12-31T23:59:00Z", None);
+        assert!(validate_response_freshness(&sr, now, &freshness).is_ok());
     }
 
     #[test]

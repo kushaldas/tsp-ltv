@@ -72,7 +72,7 @@ base64 = "0.22"
 log = "0.4"
 
 # Time
-time = { version = "0.3.55", default-features = false, features = ["std"] }
+time = { version = "0.3.53", default-features = false, features = ["std"] }
 
 # HTTP client — optional (TSA, OCSP, CRL fetching)
 reqwest = { version = "0.12", default-features = false, features = [
@@ -88,8 +88,9 @@ subtle = { version = "2", optional = true }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
 rcgen = "=0.13.2"
-# Test-only: parse and format RFC 3339 instants in assertions.
-time = { version = "0.3.55", features = ["parsing", "formatting"] }
+# Keep rcgen's transitive time dependency on an audited Rust 1.88-compatible release.
+# Also used by the tests to parse and format RFC 3339 instants.
+time = { version = "=0.3.53", features = ["parsing", "formatting"] }
 tempfile = "3"
 # Test-only: generate the TSA signing certificate/key at runtime instead of
 # committing a private key fixture into the repository.

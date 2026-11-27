@@ -36,11 +36,13 @@ durations.
 
 - `time` is already in the dependency tree. It was a dev-dependency (pinned for
   `rcgen`) and several downstream crates use it, so it adds no new crate to
-  review. The dependency is `time = { version = "0.3.55", default-features =
+  review. The dependency is `time = { version = "0.3.53", default-features =
   false, features = ["std"] }`; only the tests enable `parsing` and
   `formatting`, and no `macros` feature is needed.
-- The exact `=0.3.53` dev-dependency pin is replaced by a minimum of `0.3.55`
-  (the latest release, with the same Rust 1.88 MSRV as this crate).
+- The exact `=0.3.53` dev-dependency pin, which keeps `rcgen`'s transitive
+  `time` on an audited release, is kept unchanged. Because that pin applies to
+  this crate's own builds, the lockfile stays on `time` 0.3.53, and the shipped
+  dependency's minimum is set to the same version.
 - DER time parsing builds the instant through one helper
   (`der_utils::utc_from_parts`), which rejects out-of-range months, days,
   hours, minutes and seconds, including a leap second (`:60`), as before.
@@ -75,7 +77,20 @@ durations.
   readable. Durations in those messages print in `time`'s form (`1d` rather than
   `PT86400S`). Nothing in this crate depends on that text.
 - `time`'s default date range is years -9999 to 9999. DER `GeneralizedTime`
-  carries a four-digit year and `UTCTime` maps to 1950-2049, so both fit.
+  carries a four-digit year and `UTCTime` maps to 1950-2049, so every parsed
+  value fits. Adding a clock-skew or max-age allowance to a value near year 9999
+  can leave the range, and `time`'s `+` panics there. The freshness checks
+  therefore add durations through `der_utils::saturating_add`, which clamps to
+  the representable range. This matches `chrono`, where such a sum was just a
+  very distant instant, and means a hostile `nextUpdate` of `9999-12-31` cannot
+  panic the CRL fetch path (which reads bytes before any signature check).
+- `time` moves from a dev-dependency to a shipped dependency. It is declared as
+  a floating minimum (`0.3.53`) rather than an exact pin: an exact pin on a
+  library dependency forces every consumer onto that one release, and the
+  consumer's lockfile is where an audited version belongs. The test-only
+  `[dev-dependencies]` entry keeps its exact pin (`=0.3.53`), as before, because
+  dev-dependencies are not passed on to consumers; it holds `rcgen`'s transitive
+  `time` on the audited release for this crate's own builds.
 - `chrono` and its platform dependencies (`iana-time-zone` and the `windows-*`
   crates) leave the lockfile.
 - Downstream crates that convert these values must move to `time` as well, or

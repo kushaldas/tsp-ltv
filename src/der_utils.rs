@@ -335,6 +335,23 @@ fn utc_from_parts(
         .to_utc())
 }
 
+/// Add a duration to an instant, clamping to the representable range instead of
+/// panicking.
+///
+/// `time::UtcDateTime` covers years -9999 to 9999, narrower than `chrono`, so a
+/// DER time near year 9999 plus a clock-skew allowance can leave the range. The
+/// comparisons in the freshness checks only need "later than anything we could
+/// hold" or "earlier than anything we could hold", which the clamped value
+/// gives: it matches `chrono`'s behavior, where such a sum was simply a very
+/// distant instant.
+pub(crate) fn saturating_add(dt: time::UtcDateTime, d: time::Duration) -> time::UtcDateTime {
+    dt.checked_add(d).unwrap_or(if d.is_negative() {
+        time::UtcDateTime::MIN
+    } else {
+        time::UtcDateTime::MAX
+    })
+}
+
 /// Format an instant as `YYYY-MM-DDThh:mm:ssZ` (RFC 3339, whole seconds) for
 /// log and error messages.
 pub(crate) fn fmt_instant(dt: time::UtcDateTime) -> String {
@@ -615,6 +632,69 @@ mod tests {
 
         // Not found
         assert!(find_tagged_value(&body, 0x06).is_none());
+    }
+
+    #[test]
+    fn test_time_parsers_reject_out_of_range_fields() {
+        for bad in [
+            b"20261301000000Z".as_slice(), // month 13
+            b"20260230000000Z".as_slice(), // February 30
+            b"20260001000000Z".as_slice(), // month 0
+            b"20260600000000Z".as_slice(), // day 0
+            b"20260601240000Z".as_slice(), // hour 24
+            b"20260601126000Z".as_slice(), // minute 60
+            b"20260601235960Z".as_slice(), // leap second
+        ] {
+            assert!(
+                parse_generalized_time(bad).is_err(),
+                "GeneralizedTime must reject {}",
+                String::from_utf8_lossy(bad)
+            );
+        }
+        for bad in [
+            b"261301000000Z".as_slice(),
+            b"260230000000Z".as_slice(),
+            b"260601240000Z".as_slice(),
+            b"260601235960Z".as_slice(),
+        ] {
+            assert!(
+                parse_utc_time(bad).is_err(),
+                "UTCTime must reject {}",
+                String::from_utf8_lossy(bad)
+            );
+        }
+    }
+
+    #[test]
+    fn test_der_datetime_to_utc() {
+        let dt = der::DateTime::new(2026, 6, 1, 12, 3, 7).unwrap();
+        let utc = der_datetime_to_utc(&dt).unwrap();
+        assert_eq!(fmt_instant(utc), "2026-06-01T12:03:07Z");
+
+        // The extremes of a four-digit year convert without error.
+        let last = der::DateTime::new(9999, 12, 31, 23, 59, 59).unwrap();
+        assert_eq!(
+            fmt_instant(der_datetime_to_utc(&last).unwrap()),
+            "9999-12-31T23:59:59Z"
+        );
+    }
+
+    #[test]
+    fn test_saturating_add_clamps_instead_of_panicking() {
+        let last = parse_generalized_time(b"99991231235959Z").unwrap();
+        assert_eq!(
+            saturating_add(last, time::Duration::minutes(5)),
+            time::UtcDateTime::MAX
+        );
+        assert_eq!(
+            saturating_add(time::UtcDateTime::MIN, time::Duration::minutes(-5)),
+            time::UtcDateTime::MIN
+        );
+        let mid = parse_generalized_time(b"20260601000000Z").unwrap();
+        assert_eq!(
+            fmt_instant(saturating_add(mid, time::Duration::hours(1))),
+            "2026-06-01T01:00:00Z"
+        );
     }
 
     #[test]
